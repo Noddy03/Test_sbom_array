@@ -36,7 +36,7 @@ jobs:
       # TIMESTAMP FUNCTION
       # -----------------------------
       - name: test sequential recursion
-        id: test recurision 
+        id: recurision 
         run: | 
           for i in 3 
           do 
