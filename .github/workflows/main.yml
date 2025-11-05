@@ -31,18 +31,7 @@ jobs:
       security-events: write
       actions: read
 
-    steps:
-     
-      - name: testing array 
-        id: array
-        run: | 
-          for i in 3 
-          do  
-              i=0 
-              i+=1
-              echo "prova" 
-          done 
-         
+    steps:       
       # -----------------------------
       # TIMESTAMP FUNCTION
       # -----------------------------
@@ -51,7 +40,7 @@ jobs:
         run: |
           echo "TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S %Z')" >> $GITHUB_ENV
           echo "Timestamp initialized at $TIMESTAMP"
-
+ 
       # -----------------------------
       # SETUP ENVIRONMENT
       # -----------------------------
