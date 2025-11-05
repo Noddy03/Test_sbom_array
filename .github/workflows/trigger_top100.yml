@@ -6,7 +6,7 @@ on:
       language:
         description: "Language to fetch repositories for"
         required: true
-        default: "C++"
+        default: 'C++'
 
 jobs:
   fetch:
@@ -51,8 +51,9 @@ jobs:
           workflow: main.yml
           ref: main
           inputs:
-            src_repository: ${{ matrix.repo }}
-            src_branch: main
-            conan_repository: Noddy03/Conan_Trivy_full_SBOM_scan
-            conan_branch: main
-            src_type: c++
+            src_repository: "${{ matrix.repo }}"
+            src_branch: "main"
+            conan_repository: "Noddy03/Conan_Trivy_full_SBOM_scan"
+            conan_branch: "main"
+            src_type: "c++"
+
