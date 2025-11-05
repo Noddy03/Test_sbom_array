@@ -6,7 +6,7 @@ on:
       language:
         description: "Language to fetch repositories for"
         required: true
-        default: 'C++'
+        default: "C++"
 
 jobs:
   fetch:
@@ -39,6 +39,7 @@ jobs:
     needs: fetch
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
@@ -50,10 +51,11 @@ jobs:
           repository: ${{ github.repository }}
           workflow: main.yml
           ref: main
-          inputs:
-            src_repository: "${{ matrix.repo }}"
-            src_branch: "main"
-            conan_repository: "Noddy03/Conan_Trivy_full_SBOM_scan"
-            conan_branch: "main"
-            src_type: "c++"
+          inputs: |
+            src_repository=${{ matrix.repo }}
+            src_branch=main
+            conan_repository=Noddy03/Conan_Trivy_full_SBOM_scan
+            conan_branch=main
+            src_type=${{ github.event.inputs.language }}
+
 
