@@ -46,26 +46,28 @@ jobs:
   # -----------------------------------------------------
   # TRIGGER MAIN SBOM SCAN WORKFLOW
   # -----------------------------------------------------
+  # Trigger SBOM workflow for each repository
   trigger:
-    needs: fetch
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
+        needs: fetch
+        runs-on: ubuntu-latest
+        strategy:
+          fail-fast: false
+          matrix:
+            repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
-    steps:
-      - name: Trigger Conan+Trivy Workflow
-        uses: benc-uk/workflow-dispatch@v1
-        with:
-          token: ${{ secrets.PERSONAL_TOKEN }}  # <-- use your PAT here
-          workflow: main.yml
-          ref: main
-          inputs: >
-            {
-              "src_repository": "${{ matrix.repo }}",
-              "src_branch": "main",
-              "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
-              "conan_branch": "main",
-              "src_type": "${{ github.event.inputs.language }}"
-            }
+        steps:
+              - name: Trigger Conan + Trivy SBOM Workflow
+                uses: benc-uk/workflow-dispatch@v1
+                with:
+                    token: ${{ secrets.PERSONAL_TOKEN }}        # PAT with 'repo' + 'workflow' scopes
+                    workflow: main.yml                          # file name of the workflow
+                    ref: main                                   # branch to run the workflow on
+                    inputs: |
+                      {
+                          "src_repository": "${{ matrix.repo }}",
+                          "src_branch": "main",
+                          "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
+                          "conan_branch": "main",
+                          "src_type": "C++"
+                      }
+
