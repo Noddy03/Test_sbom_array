@@ -47,27 +47,26 @@ jobs:
           path: output/top_public_repos.json
 
       # -----------------------------
-      # LOAD REPOS INTO ARRAY SAFELY
+      # SAVE REPOS TO FILE
       # -----------------------------
-      - name: Load repos into array
-        id: load_repos
+      - name: Save repos to file
         run: |
-          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
-          echo "REPOS_ARRAY=${repos_array[*]}" >> $GITHUB_ENV
-          echo "Loaded ${#repos_array[@]} repositories"
+          mkdir -p output
+          jq -r '.[]' output/top_public_repos.json > output/repos_list.txt
+          echo "Saved $(wc -l < output/repos_list.txt) repositories to file."
 
       # -----------------------------
-      # TRIGGER WORKFLOW AND WAIT FOR COMPLETION
+      # TRIGGER WORKFLOW AND COLLECT ARTIFACTS
       # -----------------------------
       - name: Trigger SBOM workflow and collect artifacts
         run: |
           mkdir -p collected-artifacts
-          WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"  # <--- repo containing main.yml
+          WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"
           WORKFLOW_NAME="Conan + Trivy Full SBOM Scan"
 
-          for repo in "${REPOS_ARRAY[@]}"; do
+          while IFS= read -r repo; do
             echo "Triggering SBOM scan for $repo..."
-            # Trigger workflow
+
             run_info=$(gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
@@ -100,7 +99,8 @@ jobs:
 
             # Optional: throttle to avoid API limits
             sleep 2
-          done
+
+          done < output/repos_list.txt
 
       # -----------------------------
       # Upload all collected SBOM artifacts
