@@ -57,29 +57,49 @@ jobs:
           echo "Loaded ${#repos_array[@]} repositories"
 
       # -----------------------------
-      # TRIGGER MAIN WORKFLOW FOR EACH REPO
+      # TRIGGER WORKFLOW AND WAIT FOR COMPLETION
       # -----------------------------
-      - name: Trigger Conan + Trivy SBOM workflow
+      - name: Trigger SBOM workflow and collect artifacts
         run: |
+          mkdir -p collected-artifacts
           for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
 
-            run_number=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
+            # Trigger workflow
+            run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
               --ref main \
               -f src_repository="$repo" \
               -f src_branch="main" \
               -f src_type="c++" \
               -f conan_repository="Noddy03/Conan_Trivy_full_SBOM_scan" \
               -f conan_branch="main" \
-              --json number \
-              | jq -r '.number')
+              --json id \
+              | jq -r '.id')
 
-            if [[ -n "$run_number" ]]; then
-              echo "Workflow triggered for $repo, run number: $run_number"
-            else
+            if [[ -z "$run_id" ]]; then
               echo "Failed to trigger workflow for $repo"
+              continue
             fi
 
+            echo "Workflow triggered for $repo, run ID: $run_id"
+
+            # Wait for workflow to complete
+            echo "Waiting for workflow $run_id to finish..."
+            gh run watch "$run_id"
+
+            # Download workflow artifacts
+            echo "Downloading artifacts for $repo..."
+            gh run download "$run_id" --dir "collected-artifacts/$repo"
+            
             # Optional: throttle to avoid API limits
             sleep 2
           done
+
+      # -----------------------------
+      # Upload all collected SBOM artifacts
+      # -----------------------------
+      - name: Upload collected SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-sbom-reports
+          path: collected-artifacts
