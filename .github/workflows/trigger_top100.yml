@@ -38,16 +38,7 @@ jobs:
             | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
 
       # -----------------------------
-      # Upload repo list artifact
-      # -----------------------------
-      - name: Upload repository list
-        uses: actions/upload-artifact@v4
-        with:
-          name: top-repos
-          path: output/top_public_repos.json
-
-      # -----------------------------
-      # SAVE REPOS TO FILE
+      # Save repos to file
       # -----------------------------
       - name: Save repos to file
         run: |
@@ -56,7 +47,7 @@ jobs:
           echo "Saved $(wc -l < output/repos_list.txt) repositories to file."
 
       # -----------------------------
-      # TRIGGER WORKFLOW AND COLLECT ARTIFACTS
+      # Trigger workflow using JSON input & collect artifacts
       # -----------------------------
       - name: Trigger SBOM workflow and collect artifacts
         run: |
@@ -67,15 +58,20 @@ jobs:
           while IFS= read -r repo; do
             echo "Triggering SBOM scan for $repo..."
 
-            run_info=$(gh workflow run "$WORKFLOW_NAME" \
+            # Build JSON input
+            json_input=$(jq -n \
+              --arg src_repo "$repo" \
+              --arg src_branch "main" \
+              --arg src_type "c++" \
+              --arg conan_repo "$WORKFLOW_REPO" \
+              --arg conan_branch "main" \
+              '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
+
+            # Trigger workflow with JSON
+            run_info=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
-              -f src_repository="$repo" \
-              -f src_branch="main" \
-              -f src_type="c++" \
-              -f conan_repository="$WORKFLOW_REPO" \
-              -f conan_branch="main" \
-              --json id,html_url)
+              --json -)
 
             run_id=$(echo "$run_info" | jq -r '.id')
             run_url=$(echo "$run_info" | jq -r '.html_url')
@@ -111,3 +107,4 @@ jobs:
           name: all-sbom-reports
           path: collected-artifacts
           if-no-files-found: warn
+
