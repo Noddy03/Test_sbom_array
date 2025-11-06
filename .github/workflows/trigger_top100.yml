@@ -18,7 +18,7 @@ jobs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
 
     steps:
-      - name: Checkout
+      - name: Checkout this repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -46,28 +46,24 @@ jobs:
   # -----------------------------------------------------
   # TRIGGER MAIN SBOM SCAN WORKFLOW
   # -----------------------------------------------------
-  # Trigger SBOM workflow for each repository
   trigger:
-        needs: fetch
-        runs-on: ubuntu-latest
-        strategy:
-          fail-fast: false
-          matrix:
-            repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
+    needs: fetch
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
-        steps:
-              - name: Trigger Conan + Trivy SBOM Workflow
-                uses: benc-uk/workflow-dispatch@v1
-                with:
-                    token: ${{ secrets.PERSONAL_TOKEN }}        # PAT with 'repo' + 'workflow' scopes
-                    workflow: main.yml                          # file name of the workflow
-                    ref: main                                   # branch to run the workflow on
-                    inputs: |
-                      {
-                          "src_repository": "${{ matrix.repo }}",
-                          "src_branch": "main",
-                          "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
-                          "conan_branch": "main",
-                          "src_type": "C++"
-                      }
-
+    steps:
+      - name: Trigger Conan + Trivy SBOM Workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.PERSONAL_TOKEN }}       # PAT with 'repo' + 'workflow' scopes
+          workflow: main.yml                          # file name of your SBOM workflow
+          ref: main                                   # branch to run the workflow on
+          inputs: >
+            {"src_repository": "${{ matrix.repo }}",
+             "src_branch": "main",
+             "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
+             "conan_branch": "main",
+             "src_type": "C++"}
