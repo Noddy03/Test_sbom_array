@@ -1,8 +1,20 @@
-name: Fetch Top 100 Repos + Conan/Trivy SBOM Scan
+name: Fetch Top Repos + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
     inputs:
+      src_branch:
+        description: 'Branch of source repository'
+        required: false
+        default: 'main'
+      conan_repository:
+        description: 'Conan repository (default: Noddy03/Conan_Trivy_full_SBOM_scan)'
+        required: false
+        default: 'Noddy03/Conan_Trivy_full_SBOM_scan'
+      conan_branch:
+        description: 'Branch for Conan repository'
+        required: false
+        default: 'main'
       src_type:
         description: 'Project Type (java, python, dotnet, cpp, c++)'
         required: false
@@ -14,12 +26,16 @@ jobs:
     outputs:
       repo_list: ${{ steps.get_repos.outputs.repo_list }}
     steps:
-      - name: Install dependencies
+      - name: Install GitHub CLI & jq
         run: |
+          sudo apt-get update && sudo apt-get install -y jq
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
           sudo apt update
-          sudo apt install -y jq gh
-          
-      - name: Fetch top 100 repositories
+          sudo apt install gh -y
+
+      - name: Fetch top 100 repositories with >5000 stars
         id: get_repos
         env:
           GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
@@ -29,7 +45,7 @@ jobs:
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  scan_repos:
+  sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
     strategy:
@@ -44,13 +60,23 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
+          ref: ${{ github.event.inputs.src_branch }}
           token: ${{ secrets.PERSONAL_TOKEN }}
           path: project-src
 
-      - name: Setup Python and Node
+      - name: Checkout Conan repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.conan_repository }}
+          ref: ${{ github.event.inputs.conan_branch }}
+          token: ${{ secrets.PERSONAL_TOKEN }}
+          path: conan-src
+
+      - name: Setup Python & Node
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
+
       - uses: actions/setup-node@v3
         with:
           node-version: '20'
@@ -61,20 +87,12 @@ jobs:
           pip install conan
           conan profile detect --force
 
-      - name: Checkout Conan repository
-        uses: actions/checkout@v4
-        with:
-          repository: Noddy03/Conan_Trivy_full_SBOM_scan
-          ref: main
-          token: ${{ secrets.PERSONAL_TOKEN }}
-          path: conan-src
-
       - name: Generate Conan lockfile
         run: |
           conan lock create conanfile.py --lockfile-out=conan.lock
         working-directory: conan-src
 
-      - name: Copy Conan lockfile
+      - name: Copy Conan lockfile to source directory
         run: cp conan-src/conan.lock project-src/conan.lock
 
       - name: Run Trivy SBOM scan
@@ -89,28 +107,30 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
 
-      - name: Compliance NTIA
+      - name: Compliance SBOM NTIA
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
-      - name: Compliance BSI
+      - name: Compliance SBOM BSI
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         run: |
-          docker run --rm -v $PWD/project-src:/project-src ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json > project-src/score_evaluation.json
-
-      - name: Sanitize artifact name
-        id: sanitize
-        run: |
-          SAFE_NAME="${{ matrix.repo }}"
-          SAFE_NAME="${SAFE_NAME//\//_}"
-          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
       - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ steps.sanitize.outputs.name }}
+          name: sbom-reports-${{ matrix.repo }}
           path: project-src/*.json
           if-no-files-found: warn
