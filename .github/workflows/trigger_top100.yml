@@ -4,12 +4,11 @@ on:
   workflow_dispatch:
 
 jobs:
-  fetch_and_trigger:
+  fetch_trigger_collect:
     runs-on: ubuntu-latest
     permissions:
-        actions: read
-        contents: read
-       
+      actions: read
+      contents: read
 
     steps:
       # -----------------------------
@@ -19,6 +18,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq gh curl
+
+      # -----------------------------
+      # LOGIN TO GH CLI WITH PAT
+      # -----------------------------
+      - name: Authenticate gh CLI
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | gh auth login --with-token
 
       # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
