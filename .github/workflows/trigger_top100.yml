@@ -10,6 +10,8 @@ permissions:
 jobs:
   fetch_trigger_collect:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SBOM_TOKEN_PERSONAL }}
 
     steps:
       # -----------------------------
@@ -19,12 +21,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq gh curl
-
-      # -----------------------------
-      # SET GH CLI TOKEN (PAT)
-      # -----------------------------
-      - name: Set GH CLI authentication
-        run: echo "GH_TOKEN=${{ secrets.SBOM_TOKEN_PERSONAL }}" >> $GITHUB_ENV
 
       # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
@@ -53,8 +49,9 @@ jobs:
         id: load_repos
         run: |
           mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
-          echo "repos_array=${repos_array[*]}" >> $GITHUB_ENV
           echo "Loaded ${#repos_array[@]} repositories"
+          # Export repos as environment variable for next step
+          echo "REPOS_ARRAY=${repos_array[*]}" >> $GITHUB_ENV
 
       # -----------------------------
       # Trigger workflow and collect artifacts
@@ -65,21 +62,28 @@ jobs:
           WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"
           WORKFLOW_NAME="Conan + Trivy Full SBOM Scan"
 
+          # Convert REPOS_ARRAY string to Bash array
+          IFS=' ' read -r -a repos_array <<< "$REPOS_ARRAY"
+
           for repo in "${repos_array[@]}"; do
             echo "Triggering SBOM scan for $repo..."
 
-            # Trigger workflow using -f for each input
-            run_id=$(gh workflow run "$WORKFLOW_NAME" \
+            # Prepare JSON input
+            json_input=$(jq -n \
+              --arg src_repo "$repo" \
+              --arg src_branch "main" \
+              --arg src_type "c++" \
+              --arg conan_repo "$WORKFLOW_REPO" \
+              --arg conan_branch "main" \
+              '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
+
+            # Trigger workflow using stdin JSON
+            run_id=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
               --repo "$WORKFLOW_REPO" \
               --ref main \
-              -f src_repository="$repo" \
-              -f src_branch="main" \
-              -f src_type="c++" \
-              -f conan_repository="$WORKFLOW_REPO" \
-              -f conan_branch="main" \
               --json | jq -r '.id')
 
-            if [[ -z "$run_id" ]]; then
+            if [[ -z "$run_id" || "$run_id" == "null" ]]; then
               echo "Failed to trigger workflow for $repo"
               continue
             fi
@@ -92,7 +96,6 @@ jobs:
             # Download workflow artifacts
             echo "Downloading artifacts for $repo..."
             gh run download "$run_id" --repo "$WORKFLOW_REPO" --dir "collected-artifacts/$repo"
-
             sleep 2
           done
 
