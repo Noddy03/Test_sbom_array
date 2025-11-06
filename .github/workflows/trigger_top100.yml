@@ -1,4 +1,4 @@
-name: Fetch & Trigger SBOM Scans
+name: Fetch, Trigger & Collect SBOM Scans
 
 on:
   workflow_dispatch:
@@ -14,10 +14,19 @@ jobs:
       # -----------------------------
       # SETUP ENVIRONMENT
       # -----------------------------
-      - name: Setup jq & gh CLI
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq gh curl
+
+      # -----------------------------
+      # AUTHENTICATE GH CLI
+      # -----------------------------
+      - name: Authenticate GH CLI
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+        run: |
+          echo "$GH_TOKEN" | gh auth login --with-token
 
       # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
@@ -40,19 +49,19 @@ jobs:
           echo "repos_array=${repos_array[*]}" >> $GITHUB_ENV
 
       # -----------------------------
-      # TRIGGER SBOM WORKFLOW FOR EACH REPO
+      # TRIGGER MAIN WORKFLOW FOR EACH REPO
       # -----------------------------
-      - name: Trigger SBOM workflow for each repo
-        env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+      - name: Trigger Conan + Trivy SBOM workflow
         run: |
           for repo in $repos_array; do
             echo "Triggering SBOM scan for $repo..."
-            run_id=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
+            # Trigger workflow_dispatch on main.yml
+            run_number=$(gh workflow run "Conan + Trivy Full SBOM Scan" \
               --ref main \
               -f src_repository="$repo" \
               -f src_branch="main" \
               -f src_type="c++" \
-              --json number | jq -r '.number')
-            echo "Workflow triggered, run ID: $run_id"
+              --json number \
+              | jq -r '.number')
+            echo "Workflow triggered for $repo, run number: $run_number"
           done
