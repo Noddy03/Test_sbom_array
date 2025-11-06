@@ -1,110 +1,50 @@
-name: Fetch, Trigger & Collect SBOM Scans
+name: SBOM Collection & Trigger Main
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: read
-
 jobs:
-  fetch_trigger_collect:
+  fetch-and-collect:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.SBOM_TOKEN_PERSONAL }}
-
     steps:
-      # -----------------------------
-      # INSTALL DEPENDENCIES
-      # -----------------------------
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq gh curl
+      # Step 1: Checkout the repo
+      - name: Checkout repository
+        uses: actions/checkout@v3
 
-      # -----------------------------
-      # FETCH TOP PUBLIC C++ REPOS
-      # -----------------------------
-      - name: Fetch top 100 public C++ repositories
-        run: |
-          LANGUAGE="C++"
-          mkdir -p output
-          curl -s -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/search/repositories?q=language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
-            | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
+      # Step 2: Set up GitHub CLI
+      - name: Set up GitHub CLI
+        uses: cli/gh-actions/setup-gh@v2
 
-      # -----------------------------
-      # Upload repo list artifact
-      # -----------------------------
-      - name: Upload repository list
-        uses: actions/upload-artifact@v4
+      # Step 3: Authenticate with your token
+      - name: Authenticate with GH token
+        run: gh auth login --with-token <<< "${{ secrets.MY_GH_TOKEN }}"
+
+      # Step 4: Fetch SBOM dependencies or any needed files
+      - name: Fetch dependencies / files
+        run: |
+          echo "Fetching necessary SBOM dependencies..."
+          # Example: curl or gh commands to fetch assets if needed
+          # curl -O https://example.com/dependency
+
+      # Step 5: Generate SBOM
+      - name: Generate SBOM
+        run: |
+          echo "Generating SBOM..."
+          # Your SBOM generation commands, e.g.:
+          # syft packages dir:. -o json > sbom.json
+
+      # Step 6: Commit or upload SBOM
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v3
         with:
-          name: top-repos
-          path: output/top_public_repos.json
+          name: sbom
+          path: sbom.json
 
-      # -----------------------------
-      # Load repos into array safely
-      # -----------------------------
-      - name: Load repos into array
-        id: load_repos
+      # Step 7: Trigger the main workflow
+      - name: Trigger main workflow
         run: |
-          mapfile -t repos_array < <(jq -r '.[]' output/top_public_repos.json)
-          echo "Loaded ${#repos_array[@]} repositories"
-          # Export repos as environment variable for next step
-          echo "REPOS_ARRAY=${repos_array[*]}" >> $GITHUB_ENV
-
-      # -----------------------------
-      # Trigger workflow and collect artifacts
-      # -----------------------------
-      - name: Trigger SBOM workflow and collect artifacts
-        run: |
-          mkdir -p collected-artifacts
-          WORKFLOW_REPO="Noddy03/Conan_Trivy_full_SBOM_scan"
-          WORKFLOW_NAME="Conan + Trivy Full SBOM Scan"
-
-          # Convert REPOS_ARRAY string to Bash array
-          IFS=' ' read -r -a repos_array <<< "$REPOS_ARRAY"
-
-          for repo in "${repos_array[@]}"; do
-            echo "Triggering SBOM scan for $repo..."
-
-            # Prepare JSON input
-            json_input=$(jq -n \
-              --arg src_repo "$repo" \
-              --arg src_branch "main" \
-              --arg src_type "c++" \
-              --arg conan_repo "$WORKFLOW_REPO" \
-              --arg conan_branch "main" \
-              '{src_repository: $src_repo, src_branch: $src_branch, src_type: $src_type, conan_repository: $conan_repo, conan_branch: $conan_branch}')
-
-            # Trigger workflow using stdin JSON
-            run_id=$(echo "$json_input" | gh workflow run "$WORKFLOW_NAME" \
-              --repo "$WORKFLOW_REPO" \
-              --ref main \
-              --json | jq -r '.id')
-
-            if [[ -z "$run_id" || "$run_id" == "null" ]]; then
-              echo "Failed to trigger workflow for $repo"
-              continue
-            fi
-
-            echo "Workflow triggered for $repo, run ID: $run_id"
-
-            # Wait for workflow to complete
-            gh run watch "$run_id" --repo "$WORKFLOW_REPO"
-
-            # Download workflow artifacts
-            echo "Downloading artifacts for $repo..."
-            gh run download "$run_id" --repo "$WORKFLOW_REPO" --dir "collected-artifacts/$repo"
-            sleep 2
-          done
-
-      # -----------------------------
-      # Upload all collected SBOM artifacts
-      # -----------------------------
-      - name: Upload collected SBOM artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: all-sbom-reports
-          path: collected-artifacts
-          if-no-files-found: warn
+          echo "Triggering main workflow..."
+          gh workflow run main.yml -f sbom_path=sbom.json
