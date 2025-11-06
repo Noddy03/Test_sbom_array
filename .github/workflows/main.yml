@@ -22,6 +22,9 @@ on:
         description: 'Project Type (java, python, dotnet, cpp, c++)'
         required: false
         default: 'c++'
+      sbom_artifact_name:
+        description: 'Optional SBOM artifact from upstream workflow'
+        required: false
 
 jobs:
   build:
@@ -55,6 +58,16 @@ jobs:
           node-version: '20'
 
       # -----------------------------
+      # DOWNLOAD SBOM ARTIFACT (IF PROVIDED)
+      # -----------------------------
+      - name: Download SBOM artifact
+        if: ${{ github.event.inputs.sbom_artifact_name }}
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ github.event.inputs.sbom_artifact_name }}
+          path: project-src
+
+      # -----------------------------
       # CHECKOUT REPOSITORIES (with PAT)
       # -----------------------------
       - name: Checkout source repository
@@ -62,7 +75,7 @@ jobs:
         with:
           repository: ${{ inputs.src_repository }}
           ref: ${{ inputs.src_branch }}
-          token: ${{ secrets.PERSONAL_TOKEN }}    # Use PAT here
+          token: ${{ secrets.PERSONAL_TOKEN }}
           path: project-src
 
       - name: Checkout Conan repository
@@ -70,7 +83,7 @@ jobs:
         with:
           repository: ${{ inputs.conan_repository }}
           ref: ${{ inputs.conan_branch }}
-          token: ${{ secrets.PERSONAL_TOKEN }}    # Use PAT here
+          token: ${{ secrets.PERSONAL_TOKEN }}
           path: conan-src
 
       # -----------------------------
@@ -101,16 +114,13 @@ jobs:
       # GENERATE SBOM & SCAN WITH TRIVY
       # -----------------------------
       - name: Run Trivy SBOM generation and vulnerability scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: fs
-          scan-ref: ./project-src
-          format: cyclonedx
-          scanners: vuln
-          output: project-src/trivy-report.json
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH,MEDIUM
+        run: |
+          if [ ! -f project-src/trivy-report.json ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] Running Trivy scan..."
+            docker run --rm -v $PWD/project-src:/project-src aquasec/trivy:latest fs --scanners vuln --format json -o /project-src/trivy-report.json /project-src
+          else
+            echo "SBOM artifact already provided. Skipping Trivy scan."
+          fi
 
       # -----------------------------
       # COMPLIANCE & SCORING (SBOMQS)
@@ -137,7 +147,7 @@ jobs:
             /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
       # -----------------------------
-      # (OPTIONAL) GITHUB SECURITY TAB UPLOAD
+      # GITHUB SECURITY TAB UPLOAD
       # -----------------------------
       - name: Generate SARIF report for GitHub Code Scanning
         run: |
