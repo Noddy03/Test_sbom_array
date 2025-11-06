@@ -24,7 +24,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
       - name: Install Python dependencies
         run: |
@@ -47,34 +47,25 @@ jobs:
   # TRIGGER MAIN SBOM SCAN WORKFLOW
   # -----------------------------------------------------
   trigger:
-     needs: fetch
-     runs-on: ubuntu-latest
-     strategy:
-        fail-fast: false
-        matrix:
-          repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
-     steps:
-        - name: Debug token presence
-          run: |
-              if [ -z "${{ secrets.PERSONAL_TOKEN }}" ]; then
-              echo "❌ PERSONAL_TOKEN is missing"
-              exit 1
-              else
-              echo "✅ PERSONAL_TOKEN detected"
-              fi
+    needs: fetch
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson(needs.fetch.outputs.repo_list) }}
 
-        - name: Trigger Conan+Trivy Workflow
-          uses: benc-uk/workflow-dispatch@v1
-          with:
-            workflow: main.yml
-            token: ${{ secrets.PERSONAL_TOKEN }}
-            ref: main
-            inputs: >-
-              {
+    steps:
+      - name: Trigger Conan+Trivy Workflow
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          token: ${{ secrets.PERSONAL_TOKEN }}  # <-- use your PAT here
+          workflow: main.yml
+          ref: main
+          inputs: >
+            {
               "src_repository": "${{ matrix.repo }}",
               "src_branch": "main",
               "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
               "conan_branch": "main",
               "src_type": "${{ github.event.inputs.language }}"
-              }
-
+            }
