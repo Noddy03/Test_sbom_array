@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to fetch top public repos"
+        description: "Programming language to fetch repositories for"
         required: true
         default: "C++"
 
@@ -15,6 +15,12 @@ jobs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
 
     steps:
+      # -----------------------------
+      # SETUP ENVIRONMENT
+      # -----------------------------
+      - name: Checkout self
+        uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
@@ -25,33 +31,32 @@ jobs:
           python -m pip install --upgrade pip
           pip install jq requests
 
-      - name: Fetch top 100 public repositories
-        id: collect
+      # -----------------------------
+      # FETCH TOP 100 PUBLIC REPOSITORIES
+      # -----------------------------
+      - id: collect
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           mkdir -p output
+          echo "Fetching top 100 public repositories for $LANGUAGE..."
+          
           curl -s -H "Accept: application/vnd.github+json" \
             "https://api.github.com/search/repositories?q=language:${LANGUAGE}&sort=stars&order=desc&per_page=100" \
             | jq '[.items[] | select(.private == false) | .full_name]' > output/top_public_repos.json
-
-          repos=$(cat output/top_public_repos.json)
+          
+          # Convert to compact JSON for matrix usage
+          repos=$(jq -c '.' output/top_public_repos.json)
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
 
-  trigger_scans:
-    needs: fetch_and_trigger
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ${{ fromJson(needs.fetch_and_trigger.outputs.repo_list) }}
-
-    steps:
+      # -----------------------------
+      # TRIGGER SBOM WORKFLOW FOR EACH REPO
+      # -----------------------------
       - name: Trigger Conan + Trivy SBOM Workflow
         uses: benc-uk/workflow-dispatch@v1
         with:
-          token: ${{ secrets.PERSONAL_TOKEN }} # PAT with 'repo' + 'workflow' scopes
-          workflow: main.yml                    # your SBOM scan workflow
-          ref: main                             # branch where main.yml exists
+          token: ${{ secrets.PERSONAL_TOKEN }}          # PAT with repo + workflow scopes
+          workflow: main.yml                             # your SBOM workflow file
+          ref: main                                     # branch to run the workflow on
           inputs: |
             {
               "src_repository": "${{ matrix.repo }}",
@@ -60,3 +65,7 @@ jobs:
               "conan_branch": "main",
               "src_type": "C++"
             }
+    strategy:
+          fail-fast: false
+          matrix:
+            repo: ${{ fromJson(needs.fetch_and_trigger.outputs.repo_list) }}
