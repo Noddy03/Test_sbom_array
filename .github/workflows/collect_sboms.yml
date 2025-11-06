@@ -2,7 +2,7 @@ name: Collect SBOMs Automatically
 
 on:
   workflow_run:
-    workflows: ["Conan + Trivy Full SBOM Scan"] # Name of your SBOM workflow
+    workflows: ["Conan + Trivy Full SBOM Scan"]  # Must match workflow name
     types:
       - completed
 
@@ -11,22 +11,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # -----------------------------
+      # CHECKOUT
+      # -----------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
+      # -----------------------------
+      # INSTALL DEPENDENCIES
+      # -----------------------------
+      - name: Install required tools
         run: |
-          python -m pip install --upgrade pip
-          pip install jq requests
+          sudo apt-get update
+          sudo apt-get install -y jq unzip curl python3-pip
+          python3 -m pip install --upgrade pip
+          pip install requests
 
+      # -----------------------------
+      # COLLECT ARTIFACTS
+      # -----------------------------
       - name: Collect SBOM artifacts
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }} # PAT with workflow access
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}  # Must have repo + workflow scopes
           REPO: ${{ github.repository }}
         run: |
           mkdir -p collected_sboms
@@ -38,7 +44,7 @@ jobs:
             | jq -r '.workflow_runs[] | "\(.id) \(.head_repository.full_name)"')
 
           echo "$runs" | while read run_id repo_name; do
-            echo "Processing run $run_id for repo $repo_name"
+            echo "Processing workflow run $run_id for repository $repo_name"
 
             safe_repo_name=$(echo "$repo_name" | tr '/' '_')
             repo_folder="collected_sboms/$safe_repo_name"
@@ -47,7 +53,12 @@ jobs:
             artifacts=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts \
-              | jq -r '.artifacts[] | "\(.id) \(.name)"')
+              | jq -r '.artifacts[]? | "\(.id) \(.name)"')
+
+            if [ -z "$artifacts" ]; then
+              echo "No artifacts found for run $run_id"
+              continue
+            fi
 
             echo "$artifacts" | while read artifact_id artifact_name; do
               echo "Downloading artifact $artifact_name ($artifact_id) into $repo_folder"
@@ -60,7 +71,10 @@ jobs:
             done
           done
 
-      - name: Upload consolidated SBOMs
+      # -----------------------------
+      # UPLOAD CONSOLIDATED ARTIFACT
+      # -----------------------------
+      - name: Upload all SBOMs
         uses: actions/upload-artifact@v4
         with:
           name: all_sboms
