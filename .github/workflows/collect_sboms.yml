@@ -2,7 +2,7 @@ name: Collect SBOMs Automatically
 
 on:
   workflow_run:
-    workflows: ["Conan + Trivy Full SBOM Scan"]  # Name of your SBOM workflow
+    workflows: ["Conan + Trivy Full SBOM Scan"]
     types:
       - completed
 
@@ -11,10 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout current repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python
+      - name: Setup environment
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
@@ -24,37 +21,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install jq requests
 
-      - name: Collect SBOM artifacts
+      - name: Collect SBOM artifacts (successful runs only)
         env:
-          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}  # PAT with workflow + repo access
-          OWNER: ${{ github.repository_owner }}
-          REPO: ${{ github.event.workflow_run.head_repository.name }}
+          GITHUB_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           mkdir -p collected_sboms
 
-          # Get the latest completed runs of the SBOM workflow
+          echo "Fetching latest workflow runs..."
           runs=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/$OWNER/$REPO/actions/workflows/main.yml/runs?status=completed&per_page=50 \
-            | jq -r '.workflow_runs[] | "\(.id) \(.head_repository.full_name)"')
+            https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=100 \
+            | jq -r '.workflow_runs[] | select(.conclusion=="success") | "\(.id) \(.head_repository.full_name)"')
 
           echo "$runs" | while read run_id repo_name; do
-            echo "Processing run $run_id for repo $repo_name"
+            echo "Processing successful run $run_id for repo $repo_name"
+
             safe_repo_name=$(echo "$repo_name" | tr '/' '_')
             repo_folder="collected_sboms/$safe_repo_name"
             mkdir -p "$repo_folder"
 
-            # List artifacts for this workflow run
             artifacts=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/$OWNER/$REPO/actions/runs/$run_id/artifacts \
+              https://api.github.com/repos/$REPO/actions/runs/$run_id/artifacts \
               | jq -r '.artifacts[] | "\(.id) \(.name)"')
 
             echo "$artifacts" | while read artifact_id artifact_name; do
               echo "Downloading artifact $artifact_name ($artifact_id) into $repo_folder"
               curl -s -L -H "Authorization: token $GITHUB_TOKEN" \
                 -o temp.zip \
-                https://api.github.com/repos/$OWNER/$REPO/actions/artifacts/$artifact_id/zip
+                https://api.github.com/repos/$REPO/actions/artifacts/$artifact_id/zip
 
               unzip -o temp.zip -d "$repo_folder"
               rm temp.zip
