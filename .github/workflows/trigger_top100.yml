@@ -29,7 +29,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests jq
 
       - name: Fetch Top 100 Repositories
         env:
@@ -44,7 +44,7 @@ jobs:
           echo "repo_list=$repos" >> $GITHUB_OUTPUT
 
   # -----------------------------------------------------
-  # TRIGGER MAIN SCAN WORKFLOW
+  # TRIGGER MAIN SCAN WORKFLOW FOR EACH REPO
   # -----------------------------------------------------
   trigger:
     needs: fetch
@@ -56,20 +56,26 @@ jobs:
 
     steps:
       - name: Trigger Conan+Trivy Workflow
+        id: trigger_workflow
         uses: benc-uk/workflow-dispatch@v1
         with:
           workflow: main.yml
           token: ${{ secrets.GITHUB_TOKEN }}
           ref: main
-          inputs: |
-            src_repository=${{ matrix.repo }}
-            src_branch=main
-            conan_repository=Noddy03/Conan_Trivy_full_SBOM_scan
-            conan_branch=main
-            src_type=${{ github.event.inputs.language }}
+          inputs: >-
+            {
+              "src_repository": "${{ matrix.repo }}",
+              "src_branch": "main",
+              "conan_repository": "Noddy03/Conan_Trivy_full_SBOM_scan",
+              "conan_branch": "main",
+              "src_type": "${{ github.event.inputs.language }}"
+            }
+
+      - name: Log triggered repository
+        run: echo "✅ Triggered scan for repository: ${{ matrix.repo }}"
 
   # -----------------------------------------------------
-  # WAIT UNTIL ALL main.yml RUNS ARE COMPLETE
+  # WAIT UNTIL ALL main.yml RUNS ARE COMPLETE, THEN COLLECT
   # -----------------------------------------------------
   finalize:
     needs: trigger
@@ -80,10 +86,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
-          echo "Waiting for all main.yml runs to complete..."
+          echo "🕒 Waiting for all main.yml runs to complete..."
           while true; do
             in_progress=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-              https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=100 \
+              https://api.github.com/repos/$REPO/actions/workflows/main.yml/runs?per_page=400 \
               | jq '[.workflow_runs[] | select(.status != "completed")] | length')
 
             echo "Still $in_progress runs in progress..."
@@ -92,7 +98,7 @@ jobs:
               break
             fi
 
-            echo "Sleeping 5 minutes..."
+            echo "Sleeping 5 minutes before checking again..."
             sleep 300
           done
 
