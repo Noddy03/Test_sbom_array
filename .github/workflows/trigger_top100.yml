@@ -41,7 +41,7 @@ jobs:
       # Upload repo list artifact
       # -----------------------------
       - name: Upload repository list
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: top-repos
           path: output/top_public_repos.json
