@@ -12,8 +12,8 @@ jobs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
-      - name: Setup GitHub CLI
-        uses: cli/cli-action@v2
+      - name: Install jq (for JSON parsing)
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Fetch top 50 repositories
         id: fetch
@@ -48,7 +48,7 @@ jobs:
           token: ${{ github.token }}
           path: project-src
 
-      - name: Setup environment
+      - name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: "3.10"
