@@ -20,15 +20,6 @@ jobs:
           sudo apt-get install -y jq gh curl
 
       # -----------------------------
-      # LOGIN TO GH CLI WITH PAT
-      # -----------------------------
-      - name: Authenticate gh CLI
-        env:
-          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
-        run: |
-          echo "$GH_TOKEN" | gh auth login --with-token
-
-      # -----------------------------
       # FETCH TOP PUBLIC C++ REPOS
       # -----------------------------
       - name: Fetch top 100 public C++ repositories
@@ -52,6 +43,8 @@ jobs:
       # TRIGGER SBOM WORKFLOW FOR EACH REPO
       # -----------------------------
       - name: Trigger SBOM workflow for each repo
+        env:
+          GH_TOKEN: ${{ secrets.PERSONAL_TOKEN }}
         run: |
           for repo in $repos_array; do
             echo "Triggering SBOM scan for $repo..."
