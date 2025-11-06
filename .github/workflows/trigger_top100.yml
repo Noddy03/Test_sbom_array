@@ -7,9 +7,9 @@ jobs:
   fetch_and_trigger:
     runs-on: ubuntu-latest
     permissions:
-      actions: read
-      contents: read
-      workflow: write
+        actions: read
+        contents: read
+       
 
     steps:
       # -----------------------------
