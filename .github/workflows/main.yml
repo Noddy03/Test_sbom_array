@@ -190,26 +190,42 @@ jobs:
 
           records = []
 
+          def load_json_safe(path):
+              try:
+                  with open(path) as f:
+                      content = f.read().strip()
+                      if not content:
+                          print(f"⚠️ Skipping empty file: {path}")
+                          return None
+                      return json.loads(content)
+              except Exception as e:
+                  print(f"⚠️ Skipping invalid JSON in {path}: {e}")
+                  return None
+
+          # Collect SBOMQS scores
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
-              with open(path) as f:
-                  data = json.load(f)
-              data["repository"] = repo
-              records.append(data)
+              data = load_json_safe(path)
+              if data:
+                  data["repository"] = repo
+                  records.append(data)
 
-          # You can also include NTIA and BSI results if desired
+          # Collect compliance results (BSI & NTIA)
           for std in ["BSI", "NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
-                  with open(path) as f:
-                      data = json.load(f)
-                  data["repository"] = repo
-                  data["standard"] = std
-                  records.append(data)
+                  data = load_json_safe(path)
+                  if data:
+                      data["repository"] = repo
+                      data["standard"] = std
+                      records.append(data)
 
-          df = pd.json_normalize(records)
-          df.to_csv("sbomqs_summary.csv", index=False)
-          print(f"Aggregated {len(records)} SBOMQS results.")
+          if not records:
+              print("❌ No valid SBOMQS data found. Check if previous jobs generated reports.")
+          else:
+              df = pd.json_normalize(records)
+              df.to_csv("sbomqs_summary.csv", index=False)
+              print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
           EOF
 
       - name: Upload aggregated summary
