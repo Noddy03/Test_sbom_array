@@ -50,10 +50,10 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   # ---------------------------------------------------------
-  # 2. SBOM SCAN USING CONAN (for C++) OR TRIVY (generic)
+  # 2. SBOM SCAN USING CONAN  OR TRIVY (generic)
   # ---------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan with Trivy + Conan (if C++)
+    name: SBOM Scan with Trivy + Conan 
     needs: fetch_top_repos
     runs-on: ubuntu-latest
 
@@ -81,8 +81,7 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
-      - name: Conditional Conan setup (only for C++)
-        if: ${{ github.event.inputs.language == 'C++' }}
+      - name:  Conan setup 
         run: |
           python -m pip install --upgrade pip
           pip install conan
