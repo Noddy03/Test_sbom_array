@@ -2,11 +2,7 @@ name: Fetch Top IoT C++ Repositories + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
-    inputs:
-      src_type: 
-      description: 'Project Type (java, python, C++)'
-      required: false
-      default: 'C++'
+   
   
 
 permissions:
