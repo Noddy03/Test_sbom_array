@@ -2,6 +2,12 @@ name: Fetch Top IoT C++ Repositories + Conan/Trivy SBOM Scan
 
 on:
   workflow_dispatch:
+    inputs:
+      src_type: 
+      description: 'Project Type (java, python, c++)'
+      required: false
+      default: 'c++'
+  
 
 permissions:
   contents: read
@@ -31,7 +37,7 @@ jobs:
           echo "Fetching top 50 IoT-related repositories written in C++..."
           REPOS=$(gh api /search/repositories \
             --method GET \
-            -F q="IoT language:C++ fork:false archived:false" \
+            -F q="IoT language:src_type fork:false archived:false" \
             -F sort=stars \
             -F order=desc \
             -F per_page=50 \
