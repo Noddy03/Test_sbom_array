@@ -95,14 +95,17 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # INCREMENTAL ENRICHMENT (add-only, safe for compliance)
+      # SAFE INCREMENTAL ENRICHMENT
       # ---------------------------------------------------------
-      - name: Add basic metadata
+      - name: Add basic metadata (safe array handling)
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
 
           jq '
+            # Ensure arrays exist
+            (.metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
+            (.metadata.properties |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
             .metadata.timestamp //= (now | todate) |
             .metadata.tools += [{"vendor":"GitHub","name":"Actions","version":"latest"}] |
             .metadata.properties += [
@@ -111,11 +114,14 @@ jobs:
             ]
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Add BOM link and signature ref
+      - name: Add BOM link and signature ref (safe array handling)
         run: |
           FILE="project-src/trivy-report.json"
           REPO_URL="https://github.com/${{ matrix.repo }}"
           jq --arg repo "$REPO_URL" '
+            # Ensure arrays before adding
+            (.metadata.bomLinks |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
+            (.metadata.externalReferences |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
             .metadata.bomLinks += [{"rel":"component","href":$repo}] |
             .metadata.externalReferences += [{"type":"signature","url":$repo}]
           ' "$FILE" > tmp && mv tmp "$FILE"
@@ -193,9 +199,9 @@ jobs:
           fi
 
       # ---------------------------------------------------------
-      # DIAGNOSTIC CHECK: Print zero-score fields
+      # DIAGNOSTIC CHECK
       # ---------------------------------------------------------
-      - name: Diagnostic:print zero-score fields
+      - name: Diagnostic: print zero-score fields
         if: steps.checkout.outcome == 'success'
         run: |
           echo "🔎 Checking NTIA/BSI compliance zero fields..."
