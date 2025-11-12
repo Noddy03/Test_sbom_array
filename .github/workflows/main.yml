@@ -149,11 +149,15 @@ jobs:
       # OPTIONAL: SIGN SBOM (IMPROVES BSI §8.1.11)
       # ---------------------------------------------------------
       - name: Sign SBOM (if Cosign key available)
-        if: steps.checkout.outcome == 'success' && secrets.COSIGN_PRIVATE_KEY != ''
+        if: steps.checkout.outcome == 'success'
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "⚠️ No Cosign key provided — skipping signing."
+            exit 0
+          fi
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
           cosign sign-blob --key cosign.key project-src/trivy-report.json --output-signature project-src/trivy-report.sig
           echo "✅ SBOM signed successfully."
@@ -188,7 +192,10 @@ jobs:
             docker run --rm \
               -v $PWD/project-src:/project-src \
               ghcr.io/interlynk-io/sbomqs:latest score \
-              /project-src/trivy-report.json --json > project-src/score_evaluation.json
+              /project-src/trivy-report.json --json | tee project-src/score_evaluation.json | jq '.'
+            echo "✅ SBOM scoring completed."
+          else
+            echo "⚠️ No SBOM found to score."
           fi
 
       - name: Sanitize artifact name
