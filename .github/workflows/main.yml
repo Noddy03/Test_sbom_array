@@ -195,7 +195,7 @@ jobs:
       # ---------------------------------------------------------
       # DIAGNOSTIC CHECK: Print zero-score fields
       # ---------------------------------------------------------
-      - name: Diagnostic: print zero-score fields
+      - name: Diagnostic:print zero-score fields
         if: steps.checkout.outcome == 'success'
         run: |
           echo "🔎 Checking NTIA/BSI compliance zero fields..."
