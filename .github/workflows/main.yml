@@ -69,6 +69,45 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
 
+      #  PRE-SBOM COMPONENT CHECK
+      - name: Detect component count (pre-SBOM estimate)
+        if: steps.checkout.outcome == 'success'
+        run: |
+          echo "🔍 Checking declared dependencies for ${{ matrix.repo }}..."
+          cd project-src
+          count=0
+
+          # Python
+          if [ -f "requirements.txt" ]; then
+            deps=$(wc -l < requirements.txt)
+            echo "Dependencies found in requirements.txt: $deps"
+            count=$((count + deps))
+          fi
+
+          # C++ (CMake)
+          if [ -f "CMakeLists.txt" ]; then
+            deps=$(grep -Po 'find_package\(\K[^)]+' CMakeLists.txt | wc -l)
+            echo "Dependencies detected in CMakeLists.txt: $deps"
+            count=$((count + deps))
+          fi
+
+          # Conan (C++ package manager)
+          if [ -f "conanfile.txt" ]; then
+            deps=$(grep -Po '\[requires\]|\[build_requires\]' -A 100 conanfile.txt | grep -v '^\[' | wc -l)
+            echo "Conan dependencies: $deps"
+            count=$((count + deps))
+          fi
+
+          # Java (Maven)
+          if [ -f "pom.xml" ]; then
+            deps=$(grep -Po '<artifactId>\K[^<]+' pom.xml | wc -l)
+            echo "Maven dependencies in pom.xml: $deps"
+            count=$((count + deps))
+          fi
+
+          echo " Estimated number of declared components: $count"
+          echo "component_count=$count" >> $GITHUB_OUTPUT
+
       - name: Conan setup
         if: steps.checkout.outcome == 'success'
         run: |
@@ -129,7 +168,6 @@ jobs:
           TMPFILE="tmp.json"
           cp "$FILE" "$TMPFILE"
 
-          # Compute real hashes for up to 50 files to stay fast
           while read -r SRC; do
             H=$(sha256sum "$SRC" | cut -d' ' -f1)
             jq --arg h "$H" --arg src "$SRC" --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
@@ -153,26 +191,6 @@ jobs:
           jq '.metadata | {tools,properties,bomLinks,externalReferences}' project-src/trivy-report.json | head -40
           jq '.components[] | {name,hashes,externalReferences}' project-src/trivy-report.json | head -10
 
-      # ---------------------------------------------------------
-      # OPTIONAL: SIGN SBOM
-      # ---------------------------------------------------------
-      - name: Sign SBOM (if Cosign key available)
-        if: steps.checkout.outcome == 'success'
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: |
-          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
-            echo " No Cosign key provided — skipping signing."
-            exit 0
-          fi
-          echo "$COSIGN_PRIVATE_KEY" > cosign.key
-          cosign sign-blob --key cosign.key project-src/trivy-report.json --output-signature project-src/trivy-report.sig
-          echo " SBOM signed successfully."
-
-      # ---------------------------------------------------------
-      # COMPLIANCE & SCORING
-      # ---------------------------------------------------------
       - name: Compliance SBOM NTIA
         if: steps.checkout.outcome == 'success'
         run: |
@@ -203,9 +221,6 @@ jobs:
               /project-src/trivy-report.json --json > project-src/score_evaluation.json
           fi
 
-      # ---------------------------------------------------------
-      # DIAGNOSTIC CHECK
-      # ---------------------------------------------------------
       - name: Diagnostic:print zero-score fields
         if: steps.checkout.outcome == 'success'
         run: |
@@ -236,9 +251,6 @@ jobs:
           path: project-src/*.json
           if-no-files-found: warn
 
-  # ---------------------------------------------------------
-  # 3. AGGREGATE RESULTS
-  # ---------------------------------------------------------
   aggregate_results:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
