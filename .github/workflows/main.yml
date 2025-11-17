@@ -73,7 +73,7 @@ jobs:
         if: steps.checkout.outcome == 'success'
         run: |
           conan profile detect --force
-          echo "✅ Conan setup complete."
+          echo " Conan setup complete."
 
       - name: Run Trivy SBOM scan
         if: steps.checkout.outcome == 'success'
@@ -96,7 +96,7 @@ jobs:
       - name: Add basic metadata (safe array handling)
         run: |
           FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
+          [ -f "$FILE" ] || { echo " No SBOM found"; exit 0; }
           jq '
             (.metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
             (.metadata.properties |= (if type=="object" then [.] elif type=="array" then . else [] end)) |
@@ -125,7 +125,7 @@ jobs:
           REPO_URL="https://github.com/${{ matrix.repo }}"
           RELEASE_URL="$REPO_URL/releases/latest"
 
-          echo "🧩 Enriching components with real file hashes..."
+          echo " Enriching components with real file hashes..."
           TMPFILE="tmp.json"
           cp "$FILE" "$TMPFILE"
 
@@ -145,7 +145,7 @@ jobs:
           done < <(find project-src -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.py" \) | head -50)
 
           mv "$TMPFILE" "$FILE"
-          echo "✅ Real hashes injected successfully."
+          echo " Real hashes injected successfully."
 
       - name: Validate enriched SBOM fields
         run: |
@@ -163,12 +163,12 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           if [ -z "$COSIGN_PRIVATE_KEY" ]; then
-            echo "⚠️ No Cosign key provided — skipping signing."
+            echo " No Cosign key provided — skipping signing."
             exit 0
           fi
           echo "$COSIGN_PRIVATE_KEY" > cosign.key
           cosign sign-blob --key cosign.key project-src/trivy-report.json --output-signature project-src/trivy-report.sig
-          echo "✅ SBOM signed successfully."
+          echo " SBOM signed successfully."
 
       # ---------------------------------------------------------
       # COMPLIANCE & SCORING
@@ -209,18 +209,18 @@ jobs:
       - name: Diagnostic:print zero-score fields
         if: steps.checkout.outcome == 'success'
         run: |
-          echo "🔎 Checking NTIA/BSI compliance zero fields..."
+          echo " Checking NTIA/BSI compliance zero fields..."
           for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
             if [ -f "$FILE" ]; then
-              echo "📘 Analyzing $(basename $FILE)..."
+              echo "Analyzing $(basename $FILE)..."
               jq -r '
-                to_entries[] | select(.value == 0) | "❌ " + .key
-              ' "$FILE" || echo "⚠️ No zero fields found or invalid JSON."
+                to_entries[] | select(.value == 0) | "X " + .key
+              ' "$FILE" || echo " No zero fields found or invalid JSON."
             else
-              echo "⚠️ No compliance file found for $(basename $FILE)"
+              echo " No compliance file found for $(basename $FILE)"
             fi
           done
-          echo "✅ Diagnostic check complete."
+          echo " Diagnostic check complete."
 
       - name: Sanitize artifact name
         id: sanitize
@@ -263,7 +263,7 @@ jobs:
                       if not content: return None
                       return json.loads(content)
               except Exception as e:
-                  print(f"⚠️ Skipping invalid JSON in {path}: {e}")
+                  print(f" Skipping invalid JSON in {path}: {e}")
                   return None
           records = []
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
@@ -279,11 +279,11 @@ jobs:
                       data["standard"] = std
                       records.append(data)
           if not records:
-              print("❌ No valid SBOMQS data found.")
+              print(" No valid SBOMQS data found.")
           else:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
+              print(f" Aggregated {len(records)} SBOMQS results successfully.")
           EOF
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
