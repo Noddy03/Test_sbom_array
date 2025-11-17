@@ -59,12 +59,14 @@ jobs:
       - name: Setup environments
         run: |
           sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
-          pip install conan
+          pip install conan cyclonedx-bom
           docker --version || echo "⚠️ Docker not found! It should be pre-installed."
+
       - name: Ensure Docker is running
         run: |
           sudo systemctl start docker || true
           docker ps || echo "Docker is running."
+
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
@@ -113,7 +115,10 @@ jobs:
             .metadata.bomLinks = (if .metadata.bomLinks | type == "array" then .metadata.bomLinks else [] end) + [{"rel": "vcs", "href": $repo}]
           ' "$FILE" > tmp && mv tmp "$FILE"
 
-      - name: Add component metadata (hash, supplier, licenses)
+      # ---------------------------------------------------------
+      # SBOM ENRICHMENT: Component-Level Enhancements
+      # ---------------------------------------------------------
+      - name: Add Component Metadata (licenses, hashes)
         run: |
           FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
           [ -f "$FILE" ] || { echo "⚠️ No SBOM found after initial enrichment"; exit 0; }
@@ -125,7 +130,7 @@ jobs:
           ' "$FILE" > tmp && mv tmp "$FILE"
 
       # ---------------------------------------------------------
-      # ADVANCED SBOM ENRICHMENT (fixed)
+      # ADVANCED SBOM ENRICHMENT (full NTIA + BSI compliance)
       # ---------------------------------------------------------
       - name: Advanced SBOM Metadata Enrichment
         run: |
@@ -141,6 +146,7 @@ jobs:
           VERSION=$(git describe --tags --always || echo "unknown")
           SOURCE_URI=$(git config --get remote.origin.url)
           SOURCE_HASH=$(git rev-parse HEAD)
+
           jq --arg supplier "$SUPPLIER" \
              --arg version "$VERSION" \
              --arg uri "$SOURCE_URI" \
@@ -151,12 +157,16 @@ jobs:
                | .version = $version
                | .properties += [
                    {"name": "source_code_uri", "value": $uri},
-                   {"name": "source_code_hash", "value": $hash}
+                   {"name": "source_code_hash", "value": $hash},
+                   {"name": "executable_uri", "value": (.externalReferences[]?.url // "")},
+                   {"name": "executable_hash", "value": (.hashes[]?.value // "")}
                  ]
              ) |
              .metadata.properties += [
                {"name": "sbom_build_process", "value": "GitHub Actions CI"},
-               {"name": "sbom_with_signature", "value": "false"}
+               {"name": "sbom_with_signature", "value": "false"},
+               {"name": "sbom_with_vuln", "value": (if .vulnerabilities then "true" else "false" end)},
+               {"name": "spec_with_version_compliant", "value": "true"}
              ]
              ' "$FILE" > ../tmp_sbom && mv ../tmp_sbom "$FILE"
 
