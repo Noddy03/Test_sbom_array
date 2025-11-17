@@ -33,7 +33,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           LANG: ${{ github.event.inputs.language }}
         run: |
-          echo "Fetching top 50 IoT-related repositories written in $LANG..."
+          echo "🔍 Fetching top 50 IoT-related repositories written in $LANG..."
           REPOS=$(gh api /search/repositories \
             --method GET \
             -F q="IoT language:$LANG fork:true archived:false" \
@@ -101,23 +101,38 @@ jobs:
           jq --arg repo "$REPO_URL" --argjson repoInfo "$REPO_JSON" '
             .metadata.timestamp //= (now | todate) |
             .metadata.supplier = $repoInfo.supplier |
+
+            (.metadata.tools //= []) |
+            (.metadata.tools |= (if type == "array" then . else [.] )) |
             .metadata.tools += [{"vendor": "GitHub", "name": "Actions", "version": "latest"}] |
+
+            (.metadata.properties //= []) |
+            (.metadata.properties |= (if type == "array" then . else [.] )) |
             .metadata.properties += [
               {"name": "sbom_build_process", "value": "Trivy CI Scan"},
               {"name": "sbom_with_bomlinks", "value": "true"},
-              {"name": "sbom_with_signature", "value": "false"}
+              {"name": "sbom_with_signature", "value": "false"},
+              {"name": "comp_with_supplier", "value": $repoInfo.supplier}
             ] |
+
+            (.metadata.bomLinks //= []) |
+            (.metadata.bomLinks |= (if type == "array" then . else [.] )) |
             .metadata.bomLinks += [{"rel": "vcs", "href": $repo}] |
-            .components |= map(
+
+            (.components |= map(
+              .properties //= [] |
+              .properties |= (if type == "array" then . else []) |
               .properties += [
                 {"name": "comp_with_source_code_hash", "value": (.hashes[0].content // "false")}
               ]
-            )
+            ))
           ' "$FILE" > enriched.json && mv enriched.json "$FILE"
 
       - name: Validate enriched SBOM
         run: |
+          echo "🔎 SBOM Metadata:"
           jq '.metadata' scan-root/trivy-sbom.json | head -50
+          echo "🔎 First component:"
           jq '.components[0]' scan-root/trivy-sbom.json | head -20
 
       - name: Sanitize artifact name
@@ -134,7 +149,7 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------
-  # OPTIONAL: AGGREGATE & REPORT RESULTS
+  # 3. AGGREGATE RESULTS
   # ---------------------------------------------------------
   aggregate_results:
     name: Aggregate SBOM Results
@@ -158,8 +173,11 @@ jobs:
           import json, glob, pandas as pd
           records = []
           for path in glob.glob("results/**/trivy-sbom.json", recursive=True):
-              with open(path) as f:
-                  records.append(json.load(f))
+              try:
+                  with open(path) as f:
+                      records.append(json.load(f))
+              except Exception as e:
+                  print(f"⚠️ Failed to load {path}: {e}")
           if records:
               df = pd.json_normalize(records)
               df.to_csv("sbom_aggregated_report.csv", index=False)
