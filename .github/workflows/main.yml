@@ -100,8 +100,8 @@ jobs:
       # ---------------------------------------------------------
       - name: Enrich SBOM with metadata
         run: |
-          FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
+          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
+          [ -f "$FILE" ] || { echo "⚠️ No SBOM found after scan"; exit 0; }
           REPO_URL="https://github.com/${{ matrix.repo }}"
           jq --arg repo "$REPO_URL" '
             .metadata.timestamp = (now | todate) |
@@ -115,8 +115,8 @@ jobs:
 
       - name: Add component metadata (hash, supplier, licenses)
         run: |
-          FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
+          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
+          [ -f "$FILE" ] || { echo "⚠️ No SBOM found after initial enrichment"; exit 0; }
           jq '
             .components |= map(
               .licenses = (.licenses // [{"license": {"id": "Apache-2.0"}}]) |
@@ -125,12 +125,17 @@ jobs:
           ' "$FILE" > tmp && mv tmp "$FILE"
 
       # ---------------------------------------------------------
-      # ADVANCED SBOM ENRICHMENT (for full compliance)
+      # ADVANCED SBOM ENRICHMENT (fixed)
       # ---------------------------------------------------------
       - name: Advanced SBOM Metadata Enrichment
         run: |
-          FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
+          FILE="$GITHUB_WORKSPACE/project-src/trivy-report.json"
+          if [ ! -f "$FILE" ]; then
+            echo "⚠️ SBOM file $FILE not found. Listing directory:"
+            ls -R "$GITHUB_WORKSPACE/project-src" || true
+            exit 0
+          fi
+          
           cd project-src
           SUPPLIER=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)/.*|\1|')
           VERSION=$(git describe --tags --always || echo "unknown")
