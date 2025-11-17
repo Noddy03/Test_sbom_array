@@ -61,12 +61,10 @@ jobs:
           sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
           docker --version || echo "⚠️ Docker not found! It should be pre-installed."
-
       - name: Ensure Docker is running
         run: |
           sudo systemctl start docker || true
           docker ps || echo "Docker is running."
-
       - name: Checkout repository
         id: checkout
         uses: actions/checkout@v4
@@ -81,7 +79,6 @@ jobs:
         run: |
           conan profile detect --force
           echo "Conan profile initialized."
-
       - name: Run Trivy SBOM scan
         if: steps.checkout.outcome == 'success'
         continue-on-error: true
@@ -105,26 +102,24 @@ jobs:
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
           REPO_URL="https://github.com/${{ matrix.repo }}"
-
           jq --arg repo "$REPO_URL" '
             .metadata.timestamp = (now | todate) |
-            .metadata.tools += [{"vendor":"GitHub","name":"Actions"}] |
-            .metadata.properties += [
-              {"name":"sbom_build_process","value":"Trivy GitHub Workflow"},
-              {"name":"sbom_with_bomlinks","value":"true"}
+            .metadata.tools = (if .metadata.tools | type == "array" then .metadata.tools else [] end) + [{"vendor": "GitHub", "name": "Actions"}] |
+            .metadata.properties = (if .metadata.properties | type == "array" then .metadata.properties else [] end) + [
+              {"name": "sbom_build_process", "value": "Trivy GitHub Workflow"},
+              {"name": "sbom_with_bomlinks", "value": "true"}
             ] |
-            .metadata.bomLinks += [{"rel":"vcs","href":$repo}]
+            .metadata.bomLinks = (if .metadata.bomLinks | type == "array" then .metadata.bomLinks else [] end) + [{"rel": "vcs", "href": $repo}]
           ' "$FILE" > tmp && mv tmp "$FILE"
 
       - name: Add component metadata (hash, supplier, licenses)
         run: |
           FILE="project-src/trivy-report.json"
           [ -f "$FILE" ] || { echo "⚠️ No SBOM found"; exit 0; }
-
           jq '
             .components |= map(
-              .licenses = (.licenses // [{"license":{"id":"Apache-2.0"}}]) |
-              .properties += [{"name":"comp_with_source_code_hash","value":(.hashes[0].content // "unknown")}]
+              .licenses = (.licenses // [{"license": {"id": "Apache-2.0"}}]) |
+              .properties = (if .properties | type == "array" then .properties else [] end) + [{"name": "component_hash", "value": (.hashes[0].content // "unknown")}]
             )
           ' "$FILE" > tmp && mv tmp "$FILE"
 
@@ -179,6 +174,7 @@ jobs:
     name: Aggregate SBOMQS Results
     needs: sbom_scan
     runs-on: ubuntu-latest
+
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -189,12 +185,10 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
-
       - name: Aggregate SBOMQS Data
         run: |
           python3 <<EOF
           import json, pandas as pd, glob, os
-
           records = []
           for path in glob.glob('results/**/score_evaluation.json', recursive=True):
               with open(path) as f:
@@ -202,11 +196,9 @@ jobs:
                   repo = path.split('/')[-2]
                   data['repository'] = repo
                   records.append(data)
-
           if not records:
               print('❌ No SBOM score data found.')
               exit(0)
-
           df = pd.DataFrame(records)
           df.to_csv('sbomqs_summary.csv', index=False)
           print('📄 SBOM summary created: sbomqs_summary.csv')
