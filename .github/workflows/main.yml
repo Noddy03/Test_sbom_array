@@ -14,17 +14,13 @@ permissions:
   actions: read
 
 jobs:
-  # ---------------------------------------------------------
-  # 1. FETCH TOP IoT REPOSITORIES
-  # ---------------------------------------------------------
   fetch_top_repos:
-    name: Fetch top 50 IoT GitHub repositories (${{
-      github.event.inputs.language}})
+    name: Fetch top 50 IoT GitHub repositories (${{ github.event.inputs.language }})
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq and gh
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
@@ -35,7 +31,7 @@ jobs:
           LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "🔍 Fetching top 50 IoT repositories in $LANG..."
+          echo "🔎 Fetching top 50 IoT repositories in $LANG..."
           REPOS=$(gh api "/search/repositories" \
             --method GET \
             -F q="IoT in:name,description language:$LANG" \
@@ -43,14 +39,10 @@ jobs:
             -F order=desc \
             -F per_page=50 \
             -q '.items[].full_name' || true)
-
           JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "📦 Found $(echo "$JSON_ARRAY" | jq 'length') repositories."
-          echo "repo_list=$JSON_ARRAY" >> "$GITHUB_OUTPUT"
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ---------------------------------------------------------
-  # SBOM PROCESSING JOB
-  # ---------------------------------------------------------
   sbom_scan:
     name: SBOM Scan + Enrichment + NTIA/BSI V2 Compliance
     needs: fetch_top_repos
@@ -62,7 +54,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Setup environments
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq uuid-runtime python3-pip coreutils curl
@@ -78,7 +70,7 @@ jobs:
           fetch-depth: 0
           token: ${{ github.token }}
 
-      - name: Conan setup
+      - name: Detect Conan profile if needed
         if: steps.checkout.outcome == 'success'
         run: |
           conan profile detect --force || true
@@ -99,91 +91,109 @@ jobs:
       - name: Check SBOM existence
         id: sbom_exists
         run: |
-          [ -f "project-src/trivy-report.json" ] && echo "sbom_exists=true" >> "$GITHUB_OUTPUT" || echo "sbom_exists=false" >> "$GITHUB_OUTPUT"
+          [ -f "project-src/trivy-report.json" ] && echo "sbom_exists=true" >> $GITHUB_OUTPUT || echo "sbom_exists=false" >> $GITHUB_OUTPUT
 
       - name: Generate CycloneDX Dependency SBOM
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
-        run: cyclonedx-bom -o project-src/deps.bom.json -e -i ./project-src || true
+        run: |
+          cyclonedx-bom -o project-src/deps.bom.json -e -i project-src || echo "⚠️ Dependency SBOM generation failed."
 
       - name: Merge Trivy SBOM with Dependency SBOM
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           SBOM="project-src/trivy-report.json"
           DEPS="project-src/deps.bom.json"
-
           if [ -s "$DEPS" ]; then
             jq -s '.[0] * .[1]' "$SBOM" "$DEPS" > project-src/merged-sbom.json
             mv project-src/merged-sbom.json "$SBOM"
-            echo "🔄 SBOMs merged."
           else
             echo "⚠️ No dependency SBOM to merge."
           fi
 
-      - name: Enrich SBOM metadata and components
+      - name: Enrich SBOM metadata and components (licenses, URI, hash)
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           SBOM="project-src/trivy-report.json"
-          SUPPLIER="${{ matrix.repo }}"
-          SUPPLIER="${SUPPLIER%%/*}"
-          VCS_URL="https://github.com/${{ matrix.repo }}"
+          TMP="project-src/enriched-sbom.json"
+
+          REPO="${{ matrix.repo }}"
+          SUPPLIER="${REPO%%/*}"
+          REPO_URL="https://github.com/${REPO}"
           VERSION=$(git -C project-src describe --tags --always 2>/dev/null || echo "unknown")
           HASH=$(git -C project-src rev-parse HEAD 2>/dev/null || echo "unknown")
 
           jq --arg supplier "$SUPPLIER" \
              --arg version "$VERSION" \
-             --arg vcs "$VCS_URL" \
+             --arg vcs "$REPO_URL" \
              --arg hash "$HASH" \
           '
           .components |= map(
+            .licenses = (.licenses // [{"license": {"id": "NOASSERTION"}}]) |
+            .properties = (.properties // []) + [
+              {"name": "source_code_uri", "value": $vcs},
+              {"name": "source_hash", "value": $hash}
+            ] |
             .supplier = {"name": $supplier} |
             .version = $version |
-            .licenses = (.licenses // [{"license": {"id": "NOASSERTION"}}]) |
-            .properties += [{"name":"source_code_uri","value":$vcs},{"name":"source_hash","value":$hash}]
+            .externalReferences += [{"type": "vcs", "url": $vcs}]
           ) |
           .metadata.properties += [
-            {"name":"sbom_build_system","value":"GitHub Actions"},
-            {"name":"sbom_dependencies","value":(.dependencies | length > 0 | tostring)}
-          ]' "$SBOM" > project-src/enriched-sbom.json && mv project-src/enriched-sbom.json "$SBOM"
+            {"name": "sbom_source_repo", "value": $vcs},
+            {"name": "generated_by", "value": "GitHub Actions SBOM Workflow"},
+            {"name": "commit_hash", "value": $hash}
+          ]
+          ' "$SBOM" > "$TMP" && mv "$TMP" "$SBOM"
 
-      - name: Inject SHA-256 for source files (safe)
+      - name: Inject SHA-256 hash for source files (safe)
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           SBOM="project-src/trivy-report.json"
-          TMP="project-src/temp_sbom.json"
-          cp "$SBOM" "$TMP"
+          TMP="project-src/tmp sbom.json"
 
-          find project-src -type f | head -n 100 | while read -r SRC; do
+          cp "$SBOM" "$TMP"
+          find project-src -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.py" -o -name "*.js" \) | head -n 100 | \
+          while read -r SRC; do
             HASH=$(sha256sum "$SRC" | awk '{print $1}')
             REL_PATH=$(realpath --relative-to=project-src "$SRC" || echo "$SRC")
 
             jq --arg rel "$REL_PATH" --arg h "$HASH" '
               .components |= map(
-                if (.properties // [] | map(.name) | index("file_hash")) then .
-                else .properties += [{"name":"file_hash","value":$h}]
+                if (.properties // [] | any(.name == "file_hash")) then .
+                else .properties += [{"name": "file_hash", "value": $h}]
                 end
               )
             ' "$TMP" > project-src/tmp2.json && mv project-src/tmp2.json "$TMP"
           done
 
           mv "$TMP" "$SBOM"
+          echo "🟢 File hash injection complete (best effort)."
 
       - name: NTIA Compliance Check
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
-        run: docker run --rm -v "$PWD/project-src":/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+        run: |
+          docker run --rm -v "$PWD/project-src":/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance --ntia /project-src/trivy-report.json \
+            > project-src/compliance_NTIA.json
 
       - name: BSI V2 Compliance Check
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
-        run: docker run --rm -v "$PWD/project-src":/project-src ghcr.io/interlynk-io/sbomqs:latest compliance --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+        run: |
+          docker run --rm -v "$PWD/project-src":/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance --bsi-v2 /project-src/trivy-report.json \
+            > project-src/compliance_BSI.json
 
       - name: Score SBOM
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
-        run: docker run --rm -v "$PWD/project-src":/project-src ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json > project-src/score_evaluation.json
+        run: |
+          docker run --rm -v "$PWD/project-src":/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json \
+            > project-src/score_evaluation.json
 
       - name: Sanitize artifact name
         id: sanitize
         run: |
-          NAME="${{ matrix.repo }}"
-          echo "name=${NAME//\//_}" >> "$GITHUB_OUTPUT"
+          SAFE_NAME="${{ matrix.repo }}"
+          echo "name=${SAFE_NAME//\//_}" >> "$GITHUB_OUTPUT"
 
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
@@ -200,19 +210,20 @@ jobs:
     needs: sbom_scan
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: results/
 
-      - name: Install Python + Pandas
+      - name: Install Python and pandas
         run: |
-          sudo apt-get update && sudo apt-get install -y python3-pip
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
           pip install pandas
 
       - name: Aggregate SBOMQS JSON results
         run: |
-          python3 <<'EOF'
+          python3 << 'EOF'
           import json, glob, pandas as pd, os
 
           def load_json(path):
@@ -224,17 +235,18 @@ jobs:
 
           rows = []
           for f in glob.glob("results/**/score_evaluation.json", recursive=True):
+              repo = os.path.basename(os.path.dirname(f))
               data = load_json(f)
-              if not data: continue
-              repo = f.split("/")[-2]
-              data["repo"] = repo
-              rows.append(data)
+              if data:
+                  data["repo"] = repo
+                  rows.append(data)
 
           df = pd.json_normalize(rows)
           df.to_csv("sbomqs_summary.csv", index=False)
+          print(f"📊 Aggregated {len(rows)} score results.")
           EOF
 
-      - name: Upload Summary
+      - name: Upload summary report
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
