@@ -226,7 +226,7 @@ jobs:
       # ---------------------------------------------------------
       # DIAGNOSTICS & ARTIFACTS
       # ---------------------------------------------------------
-      - name: Diagnostic: Print zero-score fields
+      - name: Diagnostic:Print zero-score fields
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           for FILE in project-src/compliance_*.json; do
