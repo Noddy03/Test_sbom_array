@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------
-  # 1. FETCH TOP IoT REPOSITORIES
+  # 1. FETCH TOP IOT REPOSITORIES
   # ---------------------------------------------------------
   fetch_top_repos:
     name: Fetch top 50 IoT GitHub repositories (${{ github.event.inputs.language }})
@@ -23,12 +23,10 @@ jobs:
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install jq & gh
+      - name: Install jq & curl
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
-          # gh CLI is preinstalled on GitHub-hosted runners; if not, uncomment:
-          # curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
       - name: Fetch top 50 IoT repositories
         id: fetch
         env:
@@ -105,13 +103,13 @@ jobs:
         run: |
           FILE="project-src/trivy-report.json"
           if [ -f "$FILE" ]; then
-            echo "sbom_exists=true" >> "$GITHUB_OUTPUT"
+            echo "sbom_exists=true" >> $GITHUB_OUTPUT
           else
-            echo "sbom_exists=false" >> "$GITHUB_OUTPUT"
+            echo "sbom_exists=false" >> $GITHUB_OUTPUT
           fi
 
       # ---------------------------------------------------------
-      # Generate CycloneDX dependency SBOM
+      # Generate dependency SBOM (CycloneDX)
       # ---------------------------------------------------------
       - name: Generate CycloneDX Dependency SBOM
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
@@ -155,11 +153,10 @@ jobs:
           REPO_URL="https://github.com/${REPO_FULL}"
           RELEASE_URL="${REPO_URL}/releases/latest"
           # supplier is the owner/org (text before '/')
-          SUPPLIER_NAME=$(echo "$REPO_FULL" | cut -d'/' -f1)
+          SUPPLIER_NAME="${REPO_FULL%%/*}"
           VERSION=$(git -C project-src describe --tags --always 2>/dev/null || echo "unknown")
           SOURCE_HASH=$(git -C project-src rev-parse HEAD 2>/dev/null || echo "unknown")
 
-          # preserve existing licenses; set NOASSERTION only if missing or not an array
           jq --arg supplier "$SUPPLIER_NAME" \
              --arg version "$VERSION" \
              --arg uri "$REPO_URL" \
@@ -202,30 +199,29 @@ jobs:
           echo "✅ Enrichment complete."
 
       # ---------------------------------------------------------
-      # Inject real file hashes for common source files (optional)
+      # OPTIONAL: inject real file hashes (best-effort)
       # ---------------------------------------------------------
-      - name: Inject SHA-256 for source files (up to 100 files)
+      - name: Inject SHA-256 for source files (best-effort, up to 100 files)
         if: steps.sbom_exists.outputs.sbom_exists == 'true'
         run: |
           set -euo pipefail
           FILE="project-src/trivy-report.json"
           TMP="project-src/tmp_hash_inject.json"
-          cp "$FILE" "$TMP"
+          cp "$FILE" "$TMP" || true
 
-          # find up to 100 source files
           find project-src -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.py" -o -name "*.jar" -o -name "*.so" \) | head -n 100 | while read -r SRC; do
-            # compute sha256
+            if [ ! -f "$SRC" ]; then continue; fi
             H=$(sha256sum "$SRC" | awk '{print $1}')
-            # relative path to include in externalReferences or properties (avoid huge SBOMs)
             REL=$(realpath --relative-to=project-src "$SRC" || echo "$SRC")
-            jq --arg p "$REL" --arg h "$H" \
-               '(.components[]? | select((.externalReferences[]??.url // "") | contains($p) | not) ) as $skip
-                | .components |= map(
-                    if (.properties // []) | length > 0 then
-                      if (.properties[]? | select(.name=="file_hash" and .value==$h)) then . else . end
-                    else .
-                    end
-                  )
+            # best-effort: append a property entry for file hash if component matches filename
+            jq --arg rel "$REL" --arg h "$H" \
+               '(.components // []) as $c |
+                $c |= map(
+                  if (.externalReferences[]? | .url // "" | contains($rel)) then
+                    .properties = (.properties // []) + [{"name":"file_hash","value":$h},{"name":"file_path","value":$rel}]
+                  else .
+                  end
+                ) | .components = $c
                ' "$TMP" > project-src/tmp2.json && mv project-src/tmp2.json "$TMP" || true
           done
           mv "$TMP" "$FILE" || true
@@ -260,7 +256,7 @@ jobs:
         run: |
           for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
             if [ -f "$FILE" ]; then
-              echo "---- $(basename $FILE) ----"
+              echo "---- $(basename "$FILE") ----"
               jq -r 'to_entries[] | select(.value == 0) | "- " + .key' "$FILE" || echo "No zero fields or invalid JSON"
             else
               echo "Missing $FILE"
@@ -272,7 +268,7 @@ jobs:
         run: |
           SAFE_NAME="${{ matrix.repo }}"
           SAFE_NAME="${SAFE_NAME//\//_}"
-          echo "name=$SAFE_NAME" >> "$GITHUB_OUTPUT"
+          echo "name=$SAFE_NAME" >> $GITHUB_OUTPUT
 
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
