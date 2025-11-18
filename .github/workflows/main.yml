@@ -55,9 +55,6 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
     continue-on-error: true
 
-    env:
-      SBOM_OUT: ${{ github.workspace }}/project-src/trivy-report.json
-
     steps:
       - name: Setup environments
         run: |
@@ -75,51 +72,65 @@ jobs:
           token: ${{ github.token }}
 
       - name: Conan setup
-        if: steps.checkout.outcome == 'success'
         run: conan profile detect --force
+        if: steps.checkout.outcome == 'success'
 
       - name: Run Trivy SBOM scan
-        continue-on-error: true
         uses: aquasecurity/trivy-action@0.25.0
+        if: steps.checkout.outcome == 'success'
+        continue-on-error: true
         with:
           scan-type: fs
           scan-ref: ./project-src
           format: cyclonedx
           scanners: vuln
-          output: ${{ env.SBOM_OUT }}
+          output: project-src/trivy-report.json
           vuln-type: os,library
           severity: CRITICAL,HIGH,MEDIUM
           timeout: 15m
 
-      - name: Check SBOM existence
+      - name: Debug Trivy Output
         run: |
-          if [ ! -f "${{ env.SBOM_OUT }}" ]; then
-            echo "❌ SBOM file not found: ${{ env.SBOM_OUT }}"
-            ls -R "${{ github.workspace }}/project-src" || true
-            exit 0
+          echo "📂 Inspecting project-src for SBOM output:"
+          ls -R ${{ github.workspace }}/project-src || true
+
+      - name: Check SBOM existence
+        id: check_sbom
+        run: |
+          FILE="${{ github.workspace }}/project-src/trivy-report.json"
+          if [ ! -f "$FILE" ]; then
+            echo "❌ SBOM not found at $FILE"
+            echo "sbom_exists=false" >> $GITHUB_OUTPUT
+          else
+            echo "sbom_exists=true" >> $GITHUB_OUTPUT
           fi
-          echo "🟢 SBOM found: ${{ env.SBOM_OUT }}"
 
       # ---------------------------------------------------------
       # Generate Dependency Graph SBOM (CycloneDX)
       # ---------------------------------------------------------
       - name: Generate CycloneDX Dependency SBOM
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
           cyclonedx-bom -o project-src/deps.bom.json -e -i ./project-src || echo "⚠️ Dependency scan failed"
 
       - name: Merge SBOMs
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
-          if [ -f project-src/deps.bom.json ]; then
-            jq -s '.[0] * .[1]' ${{ env.SBOM_OUT }} project-src/deps.bom.json > project-src/merged-sbom.json
-            mv project-src/merged-sbom.json ${{ env.SBOM_OUT }}
+          SBOM="${{ github.workspace }}/project-src/trivy-report.json"
+          DEPS="project-src/deps.bom.json"
+          if [ -f "$DEPS" ]; then
+            jq -s '.[0] * .[1]' "$SBOM" "$DEPS" > project-src/merged-sbom.json
+            mv project-src/merged-sbom.json "$SBOM"
           fi
 
       # ---------------------------------------------------------
       # Enrich SBOM for BSI V2 & NTIA
       # ---------------------------------------------------------
-      - name: Enrich SBOM with required BSI & NTIA fields
+      - name: Enrich SBOM with required fields
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
-          FILE="${{ env.SBOM_OUT }}"
+          FILE="${{ github.workspace }}/project-src/trivy-report.json"
+
           cd "${{ github.workspace }}/project-src"
 
           SUPPLIER=$(git config --get remote.origin.url | sed -E 's|.*github.com[:/](.+)/.*|\1|')
@@ -154,9 +165,10 @@ jobs:
              ' "$FILE" > tmp_sbom && mv tmp_sbom "$FILE"
 
       # ---------------------------------------------------------
-      # Compliance Checks
+      # COMPLIANCE CHECKS
       # ---------------------------------------------------------
       - name: NTIA Compliance Check
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -165,6 +177,7 @@ jobs:
             > project-src/compliance_NTIA.json
 
       - name: BSI V2 Compliance Check
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -173,6 +186,7 @@ jobs:
             > project-src/compliance_BSI.json
 
       - name: Score SBOM
+        if: steps.check_sbom.outputs.sbom_exists == 'true'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
@@ -220,9 +234,9 @@ jobs:
           if records:
               df = pd.DataFrame(records)
               df.to_csv('sbomqs_summary.csv', index=False)
-              print("🟢 Summary created: sbomqs_summary.csv")
+              print("🟢 SBOM summary created: sbomqs_summary.csv")
           else:
-              print("⚠️ No SBOM scores found.")
+              print("⚠️ No SBOM score data found.")
           EOF
 
       - name: Upload Summary Report
