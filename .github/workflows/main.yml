@@ -82,7 +82,7 @@ jobs:
           severity: CRITICAL,HIGH,MEDIUM
           timeout: 15m
 
-      - name: Enrich SBOM with full compliance fields
+      - name: Enrich SBOM with compliance fields
         if: steps.checkout.outcome == 'success'
         run: |
           set -e
@@ -98,10 +98,10 @@ jobs:
           jq --arg repo "$REPO_URL" --arg ts "$TIMESTAMP" '
             .bomFormat = "CycloneDX" |
             .specVersion = "1.5" |
-            .metadata.timestamp //= $ts |
+            .metadata.timestamp = $ts |
             .metadata.component |= (
               if (. == null or . == "" or .name == null) then
-                {"name": ($repo|split("/")[-1]), "type": "application", "version": "UNKNOWN"}
+                {"name": ($repo | split("/")[-1]), "type": "application", "version": "UNKNOWN"}
               else .
               end
             ) |
@@ -132,7 +132,7 @@ jobs:
                 .externalReferences = ((.externalReferences // []) + [
                   {"type":"vcs","url":$repo},
                   {"type":"distribution","url":$release},
-                  {"type": "file", "url": $rel}
+                  {"type":"file","url":$rel}
                 ])
               )
             ' "$FILE" > tmp && mv tmp "$FILE"
@@ -164,10 +164,18 @@ jobs:
             ghcr.io/interlynk-io/sbomqs:latest score /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json
 
+      - name: Prepare artifact name
+        if: steps.checkout.outcome == 'success'
+        run: |
+          SAFE_NAME="${{ matrix.repo }}"
+          SAFE_NAME="${SAFE_NAME//\//_}" # Replace / with _
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: steps.checkout.outcome == 'success'
         with:
-          name: sbom-reports-${{ matrix.repo }}
+          name: sbom-reports-${{ env.SAFE_NAME }}
           path: project-src/*.json
           if-no-files-found: warn
 
@@ -195,20 +203,23 @@ jobs:
                       content = f.read().strip()
                       if not content: return None
                       return json.loads(content)
-              except Exception as e:
-                  return None
+              except: return None
+
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data: data["repository"] = repo; records.append(data)
+
           if not records:
-              print("❌ No valid data found.")
+              print("❌ No valid SBOMQS data found.")
           else:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"✔️ Saved aggregated SBOMQS to sbomqs_summary.csv")
+              print("✔️ Saved aggregated SBOMQS summary.")
+
           EOF
-      - name: Upload Summary
+
+      - name: Upload Summary Artifact
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
