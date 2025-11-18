@@ -97,9 +97,8 @@ jobs:
       - name: Check SBOM existence
         id: check_sbom
         run: |
-          FILE="${{ github.workspace }}/project-src/trivy-report.json"
-          if [ ! -f "$FILE" ]; then
-            echo "❌ SBOM not found at $FILE"
+          if [ ! -f "${{ github.workspace }}/project-src/trivy-report.json" ]; then
+            echo "❌ SBOM not found at project-src/trivy-report.json"
             echo "sbom_exists=false" >> $GITHUB_OUTPUT
           else
             echo "sbom_exists=true" >> $GITHUB_OUTPUT
@@ -194,10 +193,20 @@ jobs:
             /project-src/trivy-report.json --json \
             > project-src/score_evaluation.json
 
+      # ---------------------------------------------------------
+      # Sanitize Artifact Name and Upload Reports
+      # ---------------------------------------------------------
+      - name: Sanitize Artifact Name
+        id: sanitize
+        run: |
+          CLEAN_NAME="${{ matrix.repo }}"
+          CLEAN_NAME="${CLEAN_NAME//\//_}"
+          echo "name=$CLEAN_NAME" >> $GITHUB_OUTPUT
+
       - name: Upload SBOM Reports
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-reports-${{ matrix.repo }}
+          name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*.json
           if-no-files-found: warn
 
