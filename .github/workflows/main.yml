@@ -272,8 +272,9 @@ jobs:
           pip install pandas
       - name: Aggregate SBOMQS results to CSV
         run: |
-          # create aggregation.py safely (no heredoc)
-          printf '%s\n' 'import json, glob, pandas as pd, os' \
+          # Safe Python writer
+          printf '%s\n' \
+          'import json, glob, pandas as pd, os' \
           '' \
           'def load_json_safe(p):' \
           '    try:' \
@@ -284,17 +285,19 @@ jobs:
           '' \
           'rows = []' \
           '' \
-          '# score outputs' \
-          'for path in glob.glob("results/**/score_evaluation.json", recursive=True):' \
+          'print("🔍 Searching for score_evaluation.json...")' \
+          'for path in glob.glob("results/**/*score_evaluation.json", recursive=True):' \
+          '    print(" found:", path)' \
           '    repo = os.path.basename(os.path.dirname(path))' \
           '    d = load_json_safe(path)' \
           '    if d:' \
           '        d["repository"] = repo' \
           '        rows.append(d)' \
           '' \
-          '# compliance outputs' \
+          'print("🔍 Searching for compliance files...")' \
           'for std in ["NTIA", "BSI"]:' \
-          '    for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):' \
+          '    for path in glob.glob(f"results/**/*compliance_{std}.json", recursive=True):' \
+          '        print(" found:", path)' \
           '        repo = os.path.basename(os.path.dirname(path))' \
           '        d = load_json_safe(path)' \
           '        if d:' \
@@ -305,10 +308,12 @@ jobs:
           'if rows:' \
           '    df = pd.json_normalize(rows)' \
           '    df.to_csv("sbomqs_summary.csv", index=False)' \
-          '    print("✔ wrote sbomqs_summary.csv")' \
+          '    print("✔ wrote sbomqs_summary.csv with", len(rows), "records")' \
           'else:' \
-          '    print("⚠ no results found")' \
+          '    print("⚠ no results found — creating empty CSV")' \
+          '    with open("sbomqs_summary.csv", "w") as f:' \
+          '        f.write("repository,standard,message\n")' \
+          '        f.write("none,none,no_results\n")' \
           > aggregation.py
 
-          # run it
           python3 aggregation.py
