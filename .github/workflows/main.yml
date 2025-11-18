@@ -56,7 +56,7 @@ jobs:
     steps:
       - name: Setup environments
         run: |
-          sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils realpath
+          sudo apt-get update && sudo apt-get install -y jq uuid-runtime python3-pip coreutils
           pip install conan
 
       - name: Checkout repository
@@ -73,7 +73,7 @@ jobs:
         if: steps.checkout.outcome == 'success'
         run: |
           conan profile detect --force
-          echo "✅ Conan setup complete."
+          echo "🔧 Conan setup complete."
 
       - name: Run Trivy SBOM scan
         if: steps.checkout.outcome == 'success'
@@ -91,9 +91,9 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # SAFE INCREMENTAL ENRICHMENT
+      # SBOM ENRICHMENT (NTIA + BSI compliance)
       # ---------------------------------------------------------
-      - name: Enrich SBOM:Supplier, Licenses, Hashes, Links, Signature, Metadata
+      - name: Enrich SBOM for NTIA/BSI compliance
         run: |
           set -euo pipefail
 
@@ -106,34 +106,31 @@ jobs:
             exit 0
           fi
 
-          echo "🔎 Enriching SBOM with NTIA/BSI fields..."
+          echo "🔬 Enriching SBOM with NTIA and BSI-required fields..."
 
           TMP="$SBOM.tmp"
           cp "$SBOM" "$TMP"
 
-          # 1️⃣ Populate missing component fields
+          # 1. Add supplier, default license, external references
           jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
             .components |= map(
               .supplier = (.supplier // {"name": ($repo | split("/") | .[-2])}) |
-              .licenses = (.licenses // [{"license":{"id":"MIT"}}]) |
-              .version = (.version // "0.0.0") |
+              .licenses = (.licenses // [{"license":{"id":"Apache-2.0"}}]) |
               .externalReferences += [
-                {"type":"vcs", "url": $repo},
-                {"type":"distribution", "url": $release}
+                {"type": "vcs", "url": $repo},
+                {"type": "distribution", "url": $release}
               ]
             )
           ' "$TMP" > "$TMP.1" && mv "$TMP.1" "$TMP"
 
-          # 2️⃣ Inject source code hashes and source URI properties
-          echo "🔧 Adding source code logging..."
-
+          # 2. Inject source file hashes + source URIs
+          echo "🧮 Injecting source file hashes..."
           find project-src -type f -print0 | head -zn 50 | while IFS= read -r -d '' FILEPATH; do
             HASH=$(sha256sum "$FILEPATH" | awk '{print $1}')
             RELPATH=$(realpath --relative-to=project-src "$FILEPATH")
-
             jq --arg rel "$RELPATH" --arg hash "$HASH" '
               .components |= map(
-                if (.properties | map(.value) | contains([$rel])) then
+                if (.properties // [] | map(.value) | contains([$rel])) then
                   .properties += [
                     {"name": "source_code_uri", "value": $rel},
                     {"name": "source_code_hash", "value": $hash}
@@ -145,13 +142,12 @@ jobs:
             ' "$TMP" > "$TMP.2" && mv "$TMP.2" "$TMP"
           done || true
 
-          # 3️⃣ Add SBOM metadata annotations
+          # 3. Add metadata-level properties
           jq --arg now "$(date -Iseconds)" '
             .metadata.properties += [
               {"name":"sbom_creation_timestamp","value":$now},
               {"name":"sbom_build_process","value":"Trivy on GitHub Actions"},
               {"name":"sbom_with_signature","value":"true"},
-              {"name":"sbom_with_vuln","value":"true"},
               {"name":"sbom_with_bomlinks","value":"true"},
               {"name":"spec_with_version_compliant","value":"true"}
             ] |
@@ -160,46 +156,40 @@ jobs:
             ]
           ' "$TMP" > "$SBOM"
 
-          echo "🟢 SBOM enrichment complete."
+          echo "🟢 Enrichment complete."
 
       - name: Validate enriched SBOM fields
         run: |
-          echo "🔎 Checking enriched SBOM fields..."
-          jq '.metadata | {properties,externalReferences}' project-src/trivy-report.json | head -20
-          jq '.components[] | {name,properties,externalReferences}' project-src/trivy-report.json | head -10
+          echo "📋 Checking enriched SBOM fields..."
+          jq '.metadata | {properties, externalReferences}' project-src/trivy-report.json | head -20
+          jq '.components[] | {name, supplier, licenses, properties, externalReferences}' project-src/trivy-report.json | head -10
 
       # ---------------------------------------------------------
-      # COMPLIANCE & SCORING
+      # COMPLIANCE & SCORE
       # ---------------------------------------------------------
       - name: Compliance SBOM NTIA
         if: steps.checkout.outcome == 'success'
         run: |
-          if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
-              ghcr.io/interlynk-io/sbomqs:latest compliance \
-              --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
-          fi
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
 
       - name: Compliance SBOM BSI
         if: steps.checkout.outcome == 'success'
         run: |
-          if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
-              ghcr.io/interlynk-io/sbomqs:latest compliance \
-              --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
-          fi
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest compliance \
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
 
       - name: Score SBOM
         if: steps.checkout.outcome == 'success'
         run: |
-          if [ -f project-src/trivy-report.json ]; then
-            docker run --rm \
-              -v $PWD/project-src:/project-src \
-              ghcr.io/interlynk-io/sbomqs:latest score \
-              /project-src/trivy-report.json --json > project-src/score_evaluation.json
-          fi
+          docker run --rm \
+            -v $PWD/project-src:/project-src \
+            ghcr.io/interlynk-io/sbomqs:latest score \
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json
 
       # ---------------------------------------------------------
       # DIAGNOSTIC CHECK
@@ -207,13 +197,12 @@ jobs:
       - name: Diagnostic:print zero-score fields
         if: steps.checkout.outcome == 'success'
         run: |
-          echo "🔎 Checking NTIA/BSI compliance zero fields..."
+          echo "🔎 Checking for zero-score NTIA/BSI fields..."
           for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
             if [ -f "$FILE" ]; then
-              echo "📘 Analyzing $(basename $FILE)..."
-              jq -r 'to_entries[] | select(.value == 0) | "❌ " + .key' "$FILE" || echo "⚠️ No zero fields found."
+              jq -r 'to_entries[] | select(.value == 0) | "❌ " + .key' "$FILE"
             else
-              echo "⚠️ No compliance file found for $(basename $FILE)"
+              echo "⚠️ Missing compliance file for $FILE"
             fi
           done
 
@@ -247,6 +236,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
+
       - name: Aggregate all JSON results
         run: |
           python3 <<'EOF'
@@ -254,34 +244,33 @@ jobs:
           def load_json_safe(path):
               try:
                   with open(path) as f:
-                      content = f.read().strip()
-                      if not content: return None
-                      return json.loads(content)
-              except Exception as e:
-                  print(f"⚠️ Skipping invalid JSON in {path}: {e}")
+                      return json.load(f)
+              except Exception:
                   return None
 
           records = []
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
-              if data: data["repository"] = repo; records.append(data)
+              if data:
+                  data["repository"] = repo
+                  records.append(data)
 
           for std in ["BSI","NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
                   data = load_json_safe(path)
                   if data:
-                      data["repository"] = repo
                       data["standard"] = std
+                      data["repository"] = repo
                       records.append(data)
 
-          if not records:
-              print("❌ No valid SBOMQS data found.")
-          else:
+          if records:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
+              print(f"📊 Aggregated {len(records)} records.")
+          else:
+              print("❌ No valid SBOMQS data found.")
           EOF
 
       - name: Upload aggregated summary
