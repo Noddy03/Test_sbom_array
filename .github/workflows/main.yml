@@ -91,18 +91,19 @@ jobs:
           timeout: 10m
 
       # ---------------------------------------------------------
-      # SBOM ENRICHMENT (FULL NTIA/BSI V2 COVERAGE)
+      # SBOM ENRICHMENT (METADATA + COMPONENTS)
       # ---------------------------------------------------------
-      - name: 🛠️ Enrich CycloneDX SBOM (Metadata, Licensing, Hashes, External Refs)
+      - name: 🛠️ Enrich CycloneDX SBOM (Metadata, Components)
         if: steps.checkout.outcome == 'success'
         run: |
-          set -e
+          set -euo pipefail
           FILE="project-src/trivy-report.json"
-          [ -f "$FILE" ] || { echo "❌ SBOM not found"; exit 0; }
           REPO="${{ matrix.repo }}"
           REPO_URL="https://github.com/$REPO"
           RELEASE_URL="$REPO_URL/releases/latest"
           TIMESTAMP=$(date -Iseconds)
+
+          [ -f "$FILE" ] || { echo "❌ SBOM not found"; exit 0; }
 
           echo "🔧 Normalizing SBOM metadata..."
           jq --arg repo "$REPO_URL" --arg ts "$TIMESTAMP" '
@@ -111,7 +112,7 @@ jobs:
             .metadata.timestamp //= $ts |
             .metadata.component |= (.name // $repo | split("/")[-1]) |
             .metadata.licenses //= [{"license": {"id": "NOASSERTION"}}] |
-            .metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end) |
+            .metadata.tools |= (if type=="string" then [{"name": .}] elif type=="object" then [.] elif type=="array" then . else [] end) |
             .metadata.tools += [{"vendor":"Trivy","name":"CycloneDX SBOM Generator"}] |
             .metadata.properties = (.metadata.properties // []) + [
               {"name":"sbom_generator","value":"Trivy"},
@@ -121,32 +122,36 @@ jobs:
             ]
           ' "$FILE" > tmp.json && mv tmp.json "$FILE"
 
-          echo "🧩 Enriching components (license, hash, supplier)..."
+          echo "🧩 Enriching components with license, hash, supplier..."
           TMP="./tmp.json"
           cp "$FILE" "$TMP"
 
-          find project-src -type f -maxdepth 3 -print0 | head -zn 100 | while IFS= read -r -d '' SRC; do
+          # Safely gather up to 100 source files
+          mapfile -d '' FILES < <(find project-src -type f -maxdepth 3 -print0 | head -zn 100 || true)
+
+          for SRC in "${FILES[@]}"; do
             HASH=$(sha256sum "$SRC" | cut -d' ' -f1)
             RELPATH="${SRC#project-src/}"
+
             jq --arg repo "$REPO_URL" --arg rel "$RELPATH" --arg hash "$HASH" --arg release "$RELEASE_URL" '
               .components |= map(
-                .bom-ref //= (.name + ":" + (now|todate|gsub("[-:TZ]"; ""))) |
+                ."bom-ref" //= (.name + ":" + ($hash | slice(0; 8))) |
                 .version //= "UNKNOWN" |
                 .supplier //= {"name": ($repo | split("/")[-2])} |
                 .licenses = (.licenses // [{"license":{"id":"NOASSERTION"}}]) |
-                .hashes //= [{"alg":"SHA-256","content":$hash}] |
+                .hashes |= (. // []) + [{"alg":"SHA-256","content":$hash}] |
                 .externalReferences = (.externalReferences // []) + [
-                  {"type": "vcs", "url": $repo},
-                  {"type": "distribution", "url": $release},
-                  {"type": "other", "comment": "source uri", "url": $rel}
+                  {"type":"vcs","url":$repo},
+                  {"type":"distribution","url":$release},
+                  {"type":"other","comment":"source uri","url":$rel}
                 ]
               )
-            ' "$TMP" > updated_tmp && mv updated_tmp "$TMP"
+            ' "$TMP" > tmp2.json && mv tmp2.json "$TMP"
           done
 
           mv "$TMP" "$FILE"
 
-          echo "🔗 Injecting top-level external references and signature placeholder..."
+          echo "🔗 Adding global references (BOM, Signature)..."
           jq --arg bom "$REPO_URL/raw/main/project-src/trivy-report.json" '
             .metadata.externalReferences += [
               {"type":"bom","url":$bom},
@@ -154,10 +159,10 @@ jobs:
             ]
           ' "$FILE" > tmp.json && mv tmp.json "$FILE"
 
-          echo "🎉 SBOM enriched successfully."
+          echo "🎉 SBOM enrichment complete."
 
       # ---------------------------------------------------------
-      # OPTIONAL: SIGN SBOM (COSIGN)
+      # OPTIONAL: SIGN SBOM
       # ---------------------------------------------------------
       - name: Sign SBOM (if Cosign key available)
         if: steps.checkout.outcome == 'success'
