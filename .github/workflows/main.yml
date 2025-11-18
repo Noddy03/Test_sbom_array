@@ -297,7 +297,7 @@ jobs:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                 repo=os.path.basename(os.path.dirname(path))
                 d=load_json_safe(path)
-               if d:
+              if d:
                   d["repository"]=repo
                   d["standard"]=std
                   rows.append(d)
@@ -308,7 +308,7 @@ jobs:
                 print("✔ wrote sbomqs_summary.csv")
             else:
                     print("⚠ no results found")
-          PY
+                  PY
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
