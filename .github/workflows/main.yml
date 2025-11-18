@@ -103,6 +103,7 @@ jobs:
             echo "sbom_exists=false" >> $GITHUB_OUTPUT
           else
             echo "sbom_exists=true" >> $GITHUB_OUTPUT
+          fi
 
       # ---------------------------------------------------------
       # Generate CycloneDX Dependency SBOM
