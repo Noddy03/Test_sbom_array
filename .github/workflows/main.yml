@@ -25,6 +25,7 @@ jobs:
     steps:
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Fetch top 50 IoT repositories
         id: fetch
         env:
@@ -106,16 +107,19 @@ jobs:
             exit 0
           fi
 
+          echo "🔧 Fixing permissions..."
+          chmod -R u+w project-src/
+
           echo "🔬 Enriching SBOM with NTIA and BSI-required fields..."
 
           TMP="$SBOM.tmp"
           cp "$SBOM" "$TMP"
 
-          # 1. Add supplier, default license, external references
+          # 1. Add supplier, licenses, external references
           jq --arg repo "$REPO_URL" --arg release "$RELEASE_URL" '
             .components |= map(
               .supplier = (.supplier // {"name": ($repo | split("/") | .[-2])}) |
-              .licenses = (.licenses // [{"license":{"id":"Apache-2.0"}}]) |
+              .licenses = (.licenses // [{"license":{"id":"NOASSERTION"}}]) |
               .externalReferences += [
                 {"type": "vcs", "url": $repo},
                 {"type": "distribution", "url": $release}
@@ -123,7 +127,7 @@ jobs:
             )
           ' "$TMP" > "$TMP.1" && mv "$TMP.1" "$TMP"
 
-          # 2. Inject source file hashes + source URIs
+          # 2. Inject source file hashes and URIs
           echo "🧮 Injecting source file hashes..."
           find project-src -type f -print0 | head -zn 50 | while IFS= read -r -d '' FILEPATH; do
             HASH=$(sha256sum "$FILEPATH" | awk '{print $1}')
@@ -142,12 +146,12 @@ jobs:
             ' "$TMP" > "$TMP.2" && mv "$TMP.2" "$TMP"
           done || true
 
-          # 3. Add metadata-level properties
+          # 3. Add SBOM metadata
           jq --arg now "$(date -Iseconds)" '
             .metadata.properties += [
               {"name":"sbom_creation_timestamp","value":$now},
               {"name":"sbom_build_process","value":"Trivy on GitHub Actions"},
-              {"name":"sbom_with_signature","value":"true"},
+              {"name":"sbom_with_signature","value":"false"},
               {"name":"sbom_with_bomlinks","value":"true"},
               {"name":"spec_with_version_compliant","value":"true"}
             ] |
@@ -156,7 +160,7 @@ jobs:
             ]
           ' "$TMP" > "$SBOM"
 
-          echo "🟢 Enrichment complete."
+          echo "🟢 SBOM enrichment complete."
 
       - name: Validate enriched SBOM fields
         run: |
@@ -168,34 +172,30 @@ jobs:
       # COMPLIANCE & SCORE
       # ---------------------------------------------------------
       - name: Compliance SBOM NTIA
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json
+            --ntia /project-src/trivy-report.json > project-src/compliance_NTIA.json || true
 
       - name: Compliance SBOM BSI
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest compliance \
-            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json
+            --bsi-v2 /project-src/trivy-report.json > project-src/compliance_BSI.json || true
 
       - name: Score SBOM
-        if: steps.checkout.outcome == 'success'
         run: |
           docker run --rm \
             -v $PWD/project-src:/project-src \
             ghcr.io/interlynk-io/sbomqs:latest score \
-            /project-src/trivy-report.json --json > project-src/score_evaluation.json
+            /project-src/trivy-report.json --json > project-src/score_evaluation.json || true
 
       # ---------------------------------------------------------
       # DIAGNOSTIC CHECK
       # ---------------------------------------------------------
       - name: Diagnostic:print zero-score fields
-        if: steps.checkout.outcome == 'success'
         run: |
           echo "🔎 Checking for zero-score NTIA/BSI fields..."
           for FILE in project-src/compliance_NTIA.json project-src/compliance_BSI.json; do
@@ -232,6 +232,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: results/
+
       - name: Install Python + Pandas
         run: |
           sudo apt-get update && sudo apt-get install -y python3-pip
@@ -241,25 +242,22 @@ jobs:
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
-          def load_json_safe(path):
+
+          def load_json(path):
               try:
-                  with open(path) as f:
-                      return json.load(f)
-              except Exception:
-                  return None
+                  with open(path) as f: return json.load(f)
+              except: return None
 
           records = []
           for path in glob.glob("results/**/score_evaluation.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
-              data = load_json_safe(path)
-              if data:
-                  data["repository"] = repo
-                  records.append(data)
+              data = load_json(path)
+              if data: data["repository"] = repo; records.append(data)
 
-          for std in ["BSI","NTIA"]:
+          for std in ["BSI", "NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
-                  data = load_json_safe(path)
+                  data = load_json(path)
                   if data:
                       data["standard"] = std
                       data["repository"] = repo
@@ -268,9 +266,9 @@ jobs:
           if records:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"📊 Aggregated {len(records)} records.")
+              print("📊 Aggregated transparency records.")
           else:
-              print("❌ No valid SBOMQS data found.")
+              print("❌ No valid SBOMQS results found.")
           EOF
 
       - name: Upload aggregated summary
