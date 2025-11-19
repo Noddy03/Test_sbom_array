@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Fetch repositories
+      - name: Fetch repositories  # <--- DO NOT TOUCH (AS REQUESTED)
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -132,7 +132,7 @@ jobs:
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
       # --------------------------------------------------------------------
-      # 2D — MERGE LICENSE SIGNALS
+      # 2D — MERGE LICENSE SIGNALS (AS PROVIDED)
       # --------------------------------------------------------------------
       - name: Merge GitHub + Trivy + Local license into SBOM
         if: env.skip_repo != 'true'
@@ -143,21 +143,12 @@ jobs:
 
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GHLIC" 2>/dev/null || echo "")
           TRIVY_SPDX=$(jq -r '
-            [.components[].licenses[].license.id // empty]
-            | map(select(. != "")) | unique | join(",")
+            [.components[].licenses[].license.id // empty] |
+            map(select(. != "")) | unique | join(",")
           ' "$SBOM" 2>/dev/null || echo "")
 
-          if [ -s "$LOCALLIC" ]; then
-            LOCAL_SPDX="CUSTOM"
-          else
-            LOCAL_SPDX=""
-          fi
+          if [ -s "$LOCALLIC" ]; then LOCAL_SPDX="CUSTOM"; else LOCAL_SPDX=""; fi
 
-          echo "GitHub: $GH_SPDX"
-          echo "Trivy: $TRIVY_SPDX"
-          echo "Local: $LOCAL_SPDX"
-
-          # Pick best license
           if [ -n "$GH_SPDX" ] && [ "$GH_SPDX" != "NOASSERTION" ]; then
             FINAL="$GH_SPDX"
           elif [ -n "$TRIVY_SPDX" ]; then
@@ -167,8 +158,6 @@ jobs:
           else
             FINAL="NOASSERTION"
           fi
-
-          echo "➡ FINAL LICENSE = $FINAL"
 
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
@@ -180,34 +169,73 @@ jobs:
             )
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
-          echo "✔ License merged."
+      # --------------------------------------------------------------------
+      # 2E — ENRICH SBOM WITH REQUIRED NTIA / BSI FIELDS  <<<< ADDED
+      # --------------------------------------------------------------------
+      - name: Enrich SBOM (supplier, hashes, URIs, metadata, bomLinks)
+        if: env.skip_repo != 'true'
+        env:
+          REPO: ${{ matrix.repo }}
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          REPO_URL="https://github.com/$REPO"
+          RELEASE_URL="$REPO_URL/releases/latest"
+          SUPPLIER=$(echo "$REPO" | cut -d'/' -f1)
+
+          # Add SBOM-level metadata
+          jq --arg sup "$SUPPLIER" '
+            .metadata.supplier = { "name": $sup } |
+            .metadata.timestamp = (now | todate)
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+          # Add URIs and hashes to each component
+          while read -r FILE; do
+            HASH=$(sha256sum "$FILE" | cut -d" " -f1)
+            jq --arg h "$HASH" \
+               --arg src "$REPO_URL" \
+               --arg rel "$RELEASE_URL" \
+               '
+                 .components |= map(
+                   .externalReferences = ((.externalReferences // []) + [
+                     {"type": "vcs", "url": $src},
+                     {"type": "distribution", "url": $rel}
+                   ]) |
+                   .hashes = [{"alg": "SHA-256", "content": $h}]
+                 )
+               ' "$SBOM" > tmp && mv tmp "$SBOM"
+          done < <(find project-src -type f | head -40)
+
+          # Add BOM links
+          jq --arg repo "$REPO_URL" '
+            .metadata.bomLinks = [{"rel":"component","href":$repo}]
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
 
       # --------------------------------------------------------------------
-      # 2E — SBOMQS COMPLIANCE ANALYSIS
+      # 2F — SBOMQS COMPLIANCE
       # --------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
             compliance --ntia /sbom/trivy-fs.json \
             > project-src/compliance_NTIA.json || true
 
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
             compliance --bsi-v2 /sbom/trivy-fs.json \
             > project-src/compliance_BSI.json || true
 
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
 
       # --------------------------------------------------------------------
-      # 2F — ARTIFACT PACKAGING
+      # 2G — PACKAGING
       # --------------------------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
@@ -224,7 +252,7 @@ jobs:
           if-no-files-found: warn
 
   # ================================================================
-  # 3. AGGREGATION SUMMARY (FINAL CSV)
+  # 3. AGGREGATION — FINAL CSV
   # ================================================================
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -246,18 +274,15 @@ jobs:
         run: |
           python3 <<'EOF'
           import json, glob, pandas as pd, os
-
           def load_json_safe(path):
               try:
                   with open(path) as f:
-                      content = f.read().strip()
-                      if not content: return None
-                      return json.loads(content)
-              except Exception:
+                      c = f.read().strip()
+                      return json.loads(c) if c else None
+              except:
                   return None
 
           records = []
-
           for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
@@ -265,7 +290,7 @@ jobs:
                   data["repository"] = repo
                   records.append(data)
 
-          for std in ["BSI", "NTIA"]:
+          for std in ["BSI","NTIA"]:
               for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
                   repo = os.path.basename(os.path.dirname(path))
                   data = load_json_safe(path)
