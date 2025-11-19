@@ -28,7 +28,7 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Fetch repositories
+      - name: Fetch repositories  # <--- DO NOT TOUCH (AS REQUESTED)
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -37,7 +37,6 @@ jobs:
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           echo "Query: $RAW_Q"
-
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
@@ -45,10 +44,8 @@ jobs:
              --raw-field per_page=50 \
              --jq '.items[].full_name'
           )
-
           echo "Found repos:"
           echo "$REPOS"
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -66,13 +63,12 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-
       - name: Install Conan + jq + Trivy
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget curl
-          pipx install conan
-
+          sudo apt-get install -y jq wget curl python3-pip
+          pip install --upgrade pip
+          pip install conan
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -81,6 +77,7 @@ jobs:
           REPO: ${{ matrix.repo }}
           TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
         run: |
+          set -euo pipefail
           if git clone --depth=1 "https://$TOKEN@github.com/$REPO" project-src; then
               echo "skip_repo=false" >> $GITHUB_ENV
           else
@@ -88,7 +85,7 @@ jobs:
           fi
 
       # --------------------------------------------------------------------
-      # Fetch GitHub License
+      # 2A — GITHUB LICENSE API
       # --------------------------------------------------------------------
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
@@ -96,57 +93,66 @@ jobs:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "/repos/$REPO/license" > project-src/gh-license.json \
+          set -euo pipefail
+          # use proper accept header and fallback to NOASSERTION if 404/unavailable
+          gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       # --------------------------------------------------------------------
-      # Local license detection
+      # 2B — LOCAL LICENSE DETECTION (fallback)
       # --------------------------------------------------------------------
-      - name: Local license file detection
+      - name: Local license file detection (fallback)
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
+          echo "🔎 Searching for local license files..."
           FILE=$(find project-src -maxdepth 4 -type f \
             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" \
-            | head -1)
+            | head -1 || true)
           if [ -n "$FILE" ]; then
-            cat "$FILE" > project-src/local-license.txt
+            echo "📄 Found local license file: $FILE"
+            cp "$FILE" project-src/local-license.txt
           else
+            echo "⚠️ No local license file found."
             echo "" > project-src/local-license.txt
           fi
 
       # --------------------------------------------------------------------
-      # Build SBOMs
+      # 2C — BUILD SBOMS
       # --------------------------------------------------------------------
       - name: Conan SBOM
         if: env.skip_repo != 'true'
         run: |
-          cd project-src
+          set -euo pipefail
+          cd project-src || exit 1
           conan profile detect --force || true
-          conan graph info . --format=json > conan-sbom.json \
-            || echo '{"components":[]}' > conan-sbom.json
+          conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
           trivy fs --scanners vuln,license --format cyclonedx \
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
       # --------------------------------------------------------------------
-      # License Merge Logic (unchanged)
+      # 2D — MERGE LICENSE SIGNALS (GitHub -> Trivy -> Local -> NOASSERTION)
       # --------------------------------------------------------------------
       - name: Merge GitHub + Trivy + Local license into SBOM
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
           SBOM="project-src/trivy-fs.json"
           GHLIC="project-src/gh-license.json"
           LOCALLIC="project-src/local-license.txt"
 
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GHLIC" 2>/dev/null || echo "")
           TRIVY_SPDX=$(jq -r '
-            [.components[].licenses[].license.id // empty]
+            [.components[]?.licenses[]?.license?.id // empty]
             | map(select(. != "")) | unique | join(",")
           ' "$SBOM" 2>/dev/null || echo "")
+
           LOCAL_SPDX=""
           if [ -s "$LOCALLIC" ]; then LOCAL_SPDX="CUSTOM"; fi
 
@@ -163,78 +169,94 @@ jobs:
           jq --arg lic "$FINAL" '
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .components |= map(
-              if (.licenses | length == 0)
-              then .licenses = [{ "license": { "id": $lic }}]
-              else .
-              end
+              if (.licenses | length) == 0 then .licenses = [{ "license": { "id": $lic }}] else . end
             )
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
       # --------------------------------------------------------------------
-      # ENRICH SBOM (supplier, hashes, bomLinks, metadata, signature, URIs)
+      # 2E — ENRICH SBOM WITH REQUIRED NTIA / BSI FIELDS (component-level)
       # --------------------------------------------------------------------
-      - name: Enrich SBOM for NTIA + BSI v2
+      - name: Enrich SBOM for NTIA + BSI v2 (fixed jq handling)
         if: env.skip_repo != 'true'
         env:
           REPO: ${{ matrix.repo }}
         run: |
+          set -euo pipefail
           SBOM="project-src/trivy-fs.json"
-
-          OWNER=$(echo "$REPO" | cut -d'/' -f1)
           REPO_URL="https://github.com/$REPO"
+          OWNER=$(echo "$REPO" | cut -d'/' -f1)
 
+          # create minimal sbom if missing
+          if [ ! -f "$SBOM" ] || [ ! -s "$SBOM" ]; then
+            echo '{"bomFormat":"CycloneDX","components":[],"metadata":{}}' > "$SBOM"
+          fi
+
+          # compute SBOM-level sha256
           FULL_SHA=$(sha256sum "$SBOM" | awk '{print $1}')
+          echo "SBOM SHA256: $FULL_SHA"
 
-          jq --arg owner "$OWNER" \
-             --arg repo "$REPO" \
-             --arg url "$REPO_URL" \
-             --arg sha "$FULL_SHA" '
-            .metadata.supplier = {
-              "name": $owner,
-              "url": ("https://github.com/" + $owner)
-            } |
+          # safe jq transformation: normalize arrays/objects before adding
+          jq --arg owner "$OWNER" --arg repo "$REPO" --arg repourl "$REPO_URL" --arg sha "$FULL_SHA" '
+            # normalize metadata.tools, metadata.properties, metadata.bomLinks, metadata.externalReferences
+            .metadata.tools |= (if type=="object" then [.] elif type=="array" then . else [] end) |
+            .metadata.properties |= (if type=="object" then [.] elif type=="array" then . else [] end) |
+            .metadata.bomLinks |= (if type=="object" then [.] elif type=="array" then . else [] end) |
+            .metadata.externalReferences |= (if type=="object" then [.] elif type=="array" then . else [] end) |
+
+            # add tool info (Trivy) safely
             .metadata.tools += [{
               "vendor": "Aqua Security",
               "name": "Trivy",
               "version": "CycloneDX"
             }] |
-            ( .metadata.timestamp = (now | todate) ) |
-            .metadata.bomLinks = [
-              { "rel": "self", "href": ("https://github.com/" + $repo + "/sbom") },
-              { "rel": "repository", "href": $url },
-              { "rel": "distribution", "href": ($url + "/releases") }
-            ] |
-            .signature = {
-              "algorithm": "SHA-256",
-              "value": $sha
+
+            # supplier metadata (repo owner)
+            .metadata.supplier = {
+              "name": $owner,
+              "url": ("https://github.com/" + $owner)
             } |
+
+            # add build metadata
+            .metadata.properties += [
+              {"name":"build.environment","value":"GitHub Actions (ubuntu-latest)"},
+              {"name":"build.timestamp","value":(now|todate)}
+            ] |
+
+            # bomLinks
+            .metadata.bomLinks += [
+              {"rel":"self","href":("https://github.com/" + $repo + "/sbom")},
+              {"rel":"repository","href": $repourl},
+              {"rel":"distribution","href": ($repourl + "/releases")}
+            ] |
+
+            # signature (simple SBOM-level signature)
+            .signature = {"algorithm":"SHA-256","value":$sha} |
+
+            # Ensure components exists as array
+            .components |= (if . == null then [] else . end) |
+
+            # map over components: set supplier, hashes, externalReferences, ensure licenses exist
             .components |= map(
-              .supplier = {
-                "name": $owner,
-                "url": ("https://github.com/" + $owner)
-              } |
-              .hashes = [
-                { "alg": "SHA-256", "content": $sha }
-              ] |
-              .externalReferences += [
-                {
-                  "type": "vcs",
-                  "url": $url
-                },
-                {
-                  "type": "distribution",
-                  "url": ($url + "/releases")
-                }
-              ]
+              (. // {}) |
+              .supplier = (.supplier // {"name": $owner, "url": ("https://github.com/" + $owner)}) |
+              .hashes = (if (.hashes // []) | length == 0 then [{"alg":"SHA-256","content":$sha}] else .hashes end) |
+              .externalReferences = ((.externalReferences // []) + [
+                {"type":"vcs","url": $repourl},
+                {"type":"distribution","url": ($repourl + "/releases")}
+              ]) |
+              .licenses = (if (.licenses // []) | length == 0 then [{ "license": { "id": "NOASSERTION" }}] else .licenses end)
             )
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
+          echo "✔ Enrichment inserted: component.supplier, component.hashes, externalReferences, metadata, bomLinks, signature."
+
       # --------------------------------------------------------------------
-      # SBOMQS Compliance (NTIA + BSI + Score)
+      # 2F — SBOMQS COMPLIANCE (NTIA / BSI) and Score (with safe fallbacks)
       # --------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
             > project-src/compliance_NTIA.json || echo '{}' > project-src/compliance_NTIA.json
@@ -242,6 +264,7 @@ jobs:
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/trivy-fs.json \
             > project-src/compliance_BSI.json || echo '{}' > project-src/compliance_BSI.json
@@ -249,16 +272,18 @@ jobs:
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
+          set -euo pipefail
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || echo '{}' > project-src/score.json
 
       # --------------------------------------------------------------------
-      # Package artifacts
+      # 2G — PACKAGING / UPLOAD
       # --------------------------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
+          set -euo pipefail
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
@@ -271,7 +296,7 @@ jobs:
           if-no-files-found: warn
 
   # ================================================================
-  # 3. AGGREGATION SUMMARY — FIX MODE A (NEW)
+  # 3. AGGREGATION SUMMARY — FIX MODE A (recursively find all JSONs)
   # ================================================================
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -305,13 +330,21 @@ jobs:
 
           records = []
           for path in json_files:
-              base = os.path.basename(os.path.dirname(path))
+              # repository is guessed from the artifact directory name if possible
+              parts = path.split(os.sep)
+              repo = parts[1] if len(parts) > 1 else ""
               data = load_json_safe(path)
               if not data:
                   continue
-              row = {"repository": base, "file": os.path.basename(path)}
+              row = {"repository_artifact_dir": repo, "file": os.path.basename(path)}
               if isinstance(data, dict):
-                  row.update(data)
+                  # flatten top-level keys (careful: may be nested)
+                  for k,v in data.items():
+                      # only include primitive top-level items to avoid heavy nesting
+                      if isinstance(v, (str, int, float, bool)) or v is None:
+                          row[k] = v
+                  # include the whole object under a json column
+                  row["json"] = json.dumps(data)
               records.append(row)
 
           if not records:
