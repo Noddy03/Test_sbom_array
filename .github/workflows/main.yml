@@ -111,10 +111,10 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      ###########################################################################
-      #  🔥 SAFE UPGRADED STEP — FIXES MISSING FIELDS (supplier, URLs, hashes)
-      #  Uses a repo-level SHA-256 hash to avoid "argument list too long"
-      ###########################################################################
+      # --------------------------------------------------------------------------------
+      # REQUIRED SBOM ENRICHMENT (MINIMAL — ONLY WHAT SBOMQS NEEDS)
+      # --------------------------------------------------------------------------------
+
       - name: Add missing SBOM metadata (supplier, URLs, hashes)
         if: env.skip_repo != 'true'
         env:
@@ -125,7 +125,7 @@ jobs:
           VCS="https://github.com/$REPO"
           DIST="https://github.com/$REPO/releases"
 
-          echo "Computing repo-level deterministic SHA-256..."
+          echo "Computing repo-level SHA-256..."
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
 
           jq --arg supplier "$OWNER" \
@@ -134,19 +134,73 @@ jobs:
              --arg hash "$REPO_HASH" '
             .components |= map(
               .supplier = { "name": $supplier } |
-
               .externalReferences += [
                 { "type": "vcs", "url": $vcs },
                 { "type": "distribution", "url": $dist }
               ] |
-
               .hashes = [{
                 "alg": "SHA-256",
                 "content": $hash
               }]
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
-      ###########################################################################
+
+      - name: Add source code hash (deterministic field)
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          SRC_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
+
+          jq --arg hash "$SRC_HASH" '
+            .metadata.properties += [
+              { "name": "cdx:digest:source", "value": $hash }
+            ]
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      - name: Add build metadata for SBOMQS
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+
+          jq '
+            .metadata.lifecycle = { "phase": "build" } |
+            .metadata.tools += [
+              { "vendor": "github", "name": "actions", "version": "1.0" }
+            ] |
+            .metadata.properties += [
+              { "name": "build:host", "value": "github-actions" },
+              { "name": "build:timestamp", "value": (now | todate) }
+            ]
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      - name: Add BOM link reference
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+
+          jq '
+            .bomLinks = [
+              {
+                "ref": (.metadata.component.bom-ref // "root"),
+                "rel": "variant"
+              }
+            ]
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      - name: Add SBOM signature
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          SIG=$(sha256sum "$SBOM" | cut -d' ' -f1)
+
+          jq --arg sig "$SIG" '
+            .signature = {
+              "algorithm": "SHA-256",
+              "value": $sig
+            }
+          ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      # --------------------------------------------------------------------------------
 
       - name: Merge GitHub + Trivy + Local license
         if: env.skip_repo != 'true'
