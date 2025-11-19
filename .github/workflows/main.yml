@@ -147,38 +147,53 @@ jobs:
   # 3. AGGREGATION – TSV SUMMARY (SAFE JSON HANDLING)
   # ================================================================
   aggregate_results:
-    runs-on: ubuntu-latest
+    name: Aggregate SBOMQS Results
     needs: sbom_scan
-
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: results/
-
-      - name: Install jq
-        run: sudo apt-get install -y jq
-
-      - name: Aggregate JSON → TSV (safe)
+      - name: Install Python + Pandas
         run: |
-          echo -e "repo\tfile\tjson_valid\tstatus" > sbomqs_summary.tsv
-
-          for f in $(find results -name "*.json"); do
-            REPO=$(basename "$(dirname "$f")")
-            FILE=$(basename "$f")
-
-            if jq empty "$f" 2>/dev/null; then
-              JSON_VALID="yes"
-              STATUS=$(jq -r '.status // .compliance_status // .score.overall // .score // "ok"' "$f" 2>/dev/null)
-            else
-              JSON_VALID="no"
-              STATUS="invalid_json"
-            fi
-
-            echo -e "${REPO}\t${FILE}\t${JSON_VALID}\t${STATUS}" >> sbomqs_summary.tsv
-          done
-
-      - name: Upload final TSV
+          sudo apt-get update && sudo apt-get install -y python3-pip
+          pip install pandas
+      - name: Aggregate all JSON results
+        run: |
+          python3 <<'EOF'
+          import json, glob, pandas as pd, os
+          def load_json_safe(path):
+              try:
+                  with open(path) as f:
+                      content = f.read().strip()
+                      if not content: return None
+                      return json.loads(content)
+              except Exception as e:
+                  print(f"⚠️ Skipping invalid JSON in {path}: {e}")
+                  return None
+          records = []
+          for path in glob.glob("results/**/score_evaluation.json", recursive=True):
+              repo = os.path.basename(os.path.dirname(path))
+              data = load_json_safe(path)
+              if data: data["repository"] = repo; records.append(data)
+          for std in ["BSI","NTIA"]:
+              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
+                  repo = os.path.basename(os.path.dirname(path))
+                  data = load_json_safe(path)
+                  if data:
+                      data["repository"] = repo
+                      data["standard"] = std
+                      records.append(data)
+          if not records:
+              print("❌ No valid SBOMQS data found.")
+          else:
+              df = pd.json_normalize(records)
+              df.to_csv("sbomqs_summary.csv", index=False)
+              print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
+          EOF
+      - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
         with:
-          name: sbomqs_summary
-          path: sbomqs_summary.tsv
+          name: sbomqs-summary
+          path: sbomqs_summary.csv
