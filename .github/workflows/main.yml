@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan 
 
 on:
   workflow_dispatch:
