@@ -14,9 +14,9 @@ permissions:
   actions: read
 
 jobs:
-  # ================================================================
-  # 1. FETCH TOP REPOS
-  # ================================================================
+  # ===================================================================
+  # 1. FETCH TOP REPOSITORIES
+  # ===================================================================
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -36,17 +36,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          # FIXED — remove quotes around language
+          # FIXED: GitHub API requires URL-encoded query, no quotes in language
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
-          echo "Query: $RAW_Q"
+          Q=$(printf "%s" "$RAW_Q" | sed 's/ /+/g')
 
-          REPOS=$(gh api -X GET /search/repositories \
-             --raw-field q="$RAW_Q" \
-             --raw-field sort=stars \
-             --raw-field order=desc \
-             --raw-field per_page=50 \
-             --jq '.items[].full_name'
-          )
+          echo "Query: $Q"
+
+          REPOS=$(gh api -X GET "/search/repositories?q=$Q&sort=stars&order=desc&per_page=50" \
+              --jq '.items[].full_name')
 
           echo "Found repos:"
           echo "$REPOS"
@@ -54,9 +51,10 @@ jobs:
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-  # ================================================================
-  # 2. SBOM SCAN
-  # ================================================================
+
+  # ===================================================================
+  # 2. SBOM GENERATION + NTIA + BSI-V2 SCORING
+  # ===================================================================
   sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -68,26 +66,26 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Install Conan + jq + Trivy (SAFE installer)
+      - name: Install Conan + jq + Trivy
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl
 
           pipx install conan
 
-          # FIXED — SAFE, always working Trivy installer
+          # FIXED: Always-working Trivy installer
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-      - name: Checkout repository
+      - name: Checkout
         env:
           REPO: ${{ matrix.repo }}
-          TOKEN: ${{ secrets.MY_PERSONAL_TOKEN || github.token }}
+          TOKEN: ${{ github.token }}
         run: |
           if git clone --depth=1 "https://$TOKEN@github.com/$REPO" project-src; then
-              echo "skip_repo=false" >> $GITHUB_ENV
+            echo "skip_repo=false" >> $GITHUB_ENV
           else
-              echo "skip_repo=true" >> $GITHUB_ENV
+            echo "skip_repo=true" >> $GITHUB_ENV
           fi
 
       - name: Fetch GitHub license metadata
@@ -110,46 +108,48 @@ jobs:
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
         run: |
-          trivy fs --scanners vuln,license --format cyclonedx \
+          trivy fs --scanners vuln,license \
+            --format cyclonedx \
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      - name: NTIA
+      - name: SBOM-QS NTIA
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v "$PWD/project-src":/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || true
+            > project-src/ntia.json || true
 
-      - name: BSI v2
+      - name: SBOM-QS BSI-V2
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v "$PWD/project-src":/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || true
+            > project-src/bsi-v2.json || true
 
-      - name: Score
+      - name: SBOM-QS Full Score
         if: env.skip_repo != 'true'
         run: |
-          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+          docker run --rm -v "$PWD/project-src":/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
 
-      - name: Sanitize name
+      - name: Sanitize artifact name
         run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+          NAME="${{ matrix.repo }}"
+          NAME="${NAME//\//_}"
+          echo "SAFE_NAME=$NAME" >> $GITHUB_ENV
 
-      - name: Upload artifacts
+      - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ env.SAFE_NAME }}
           path: project-src/*.json
 
-  # ================================================================
-  # 3. AGGREGATION – NO PYTHON
-  # ================================================================
+
+  # ===================================================================
+  # 3. FINAL AGGREGATION — GENERATE TSV SUMMARY WITH FULL JSON
+  # ===================================================================
   aggregate_results:
     runs-on: ubuntu-latest
     needs: sbom_scan
@@ -162,19 +162,19 @@ jobs:
       - name: Install jq
         run: sudo apt-get install -y jq
 
-      - name: Aggregate JSON → CSV
+      - name: Build summary (TSV w/ full JSON in one cell)
         run: |
-          echo "repository,file,status" > sbomqs_summary.csv
+          echo -e "repo\tfile\tjson" > sbomqs_summary.tsv
 
           for f in $(find results -name "*.json"); do
             REPO=$(basename "$(dirname "$f")")
             FILE=$(basename "$f")
-            STATUS=$(jq -r '.status // "unknown"' "$f" 2>/dev/null || echo "unknown")
-            echo "$REPO,$FILE,$STATUS" >> sbomqs_summary.csv
+            RAW=$(jq -c '.' "$f")
+            echo -e "$REPO\t$FILE\t$RAW" >> sbomqs_summary.tsv
           done
 
-      - name: Upload final CSV
+      - name: Upload final summary
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs_summary
-          path: sbomqs_summary.csv
+          path: sbomqs_summary.tsv
