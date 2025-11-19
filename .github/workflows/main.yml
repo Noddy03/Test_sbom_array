@@ -16,10 +16,11 @@ permissions:
 jobs:
 
   # -------------------------------------------------------------
-  # 1. FETCH TOP IoT REPOSITORIES
+  # 1. FETCH IoT REPOS
   # -------------------------------------------------------------
   fetch_repos:
     runs-on: ubuntu-latest
+
     outputs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
 
@@ -27,26 +28,30 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Collect top repositories
+      - name: Collect repositories using GitHub Search
         id: collect
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           LANG="${{ inputs.language }}"
+
           QUERY="topic:IoT language:\"$LANG\" fork:false archived:false"
 
-          # Fetch top 20 repos
-          gh search repos "$QUERY" --limit 20 --json fullName \
+          echo "Searching: $QUERY"
+
+          # Fetch top 20 repos (safe JSON)
+          gh search repos "$QUERY" --json fullName --limit 20 \
             | jq -r '.[].fullName' > repos.txt
 
-          # Convert to SINGLE-LINE JSON ARRAY
+          # Convert to single-line JSON array
           JSON=$(jq -Rc 'split("\n")[:-1]' repos.txt)
 
-          echo "repo_list=$JSON" >> $GITHUB_OUTPUT
+          # Always quote JSON output (fixes GitHub invalid format error)
+          echo "repo_list=\"$JSON\"" >> $GITHUB_OUTPUT
 
 
   # -------------------------------------------------------------
-  # 2. SCAN + SBOM + LICENSES
+  # 2. SCAN REPOS
   # -------------------------------------------------------------
   scan:
     needs: fetch_repos
@@ -60,42 +65,39 @@ jobs:
 
     steps:
 
-      - name: Prepare system
+      - name: Install tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl python3-pip
           pip install conan
 
-      - name: Checkout repository
+      - name: Clone repository
         env:
           TOKEN: ${{ github.token }}
         run: |
           git clone --depth=1 https://$TOKEN@github.com/${{ matrix.repo }} repo \
             || echo "clone_failed=true" >> $GITHUB_ENV
 
-      - name: Skip if clone failed
+      - name: Exit if clone failed
         if: env.clone_failed == 'true'
         run: exit 0
 
-      # -----------------------------------------------------------
-      # CONAN SBOM
-      # -----------------------------------------------------------
-      - name: Conan detect
+      # ---------------- CONAN SBOM ----------------
+      - name: Conan detect profiles
         run: conan profile detect --force || true
 
       - name: Generate Conan SBOM
         run: |
           cd repo
-          conan graph info . --format=json > ../conan-sbom.json || echo '{"components":[]}' > ../conan-sbom.json
+          conan graph info . --format=json > ../conan-sbom.json \
+            || echo '{"components":[]}' > ../conan-sbom.json
 
-      # -----------------------------------------------------------
-      # TRIVY ANALYSIS OF SBOM (LICENSE + VULN)
-      # -----------------------------------------------------------
+      # ---------------- TRIVY SBOM ANALYSIS ----------------
       - name: Install Trivy
         run: |
           curl -L https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -
 
-      - name: Analyze SBOM using Trivy
+      - name: Analyze SBOM with Trivy
         run: |
           ./trivy sbom conan-sbom.json \
             --format cyclonedx \
@@ -103,10 +105,8 @@ jobs:
             --output trivy-sbom.json \
             || echo '{"components":[]}' > trivy-sbom.json
 
-      # -----------------------------------------------------------
-      # GITHUB API LICENSE FOR MAIN REPO
-      # -----------------------------------------------------------
-      - name: Fetch GitHub license of repo
+      # ---------------- GITHUB LICENSE API ----------------
+      - name: Fetch GitHub license
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -117,10 +117,8 @@ jobs:
             --jq '{license: .license.spdx_id}' > gh-license.json \
             || echo '{"license":"NOASSERTION"}' > gh-license.json
 
-      # -----------------------------------------------------------
-      # CREATE FINAL MERGED SBOM WITHOUT PYTHON
-      # -----------------------------------------------------------
-      - name: Create merged SBOM (Bash-only)
+      # ---------------- MERGE SBOMs WITHOUT PYTHON ----------------
+      - name: Merge SBOM (Bash only)
         run: |
           SPDX=$(jq -r '.license' gh-license.json)
 
@@ -133,31 +131,27 @@ jobs:
             )
           ' trivy-sbom.json > merged-sbom.json
 
-      # -----------------------------------------------------------
-      # SBOMQS CHECKS
-      # -----------------------------------------------------------
-      - name: SBOMQS NTIA
+      # ---------------- SBOMQS ----------------
+      - name: NTIA Compliance
         run: |
           docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/merged-sbom.json \
             > compliance_NTIA.json || true
 
-      - name: SBOMQS BSI
+      - name: BSI V2 Compliance
         run: |
           docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/merged-sbom.json \
             > compliance_BSI.json || true
 
-      - name: SBOMQS Score
+      - name: Score SBOM
         run: |
           docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/merged-sbom.json --json \
             > score.json || true
 
-      # -----------------------------------------------------------
-      # Upload artifacts
-      # -----------------------------------------------------------
-      - name: Safe repo name
+      # ---------------- UPLOAD RESULTS ----------------
+      - name: Safe name
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
@@ -174,27 +168,26 @@ jobs:
 
 
   # -------------------------------------------------------------
-  # 3. AGGREGATE RESULTS INTO CSV (NO PYTHON)
+  # 3. AGGREGATE (NO PYTHON)
   # -------------------------------------------------------------
   aggregate:
     needs: scan
     runs-on: ubuntu-latest
 
     steps:
-
       - uses: actions/download-artifact@v4
         with:
           path: results/
 
-      - name: Create CSV without Python
+      - name: Build CSV (no Python)
         run: |
           echo "repository,file,status" > sbom-summary.csv
 
           for repo in results/*; do
-            r=$(basename "$repo")
+            repo_name=$(basename "$repo")
             for file in "$repo"/*.json; do
               f=$(basename "$file")
-              echo "$r,$f,OK" >> sbom-summary.csv
+              echo "$repo_name,$f,OK" >> sbom-summary.csv
             done
           done
 
