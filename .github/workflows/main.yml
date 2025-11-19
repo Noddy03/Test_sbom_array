@@ -53,21 +53,14 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      # -------------------------------------------------------------------------
-      # FIX: remove docker.io (conflicts with builtin containerd)
-      # -------------------------------------------------------------------------
       - name: Install Conan + jq + Trivy (safe, non-conflicting)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip
           pip install --upgrade pip
           pip install conan
-
-          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-
-          # Ensure Docker exists (GitHub runners already have it)
           docker --version || sudo systemctl start docker || true
 
       - name: Checkout repository
@@ -107,9 +100,6 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
             || echo '{"components":[]}' > conan-sbom.json
 
-      # -------------------------------------------------------------------------
-      # FIX: Trivy must output VALID CycloneDX 1.4 JSON for SBOMQS
-      # -------------------------------------------------------------------------
       - name: Trivy SBOM (CycloneDX 1.4 JSON)
         if: env.skip_repo != 'true'
         run: |
@@ -118,9 +108,9 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > project-src/trivy-fs.json
 
-      # -------------------------------------------------------------------------
-      # Normalize SBOM
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
+      # PERMANENT NORMALIZATION FIXES
+      # -------------------------------------------------------------------------------------
       - name: Normalize SBOM structure (permanent fix)
         if: env.skip_repo != 'true'
         run: |
@@ -130,16 +120,37 @@ jobs:
             .specVersion = (.specVersion // "1.4") |
             .version = (.version // 1) |
             .metadata = (.metadata // {}) |
-            .metadata.component = (.metadata.component // { "bomRef": "root" }) |
-            .metadata.properties = ((.metadata.properties // []) | arrays) |
-            .metadata.tools = ((.metadata.tools // []) | arrays) |
-            .metadata.licenses = ((.metadata.licenses // []) | arrays) |
-            .components = (if (.components | type) == "array" then .components else [] end)
+
+            # Fix component shape
+            .metadata.component = (
+              if (.metadata.component | type) == "object" then
+                .metadata.component
+              else
+                { "bomRef": "root" }
+              end
+            ) |
+
+            # Arrays always arrays
+            .metadata.properties = (
+              if (.metadata.properties | type) == "array" then .metadata.properties else [] end
+            ) |
+            .metadata.tools = (
+              if (.metadata.tools | type) == "array" then .metadata.tools else [] end
+            ) |
+            .metadata.licenses = (
+              if (.metadata.licenses | type) == "array" then .metadata.licenses else [] end
+            ) |
+
+            # Components array fix
+            .components = (
+              if (.components | type) == "array" then .components else [] end
+            )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
       # PATCH METADATA
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
+
       - name: Add missing SBOM metadata
         if: env.skip_repo != 'true'
         env:
@@ -218,9 +229,9 @@ jobs:
             }
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
       # LICENSE MERGE
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
       - name: Merge GitHub + Trivy + Local license
         if: env.skip_repo != 'true'
         run: |
@@ -244,29 +255,29 @@ jobs:
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
       # SBOMQS
-      # -------------------------------------------------------------------------
+      # -------------------------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || true
+            > project-src/compliance_NTIA.json || echo '{}' > project-src/compliance_NTIA.json
 
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || true
+            > project-src/compliance_BSI.json || echo '{}' > project-src/compliance_BSI.json
 
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
-            > project-src/score.json || true
+            > project-src/score.json || echo '{}' > project-src/score.json
 
       - name: Sanitize artifact name
         id: sanitize
@@ -302,36 +313,44 @@ jobs:
       - name: Aggregate SBOMQS results to CSV
         run: |
           python3 <<'PY'
-          import json, glob, pandas as pd, os
-          def load_json_safe(path):
-              try:
-                  with open(path, "r") as f:
-                      txt = f.read().strip()
-                      return json.loads(txt) if txt else None
-              except:
-                  return None
-          rows = []
-          for path in glob.glob("results/**/*.json", recursive=True):
-              name = os.path.basename(path)
-              if name == "score.json":
-                  category = "score"
-              elif name == "compliance_NTIA.json":
-                  category = "compliance_NTIA"
-              elif name == "compliance_BSI.json":
-                  category = "compliance_BSI"
-              else:
-                  continue
-              data = load_json_safe(path)
-              if not data:
-                  continue
-              folder = os.path.basename(os.path.dirname(path))
-              repo = folder.replace("sbom-reports-", "")
-              data["repository"] = repo
-              data["category"] = category
-              rows.append(data)
-          df = pd.DataFrame(rows)
-          df.to_csv("sbomqs_summary.csv", index=False)
-          PY
+import json, glob, pandas as pd, os
+
+def load_json_safe(path):
+    try:
+        with open(path, "r") as f:
+            txt = f.read().strip()
+            return json.loads(txt) if txt else None
+    except:
+        return None
+
+rows = []
+
+for path in glob.glob("results/**/*.json", recursive=True):
+    name = os.path.basename(path)
+
+    if name == "score.json":
+        category = "score"
+    elif name == "compliance_NTIA.json":
+        category = "compliance_NTIA"
+    elif name == "compliance_BSI.json":
+        category = "compliance_BSI"
+    else:
+        continue
+
+    data = load_json_safe(path)
+    if not data:
+        continue
+
+    folder = os.path.basename(os.path.dirname(path))
+    repo = folder.replace("sbom-reports-", "")
+
+    data["repository"] = repo
+    data["category"] = category
+    rows.append(data)
+
+df = pd.DataFrame(rows)
+df.to_csv("sbomqs_summary.csv", index=False)
+PY
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
