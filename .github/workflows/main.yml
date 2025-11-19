@@ -258,7 +258,7 @@ jobs:
             # Ensure components exists as array
             .components |= (if . == null then [] else . end) |
 
-            # Per-component enrichment: supplier, hashes, externalReferences, ensure license presence
+            # Per-component enrichment: supplier, hashes, externalReferences, ensure license exists
             .components |= map(
               (. // {}) |
               .supplier = (.supplier // {"name": $owner, "url": ("https://github.com/" + $owner)}) |
@@ -307,7 +307,7 @@ jobs:
 
           # Inject creation_info block so aggregator can extract the expected columns.
           # creation_info fields: name, version, scoring_engine_version, vendor
-          # We preserve any existing scoring_engine_version if present in the output.
+          # We try to preserve any existing scoring_engine_version in the score output.
           jq --arg repo "$REPO" '
             .creation_info = {
               "name": "SBOMQS Score",
@@ -354,7 +354,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y python3-pip
           pip install pandas
 
-      - name: Aggregate into sbomqs_summary.csv (minimal layout)
+      - name: Aggregate into sbomqs_summary.csv (match example layout)
         run: |
           python3 <<'EOF'
           import json, glob, os, pandas as pd, time
@@ -370,48 +370,112 @@ jobs:
           run_id = os.getenv("GITHUB_RUN_ID", "")
           timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-          # Find artifact directories that contain score.json
+          # Find all score.json files under results/
           score_paths = glob.glob("results/**/score.json", recursive=True)
-          # Normalize list of artifact dirs (dir that contains each score.json)
-          artifact_dirs = sorted({ os.path.dirname(p) for p in score_paths })
 
-          for ad in artifact_dirs:
-              # repository: try to get the artifact folder name (often 'sbom-reports_<repo>')
-              repo = os.path.basename(ad)
-              # find first score.json under this artifact dir (may be nested)
-              score_list = glob.glob(os.path.join(ad, "**", "score.json"), recursive=True)
-              score_data = None
-              if score_list:
-                  score_data = load_json_safe(score_list[0])
+          # For each score.json, build the output row matching your sample
+          for sp in sorted(score_paths):
+              # artifact directory (folder that contains this score.json)
+              artifact_dir = os.path.dirname(sp)
+              repo = os.path.basename(artifact_dir)
 
-              # count presence of relevant files (score + compliance_NTIA + compliance_BSI)
-              files_count = 0
-              if glob.glob(os.path.join(ad, "**", "score.json"), recursive=True):
-                  files_count += 1
-              if glob.glob(os.path.join(ad, "**", "compliance_NTIA.json"), recursive=True):
-                  files_count += 1
-              if glob.glob(os.path.join(ad, "**", "compliance_BSI.json"), recursive=True):
-                  files_count += 1
+              score = load_json_safe(sp)
+              if not isinstance(score, dict):
+                  continue
 
-              # Extract creation_info fields from score.json (injected earlier)
-              ci = {}
-              if isinstance(score_data, dict):
-                  ci = score_data.get("creation_info", {}) or {}
+              # Prefer "files" array in score.json; fallback to trying other keys
+              files_arr = score.get("files") or []
+              files_list = []
 
+              for f in files_arr:
+                  # pick the fields similar to your example row
+                  entry = {
+                      "file_name": f.get("file_name") or f.get("path") or f.get("source", ""),
+                      "spec": f.get("spec", ""),
+                      "spec_version": f.get("spec_version") or f.get("specVersion") or "",
+                      "file_format": f.get("file_format") or f.get("fileFormat") or "",
+                      "avg_score": f.get("avg_score") or f.get("avg_score", None),
+                      "num_components": f.get("num_components") or f.get("num_components", None),
+                      "creation_time": f.get("creation_time") or f.get("creation_time", "") or f.get("creationTime", ""),
+                      "gen_tool_name": f.get("gen_tool_name") or f.get("genToolName") or f.get("gen_tool", ""),
+                      "gen_tool_version": f.get("gen_tool_version") or f.get("genToolVersion") or f.get("gen_tool_version", ""),
+                      "scores": f.get("scores", []),
+                  }
+                  files_list.append(entry)
+
+              # If files_list empty, attempt to build minimal file entry from score root (best-effort)
+              if not files_list:
+                  # try to extract some top-level info
+                  entry = {
+                      "file_name": "trivy-fs.json",
+                      "spec": score.get("spec", ""),
+                      "spec_version": score.get("spec_version", ""),
+                      "file_format": score.get("file_format", ""),
+                      "avg_score": score.get("avg_score", None),
+                      "num_components": score.get("num_components", None),
+                      "creation_time": score.get("timestamp", ""),
+                      "gen_tool_name": score.get("gen_tool_name", ""),
+                      "gen_tool_version": score.get("gen_tool_version", ""),
+                      "scores": score.get("scores", []),
+                  }
+                  files_list.append(entry)
+
+              # creation_info fields: derive from first file's scoring_engine where possible
+              creation_name = ""
+              creation_version = ""
+              creation_engine_version = ""
+              creation_vendor = ""
+
+              if files_list:
+                  first = files_list[0]
+                  # score JSON sometimes nests scoring_engine inside the file record
+                  scoring_engine = None
+                  # attempt to find scoring_engine in original score file structure
+                  # check score['files'][0]['scoring_engine'] if present
+                  try:
+                      orig_first = files_arr[0] if files_arr else {}
+                      scoring_engine = orig_first.get("scoring_engine") or orig_first.get("scoringEngine") or None
+                  except Exception:
+                      scoring_engine = None
+
+                  if scoring_engine and isinstance(scoring_engine, dict):
+                      creation_name = scoring_engine.get("name", "") or creation_name
+                      creation_version = scoring_engine.get("version", "") or creation_version
+                      creation_vendor = scoring_engine.get("vendor", "") or creation_vendor
+
+                  # fallbacks
+                  if not creation_name:
+                      creation_name = score.get("creation_info", {}).get("name") or score.get("tool", "") or "SBOMQS Score"
+                  if not creation_version:
+                      creation_version = score.get("creation_info", {}).get("version") or "1.0"
+                  # gen tool version: try file.gen_tool_version, else score-level field
+                  creation_engine_version = first.get("gen_tool_version") or score.get("gen_tool_version") or score.get("scoring_engine_version") or ""
+
+              # Build output row
               row = {
                   "run_id": run_id,
                   "timestamp": timestamp,
-                  "files": files_count,
+                  "files": json.dumps(files_list, ensure_ascii=False),
                   "repository": repo,
-                  "creation_info.name": ci.get("name", ""),
-                  "creation_info.version": ci.get("version", ""),
-                  "creation_info.scoring_engine_version": ci.get("scoring_engine_version", ""),
-                  "creation_info.vendor": ci.get("vendor", "")
+                  "creation_info.name": creation_name,
+                  "creation_info.version": creation_version,
+                  "creation_info.scoring_engine_version": creation_engine_version,
+                  "creation_info.vendor": creation_vendor
               }
               rows.append(row)
 
+          # write CSV if any rows found
           if rows:
-              df = pd.DataFrame(rows)
+              df = pd.DataFrame(rows, columns=[
+                  "run_id",
+                  "timestamp",
+                  "files",
+                  "repository",
+                  "creation_info.name",
+                  "creation_info.version",
+                  "creation_info.scoring_engine_version",
+                  "creation_info.vendor"
+              ])
               df.to_csv("sbomqs_summary.csv", index=False)
               print("Generated sbomqs_summary.csv with", len(rows), "rows")
           else:
