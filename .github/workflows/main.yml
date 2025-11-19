@@ -1,10 +1,10 @@
-name: IoT Repository Scanner – Conan SBOM + Trivy + GitHub License
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to scan (C++, Python, Java, etc.)"
+        description: "Programming language to scan (e.g. C++, Python, Java)"
         required: true
         default: "C++"
 
@@ -14,184 +14,212 @@ permissions:
   security-events: write
 
 jobs:
-
-  # -------------------------------------------------------------
-  # 1. FETCH IoT REPOS
-  # -------------------------------------------------------------
-  fetch_repos:
+  # ------------------------------------------------------------------
+  # 1. FETCH TOP REPOS — SAFE JSON OUTPUT
+  # ------------------------------------------------------------------
+  fetch_top_repos:
+    name: Fetch top IoT repositories
     runs-on: ubuntu-latest
-
     outputs:
-      repo_list: ${{ steps.collect.outputs.repo_list }}
+      repo_list: ${{ steps.fetch.outputs.repo_list }}
 
     steps:
       - name: Install jq
-        run: sudo apt-get update -y && sudo apt-get install -y jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
 
-      - name: Collect repositories using GitHub Search
-        id: collect
+      - name: Fetch top IoT repositories (topic:IoT)
+        id: fetch
         env:
+          LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          LANG="${{ inputs.language }}"
+          set -euo pipefail
 
-          QUERY="topic:IoT language:\"$LANG\" fork:false archived:false"
+          echo "Searching IoT repos using language: $LANG"
 
-          echo "Searching: $QUERY"
+          RAW_Q="topic:IoT language:\"$LANG\" fork:false archived:false"
 
-          # Fetch top 20 repos (safe JSON)
-          gh search repos "$QUERY" --json fullName --limit 20 \
-            | jq -r '.[].fullName' > repos.txt
+          REPOS=$(gh api -X GET /search/repositories \
+            --raw-field q="$RAW_Q" \
+            --raw-field sort=stars \
+            --raw-field order=desc \
+            --raw-field per_page=40 \
+            --jq '.items[].full_name'
+          )
 
-          # Convert to single-line JSON array
-          JSON=$(jq -Rc 'split("\n")[:-1]' repos.txt)
+          echo "Found repositories:"
+          echo "$REPOS"
 
-          # Always quote JSON output (fixes GitHub invalid format error)
-          echo "repo_list=\"$JSON\"" >> $GITHUB_OUTPUT
+          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
 
+          echo "repo_list=\"$JSON_ARRAY\"" >> $GITHUB_OUTPUT
 
-  # -------------------------------------------------------------
-  # 2. SCAN REPOS
-  # -------------------------------------------------------------
-  scan:
-    needs: fetch_repos
+  # ------------------------------------------------------------------
+  # 2. SBOM SCAN — TRIVY + CONAN + GH LICENSE (NO MERGING)
+  # ------------------------------------------------------------------
+  sbom_scan:
+    name: SBOM Scan
+    needs: fetch_top_repos
     runs-on: ubuntu-latest
-    continue-on-error: true
 
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJson(needs.fetch_repos.outputs.repo_list) }}
+        repo: ${{ fromJson(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          path: project-src
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y trivy jq python3-pip python3-venv unzip
+          pip install conan
+
+      # ----------------------------------------------
+      # GitHub API License Fetch
+      # ----------------------------------------------
+      - name: Fetch GitHub License
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          gh api "/repos/${{ matrix.repo }}/license" \
+            --jq '{repo: .repository?.full_name, license: .license}' \
+            > project-src/github-license.json || echo '{"license":"UNKNOWN"}' > project-src/github-license.json
+
+      # ----------------------------------------------
+      # Trivy SBOM (FS mode)
+      # ----------------------------------------------
+      - name: Trivy FS SBOM (CycloneDX JSON)
+        run: |
+          trivy fs project-src \
+            --format cyclonedx \
+            --output project-src/trivy-sbom.json \
+            || echo "Trivy failed, continuing"
+
+      # ----------------------------------------------
+      # Conan SBOM
+      # ----------------------------------------------
+      - name: Conan Install
+        working-directory: project-src
+        run: |
+          conan profile detect || true
+          conan install . --build=missing || true
+
+      - name: Conan SBOM
+        working-directory: project-src
+        run: |
+          conan sbom . --format cyclonedx_json --output conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
+
+      # ----------------------------------------------
+      # SBOMQS — evaluate SBOMs separately (NO MERGE)
+      # ----------------------------------------------
+      - name: SBOMQS – NTIA Compliance (Trivy SBOM)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            compliance --ntia /sbom/trivy-sbom.json \
+            > project-src/compliance_trivy_NTIA.json || true
+
+      - name: SBOMQS – NTIA Compliance (Conan SBOM)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            compliance --ntia /sbom/conan-sbom.json \
+            > project-src/compliance_conan_NTIA.json || true
+
+      - name: SBOMQS – BSI V2 (Trivy SBOM)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            compliance --bsi-v2 /sbom/trivy-sbom.json \
+            > project-src/compliance_trivy_BSI.json || true
+
+      - name: SBOMQS – BSI V2 (Conan SBOM)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            compliance --bsi-v2 /sbom/conan-sbom.json \
+            > project-src/compliance_conan_BSI.json || true
+
+      - name: SBOMQS – Score (Trivy)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            score /sbom/trivy-sbom.json --json \
+            > project-src/score_trivy.json || true
+
+      - name: SBOMQS – Score (Conan)
+        run: |
+          docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
+            score /sbom/conan-sbom.json --json \
+            > project-src/score_conan.json || true 
+
+      # ----------------------------------------------
+      # Upload artifacts
+      # ----------------------------------------------
+      - name: Sanitize Repo Name
+        run: |
+          SAFE="${{ matrix.repo }}"
+          SAFE="${SAFE//\//_}"
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+
+      - name: Upload SBOM + License + SBOMQS
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ env.SAFE_NAME }}
+          path: project-src/*.json
+
+  # ------------------------------------------------------------------
+  # 3. AGGREGATION — NO PYTHON
+  # ------------------------------------------------------------------
+  aggregate_results:
+    name: Aggregate SBOM Compliance Results
+    needs: sbom_scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results/
 
       - name: Install tools
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl python3-pip
-          pip install conan
+          sudo apt-get install -y jq
 
-      - name: Clone repository
-        env:
-          TOKEN: ${{ github.token }}
+      - name: Aggregate results into CSV (NO PYTHON)
         run: |
-          git clone --depth=1 https://$TOKEN@github.com/${{ matrix.repo }} repo \
-            || echo "clone_failed=true" >> $GITHUB_ENV
-
-      - name: Exit if clone failed
-        if: env.clone_failed == 'true'
-        run: exit 0
-
-      # ---------------- CONAN SBOM ----------------
-      - name: Conan detect profiles
-        run: conan profile detect --force || true
-
-      - name: Generate Conan SBOM
-        run: |
-          cd repo
-          conan graph info . --format=json > ../conan-sbom.json \
-            || echo '{"components":[]}' > ../conan-sbom.json
-
-      # ---------------- TRIVY SBOM ANALYSIS ----------------
-      - name: Install Trivy
-        run: |
-          curl -L https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -
-
-      - name: Analyze SBOM with Trivy
-        run: |
-          ./trivy sbom conan-sbom.json \
-            --format cyclonedx \
-            --scanners vuln,license \
-            --output trivy-sbom.json \
-            || echo '{"components":[]}' > trivy-sbom.json
-
-      # ---------------- GITHUB LICENSE API ----------------
-      - name: Fetch GitHub license
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          OWNER=$(echo "${{ matrix.repo }}" | cut -d'/' -f1)
-          NAME=$(echo "${{ matrix.repo }}" | cut -d'/' -f2)
-
-          gh api repos/$OWNER/$NAME/license \
-            --jq '{license: .license.spdx_id}' > gh-license.json \
-            || echo '{"license":"NOASSERTION"}' > gh-license.json
-
-      # ---------------- MERGE SBOMs WITHOUT PYTHON ----------------
-      - name: Merge SBOM (Bash only)
-        run: |
-          SPDX=$(jq -r '.license' gh-license.json)
-
-          jq --arg spdx "$SPDX" '
-            .components |= map(
-              if (.licenses | length == 0) then
-                .licenses = [{"license":{"id":$spdx}}]
-              else .
-              end
-            )
-          ' trivy-sbom.json > merged-sbom.json
-
-      # ---------------- SBOMQS ----------------
-      - name: NTIA Compliance
-        run: |
-          docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --ntia /sbom/merged-sbom.json \
-            > compliance_NTIA.json || true
-
-      - name: BSI V2 Compliance
-        run: |
-          docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --bsi-v2 /sbom/merged-sbom.json \
-            > compliance_BSI.json || true
-
-      - name: Score SBOM
-        run: |
-          docker run --rm -v $PWD:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            score /sbom/merged-sbom.json --json \
-            > score.json || true
-
-      # ---------------- UPLOAD RESULTS ----------------
-      - name: Safe name
-        run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "SAFE=$SAFE" >> $GITHUB_ENV
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-${{ env.SAFE }}
-          path: |
-            merged-sbom.json
-            compliance_*.json
-            score.json
-
-
-  # -------------------------------------------------------------
-  # 3. AGGREGATE (NO PYTHON)
-  # -------------------------------------------------------------
-  aggregate:
-    needs: scan
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: results/
-
-      - name: Build CSV (no Python)
-        run: |
-          echo "repository,file,status" > sbom-summary.csv
+          echo "repository,type,standard,score_or_status" > sbom_summary.csv
 
           for repo in results/*; do
-            repo_name=$(basename "$repo")
-            for file in "$repo"/*.json; do
-              f=$(basename "$file")
-              echo "$repo_name,$f,OK" >> sbom-summary.csv
+            REPO_NAME=$(basename "$repo")
+
+            for f in "$repo"/*.json; do
+              FILE=$(basename "$f")
+
+              if [[ "$FILE" == *"NTIA"* ]]; then
+                STATUS=$(jq -r '.status // "unknown"' "$f")
+                echo "$REPO_NAME,${FILE},NTIA,$STATUS" >> sbom_summary.csv
+              fi
+
+              if [[ "$FILE" == *"BSI"* ]]; then
+                STATUS=$(jq -r '.status // "unknown"' "$f")
+                echo "$REPO_NAME,${FILE},BSI,$STATUS" >> sbom_summary.csv
+              fi
+
+              if [[ "$FILE" == *"score"* ]]; then
+                SCORE=$(jq -r '.score // "0"' "$f")
+                echo "$REPO_NAME,${FILE},Score,$SCORE" >> sbom_summary.csv
+              fi
             done
           done
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload summary CSV
+        uses: actions/upload-artifact@v4
         with:
-          name: sbom-summary
-          path: sbom-summary.csv
+          name: sbom_summary
+          path: sbom_summary.csv
