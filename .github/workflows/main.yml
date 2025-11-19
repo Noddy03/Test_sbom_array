@@ -10,56 +10,50 @@ on:
 
 permissions:
   contents: read
-  security-events: write
   actions: read
-
+  security-events: write
 
 jobs:
-  # ------------------------------------------------------------
-  # 1. Fetch Top IoT Repositories
-  # ------------------------------------------------------------
+  # -------------------------------------------------------------
+  # 1. Fetch IoT Repositories using GitHub API
+  # -------------------------------------------------------------
   fetch_top_repos:
-    name: Fetch top 50 IoT repositories (${{ github.event.inputs.language }})
+    name: Fetch IoT repositories
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
       - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+        run: sudo apt-get update -y && sudo apt-get install -y jq
 
-      - name: Fetch IoT repositories
+      - name: Fetch top IoT repos
         id: fetch
         env:
-          LANG: ${{ github.event.inputs.language }}
           GH_TOKEN: ${{ github.token }}
+          LANG: ${{ github.event.inputs.language }}
         run: |
-          set -euo pipefail
+          echo "Searching top IoT repos for language: $LANG"
 
           RAW_Q="topic:IoT language:\"$LANG\" fork:false archived:false"
-          echo "Query: $RAW_Q"
 
-          REPOS=$(gh api -X GET /search/repositories \
+          REPOS=$(gh api /search/repositories \
             --raw-field q="$RAW_Q" \
             --raw-field sort=stars \
             --raw-field order=desc \
-            --raw-field per_page=50 \
-            --jq '.items[].full_name'
-          )
+            --raw-field per_page=20 \
+            --jq '.items[].full_name')
 
-          echo "Found repositories:"
           echo "$REPOS"
 
-          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+          JSON=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "repo_list=$JSON" >> "$GITHUB_OUTPUT"
 
-
-  # ------------------------------------------------------------
-  # 2. SBOM Scan Job (Matrix)
-  # ------------------------------------------------------------
+  # -------------------------------------------------------------
+  # 2. SBOM Scan (Trivy + Conan)
+  # -------------------------------------------------------------
   sbom_scan:
-    name: SBOM Scan (Trivy + Conan + NTIA + BSI V2)
+    name: SBOM Scan
     needs: fetch_top_repos
     runs-on: ubuntu-latest
 
@@ -74,44 +68,34 @@ jobs:
         with:
           repository: ${{ matrix.repo }}
 
-      # --------------------------------------------------------
-      # Install required tools (jq, Conan, Trivy)
-      # --------------------------------------------------------
-      - name: Install Conan, Trivy, jq, curl, wget
+      - name: Install Conan, Trivy, jq, curl
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget curl python3-pip python3-venv
+          sudo apt-get install -y jq curl wget python3-pip python3-venv
 
           # Conan
-          pip install --upgrade pip
           pip install conan
 
-          # Trivy - official safe installer (never 404s)
+          # Trivy (safe installer, no 404)
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-      # --------------------------------------------------------
-      # Generate SBOM with Trivy + Conan
-      # --------------------------------------------------------
-      - name: Generate SBOM (NTIA + BSI V2)
-        id: sbom
+      - name: Generate SBOMs
         run: |
           mkdir -p sbom
 
-          echo "Generating NTIA-style CycloneDX SBOM via Trivy..."
-
+          echo "Running Trivy CycloneDX SBOM..."
           trivy fs . --format cyclonedx --output sbom/cyclonedx.json || true
 
-          echo "Creating Conan SBOM if conanfile exists..."
           if [ -f "conanfile.txt" ] || [ -f "conanfile.py" ]; then
+            echo "Conanfile detected — generating Conan SBOM..."
             conan graph info . --format=json > sbom/conan-sbom.json || true
+          else
+            echo "No Conan file found — skipping Conan SBOM."
           fi
 
-      # --------------------------------------------------------
-      # Upload SBOM artifacts
-      # --------------------------------------------------------
-      - name: Upload SBOMs
+      - name: Upload SBOM artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ matrix.repo }}
+          name: sbom-${{ matrix.repo.replace('/', '_') }}
           path: sbom/
