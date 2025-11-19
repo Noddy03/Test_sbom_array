@@ -14,7 +14,6 @@ permissions:
   actions: read
 
 jobs:
-
   # ================================================================
   # 1. FETCH TOP REPOS
   # ================================================================
@@ -83,7 +82,9 @@ jobs:
               echo "skip_repo=true" >> $GITHUB_ENV
           fi
 
-      # Fetch GitHub license metadata (for merging)
+      # --------------------------------------------------------------------
+      # 2A — GITHUB LICENSE API
+      # --------------------------------------------------------------------
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
         env:
@@ -93,6 +94,28 @@ jobs:
           gh api "/repos/$REPO/license" > project-src/gh-license.json \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
+      # --------------------------------------------------------------------
+      # 2B — LOCAL LICENSE DETECTION
+      # --------------------------------------------------------------------
+      - name: Local license file detection (fallback)
+        if: env.skip_repo != 'true'
+        run: |
+          echo "🔎 Searching for local license files..."
+          FILE=$(find project-src -maxdepth 4 -type f \
+            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" \
+            | head -1)
+
+          if [ -n "$FILE" ]; then
+            echo "📄 Found local license file: $FILE"
+            cat "$FILE" > project-src/local-license.txt
+          else
+            echo "⚠️ No local license file found."
+            echo "" > project-src/local-license.txt
+          fi
+
+      # --------------------------------------------------------------------
+      # 2C — BUILD SBOMS
+      # --------------------------------------------------------------------
       - name: Conan SBOM
         if: env.skip_repo != 'true'
         run: |
@@ -108,28 +131,39 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      # ================================================================
-      # MERGE GitHub LICENSE + TRIVY LICENSE → SBOM
-      # ================================================================
-      - name: Merge GitHub + Trivy license into SBOM
+      # --------------------------------------------------------------------
+      # 2D — MERGE LICENSE SIGNALS
+      # --------------------------------------------------------------------
+      - name: Merge GitHub + Trivy + Local license into SBOM
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
           GHLIC="project-src/gh-license.json"
+          LOCALLIC="project-src/local-license.txt"
 
           GH_SPDX=$(jq -r '.license.spdx_id // empty' "$GHLIC" 2>/dev/null || echo "")
-          echo "GitHub SPDX detected: $GH_SPDX"
-
           TRIVY_SPDX=$(jq -r '
             [.components[].licenses[].license.id // empty]
             | map(select(. != "")) | unique | join(",")
           ' "$SBOM" 2>/dev/null || echo "")
-          echo "Trivy SPDX detected: $TRIVY_SPDX"
 
-          if [ -n "$GH_SPDX" ] && [ "$GH_SPDX" != "NOASSERTION" ] && [ "$GH_SPDX" != "null" ]; then
+          if [ -s "$LOCALLIC" ]; then
+            LOCAL_SPDX="CUSTOM"
+          else
+            LOCAL_SPDX=""
+          fi
+
+          echo "GitHub: $GH_SPDX"
+          echo "Trivy: $TRIVY_SPDX"
+          echo "Local: $LOCAL_SPDX"
+
+          # Pick best license
+          if [ -n "$GH_SPDX" ] && [ "$GH_SPDX" != "NOASSERTION" ]; then
             FINAL="$GH_SPDX"
           elif [ -n "$TRIVY_SPDX" ]; then
             FINAL="$TRIVY_SPDX"
+          elif [ -n "$LOCAL_SPDX" ]; then
+            FINAL="$LOCAL_SPDX"
           else
             FINAL="NOASSERTION"
           fi
@@ -146,11 +180,11 @@ jobs:
             )
           ' "$SBOM" > tmp.json && mv tmp.json "$SBOM"
 
-          echo "✔ SBOM license merged successfully."
+          echo "✔ License merged."
 
-      # ================================================================
-      # SBOMQS COMPLIANCE + SCORING
-      # ================================================================
+      # --------------------------------------------------------------------
+      # 2E — SBOMQS COMPLIANCE ANALYSIS
+      # --------------------------------------------------------------------
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
         run: |
@@ -172,6 +206,9 @@ jobs:
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
 
+      # --------------------------------------------------------------------
+      # 2F — ARTIFACT PACKAGING
+      # --------------------------------------------------------------------
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -187,7 +224,7 @@ jobs:
           if-no-files-found: warn
 
   # ================================================================
-  # 3. AGGREGATION – TSV SUMMARY
+  # 3. AGGREGATION SUMMARY (FINAL CSV)
   # ================================================================
   aggregate_results:
     name: Aggregate SBOMQS Results
@@ -216,8 +253,7 @@ jobs:
                       content = f.read().strip()
                       if not content: return None
                       return json.loads(content)
-              except Exception as e:
-                  print(f"⚠️ Skipping invalid JSON in {path}: {e}")
+              except Exception:
                   return None
 
           records = []
@@ -243,7 +279,7 @@ jobs:
           else:
               df = pd.json_normalize(records)
               df.to_csv("sbomqs_summary.csv", index=False)
-              print(f"✅ Aggregated {len(records)} SBOMQS results successfully.")
+              print("✅ Aggregated", len(records), "records.")
           EOF
 
       - name: Upload aggregated summary
