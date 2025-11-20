@@ -126,6 +126,9 @@ jobs:
             .components = (if (.components | type) == "array" then .components else [] end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
+      #######################################################################
+      # BSI FIX 1 — Guarantee root component name + version
+      #######################################################################
       - name: Ensure component has version + name (BSI helper)
         if: env.skip_repo != 'true'
         run: |
@@ -135,6 +138,9 @@ jobs:
             .metadata.component.version = (.metadata.component.version // "0.0.0")
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
+      #######################################################################
+      # BSI FIX 2 — Generate PURLs for all components (required for BSI)
+      #######################################################################
       - name: Add synthetic PURLs for BSI compliance (BSI helper)
         if: env.skip_repo != 'true'
         run: |
@@ -142,8 +148,7 @@ jobs:
           jq '
             .metadata.component.purl = (.metadata.component.purl // ("pkg:generic/" + (.metadata.component.name // "root") + "@" + (.metadata.component.version // "0.0.0"))) |
             .components |= map(
-              .purl = (.purl // ("pkg:generic/" + ((.name // "unknown") | gsub(" "; "-")) + "@" + ((.version // "0.0.0") | tostring))) |
-              .
+              .purl = (.purl // ("pkg:generic/" + ((.name // "unknown") | gsub(" "; "-")) + "@" + ((.version // "0.0.0") | tostring)))
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
@@ -333,12 +338,11 @@ jobs:
               data["category"] = category
               rows.append(data)
 
-          df = pd.DataFrame(rows)
+          df = pandas.DataFrame(rows)
           df.to_csv("sbomqs_summary.csv", index=False)
           EOF
 
           python3 agg.py
-
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
