@@ -98,7 +98,7 @@ jobs:
           cd project-src
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json \
-            || echo '{"components":[]}' > conan-sbom.json
+            || echo '{"status":"FAILED","reason":"conan-error"}' > conan-sbom.json
 
       - name: Trivy SBOM (CycloneDX 1.4 JSON)
         if: env.skip_repo != 'true'
@@ -106,7 +106,7 @@ jobs:
           trivy fs --scanners vuln,license \
             --format cyclonedx --cyclonedx-version 1.4 \
             -o project-src/trivy-fs.json project-src \
-            || echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > project-src/trivy-fs.json
+            || echo '{"status":"FAILED","reason":"trivy-error","bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > project-src/trivy-fs.json
 
       - name: Normalize SBOM structure
         if: env.skip_repo != 'true'
@@ -136,10 +136,7 @@ jobs:
           VCS="https://github.com/$REPO"
           DIST="https://github.com/$REPO/releases"
           REPO_HASH=$(find project-src -type f -exec sha256sum {} + | sha256sum | cut -d' ' -f1)
-          jq --arg supplier "$OWNER" \
-             --arg vcs "$VCS" \
-             --arg dist "$DIST" \
-             --arg hash "$REPO_HASH" '
+          jq --arg supplier "$OWNER" --arg vcs "$VCS" --arg dist "$DIST" --arg hash "$REPO_HASH" '
             .metadata.supplier = { "name": $supplier } |
             .components |= map(
               .externalReferences = ((.externalReferences // []) + [
@@ -221,21 +218,27 @@ jobs:
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || echo '{}' > project-src/compliance_NTIA.json
+            > project-src/compliance_NTIA.json || {
+              echo '{"status":"FAILED","reason":"sbomqs-compliance-ntia-error"}' > project-src/compliance_NTIA.json
+            }
 
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || echo '{}' > project-src/compliance_BSI.json
+            > project-src/compliance_BSI.json || {
+              echo '{"status":"FAILED","reason":"sbomqs-compliance-bsi-v2-error"}' > project-src/compliance_BSI.json
+            }
 
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
-            > project-src/score.json || echo '{}' > project-src/score.json
+            > project-src/score.json || {
+              echo '{"status":"FAILED","reason":"sbomqs-score-error"}' > project-src/score.json
+            }
 
       - name: Sanitize artifact name
         id: sanitize
@@ -270,8 +273,11 @@ jobs:
 
       - name: Aggregate SBOMQS results to CSV
         run: |
-          cat << 'EOF' > agg.py
-          import json, glob, pandas as pd, os
+          cat > agg.py << 'EOF'
+          import json
+          import glob
+          import pandas as pd
+          import os
 
           def load_json_safe(path):
               try:
@@ -284,13 +290,13 @@ jobs:
           rows = []
 
           for path in glob.glob("results/**/*.json", recursive=True):
-              name = os.path.basename(path)
+              name = os.path.basename(path).lower()
 
               if name == "score.json":
                   category = "score"
-              elif name == "compliance_NTIA.json":
+              elif name == "compliance_ntia.json":
                   category = "compliance_NTIA"
-              elif name == "compliance_BSI.json":
+              elif name == "compliance_bsi.json":
                   category = "compliance_BSI"
               else:
                   continue
@@ -311,6 +317,7 @@ jobs:
           EOF
 
           python3 agg.py
+
 
 
       - name: Upload aggregated summary
