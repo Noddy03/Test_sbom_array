@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2)
+name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2 Bulletproof)
 
 on:
   workflow_dispatch:
@@ -33,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
-          echo "Query: $RAW_Q"
           REPOS=$(gh api -X GET /search/repositories \
              --raw-field q="$RAW_Q" \
              --raw-field sort=stars \
@@ -56,14 +55,12 @@ jobs:
 
     steps:
 
-      - name: Install Conan + CycloneDX + jq + Trivy (stable/bulletproof)
+      - name: Install Conan + CycloneDX + jq + Trivy
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq wget curl python3-pip rpm
+          sudo apt-get install -y jq wget curl python3-pip rpm gnupg lsb-release
           pip install --upgrade pip
           pip install conan cyclonedx-bom
-          echo "Installing Trivy via Aqua Security APT repo (never fails)..."
-          sudo apt-get install -y gnupg lsb-release
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
@@ -92,7 +89,7 @@ jobs:
              > project-src/gh-license.json 2>/dev/null \
              || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
-      - name: Local license fallback
+      - name: Local SPDX license fallback
         if: env.skip_repo != 'true'
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
@@ -118,7 +115,7 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      - name: Normalize SBOM components (unbreakable safe mode)
+      - name: Normalize SBOM components
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -126,18 +123,22 @@ jobs:
             .components |= (if type=="array" then . else [] end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: Assign repository license to all components
+      - name: Determine final assigned license
         if: env.skip_repo != 'true'
         run: |
-          SBOM="project-src/trivy-fs.json"
           GH_LICENSE=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
           FILE_LICENSE=$(grep -Eo "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" \
                          project-src/local-license.txt 2>/dev/null | head -1 | awk -F': ' '{print $2}')
-          FINAL_LICENSE="${GH_LICENSE:-$FILE_LICENSE}"
-          [ -z "$FINAL_LICENSE" ] && FINAL_LICENSE="NOASSERTION"
-          echo "$FINAL_LICENSE" > project-src/final_license.txt
+          FINAL="${GH_LICENSE:-$FILE_LICENSE}"
+          [ -z "$FINAL" ] && FINAL="NOASSERTION"
+          echo "$FINAL" > project-src/final_license.txt
 
-          jq --arg lic "$FINAL_LICENSE" '
+      - name: Apply final license to SBOM components
+        if: env.skip_repo != 'true'
+        run: |
+          SBOM="project-src/trivy-fs.json"
+          FINAL=$(cat project-src/final_license.txt)
+          jq --arg lic "$FINAL" '
             .components |= map(
               .licenses = [{ "license": { "id": $lic }}]
             )
@@ -185,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download all artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: results/
@@ -204,8 +205,8 @@ jobs:
           def load_json(path):
               try:
                   with open(path) as f:
-                      t = f.read().strip()
-                      return json.loads(t) if t else None
+                      txt = f.read().strip()
+                      return json.loads(txt) if txt else None
               except:
                   return None
 
@@ -224,32 +225,51 @@ jobs:
               trivy = load_json(os.path.join(folder, "trivy-fs.json")) or {}
               conan = load_json(os.path.join(folder, "conan-sbom.json")) or {}
               score = load_json(os.path.join(folder, "score.json"))
-              ntia = load_json(os.path.join(folder, "compliance_NTIA.json"))
-              bsi  = load_json(os.path.join(folder, "compliance_BSI.json"))
+              ntia  = load_json(os.path.join(folder, "compliance_NTIA.json"))
+              bsi   = load_json(os.path.join(folder, "compliance_BSI.json"))
 
-              gh_lic = load_json(os.path.join(folder, "gh-license.json")) or {}
-              github_license_spdx = gh_lic.get("license", {}).get("spdx_id", "")
-              github_license_name = gh_lic.get("license", {}).get("name", "")
+              # LICENSES
+              gh_license = load_json(os.path.join(folder, "gh-license.json")) or {}
+              github_license_spdx = gh_license.get("license", {}).get("spdx_id", "")
+              github_license_name = gh_license.get("license", {}).get("name", "")
 
-              local_license_text = load_text(os.path.join(folder, "local-license.txt"))
-              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local_license_text)
+              local_license_txt = load_text(os.path.join(folder, "local-license.txt"))
+              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local_license_txt)
               local_spdx = m.group(1) if m else ""
 
               final_license = load_text(os.path.join(folder, "final_license.txt"))
 
+              # COMPONENT METADATA
               components = trivy.get("components", []) or []
+
+              component_names = [c.get("name") for c in components]
+              component_versions = [c.get("version") for c in components]
+              component_purls = [c.get("purl") for c in components]
+              component_suppliers = [c.get("supplier", {}).get("name") for c in components]
 
               base = {
                   "repository": repo,
-                  "num_trivy_components": len(components),
-                  "num_conan_components": len(conan.get("components", [])),
+
+                  # License fields
                   "github_license_spdx": github_license_spdx,
                   "github_license_name": github_license_name,
                   "local_spdx_license": local_spdx,
                   "final_assigned_license": final_license,
-                  "component_names": [c.get("name") for c in components],
-                  "component_versions": [c.get("version") for c in components],
-                  "component_purls": [c.get("purl") for c in components],
+
+                  # Component counts
+                  "num_trivy_components": len(components),
+                  "num_conan_components": len(conan.get("components", [])),
+
+                  # Component metadata
+                  "component_names": component_names,
+                  "component_versions": component_versions,
+                  "component_purls": component_purls,
+                  "component_suppliers": component_suppliers,
+
+                  # Diagnostics
+                  "trivy_scan_success": trivy != {},
+                  "conan_scan_success": conan != {},
+                  "sbom_empty": len(components) == 0,
               }
 
               if score:
@@ -263,7 +283,7 @@ jobs:
           df.to_csv("sbomqs_summary.csv", index=False)
           PY
 
-      - name: Upload aggregated summary
+      - name: Upload summary
         uses: actions/upload-artifact@v4
         with:
           name: sbomqs-summary
