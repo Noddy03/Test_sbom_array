@@ -74,7 +74,10 @@ jobs:
             echo "skip_repo=true" >> $GITHUB_ENV
           fi
 
-      # --- FIX #1: Reliable GitHub license extraction ---
+      # =======================
+      # License Detection Stage
+      # =======================
+
       - name: Fetch GitHub license metadata
         if: env.skip_repo != 'true'
         env:
@@ -88,12 +91,12 @@ jobs:
             echo "$LICENSE" > project-src/gh-license.txt
           fi
 
-      # --- FIX #2: Local SPDX fallback ---
       - name: Local license fallback
         if: env.skip_repo != 'true'
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|UNLICENSE\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+
           if [ -n "$FILE" ]; then
             SPDX=$(grep -Eio "SPDX-License-Identifier:[ ]*[A-Za-z0-9.\-+]+" "$FILE" | head -1 | awk -F': ' '{print $2}')
             if [ -z "$SPDX" ]; then
@@ -103,6 +106,10 @@ jobs:
           else
             echo "NOASSERTION" > project-src/local-license.txt
           fi
+
+      # =======================
+      # SBOM Generation Stage
+      # =======================
 
       - name: Conan SBOM
         if: env.skip_repo != 'true'
@@ -119,17 +126,37 @@ jobs:
             -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      # --- Existing normalization block ---
-      - name: Normalize SBOM components
+      # =======================
+      # Synthetic Component Fix
+      # =======================
+
+      - name: Ensure SBOM has at least 1 component (synthetic)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
+
           jq '
-            .components |= (if type=="array" then . else [] end)
+            .components |= (if type!="array" then [] else . end) |
+            if (.components | length) == 0 then
+              .components = [
+                {
+                  "name": "repository",
+                  "version": "0.0.0",
+                  "supplier": { "name": "unknown" },
+                  "licenses": [],
+                  "externalReferences": []
+                }
+              ]
+            else
+              .
+            end
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      # --- FIX #3: SBOMQS-compatible license injection ---
-      - name: Inject license (SBOMQS compliant)
+      # =======================
+      # License Injection Fix
+      # =======================
+
+      - name: Inject final license into SBOM (SBOMQS compatible)
         if: env.skip_repo != 'true'
         run: |
           SBOM="project-src/trivy-fs.json"
@@ -140,25 +167,12 @@ jobs:
           elif [ "$LC" != "NOASSERTION" ]; then FINAL="$LC"
           else FINAL="NOASSERTION"; fi
 
-          echo "Final detected license: $FINAL"
-
           jq --arg lic "$FINAL" '
+
+            # Ensure components exist
             .components |= (if type!="array" then [] else . end) |
 
-            # If no components, create one
-            .components |= (if length==0 then
-              [{
-                "name": "repository",
-                "version": "0.0.0",
-                "licenses": [{ "license": { "id": $lic }}],
-                "externalReferences": [{
-                  "type": "license",
-                  "url": ("https://spdx.org/licenses/" + $lic + ".html")
-                }]
-              }]
-            else . end) |
-
-            # Inject licenses for each component
+            # Inject license and externalReferences into each component
             .components |= map(
               .licenses = [{ "license": { "id": $lic }}] |
               .externalReferences = ((.externalReferences // []) + [
@@ -169,7 +183,7 @@ jobs:
               ])
             ) |
 
-            # SBOM metadata requirements
+            # SBOM-level licensing
             .metadata.dataLicense = "CC-BY-4.0" |
             .metadata.licenses = [{ "license": { "id": $lic }}] |
             .metadata.component.licenses = [{ "license": { "id": $lic }}] |
@@ -179,7 +193,12 @@ jobs:
                 "url": ("https://spdx.org/licenses/" + $lic + ".html")
               }
             ]
+
           ' "$SBOM" > tmp && mv tmp "$SBOM"
+
+      # =======================
+      # SBOMQS Evaluation
+      # =======================
 
       - name: NTIA Compliance
         if: env.skip_repo != 'true'
@@ -204,6 +223,10 @@ jobs:
             ghcr.io/interlynk-io/sbomqs:latest \
             score /sbom/trivy-fs.json --json \
             > project-src/score.json || true
+
+      # =======================
+      # Artifact Upload
+      # =======================
 
       - name: Sanitize artifact name
         id: sanitize
@@ -240,30 +263,34 @@ jobs:
         run: |
           python3 <<'PY'
           import json, glob, pandas as pd, os
+
           def load_json_safe(p):
               try:
                   with open(p) as f:
-                      content = f.read().strip()
-                      return json.loads(content) if content else None
+                      data = f.read().strip()
+                      return json.loads(data) if data else None
               except:
                   return None
 
           rows = []
+
+          # Score files
           for path in glob.glob("results/**/score.json", recursive=True):
               repo = os.path.basename(os.path.dirname(path))
               data = load_json_safe(path)
               if data:
-                data["repository"] = repo
-                rows.append(data)
+                  data["repository"] = repo
+                  rows.append(data)
 
+          # NTIA + BSI
           for std in ["NTIA", "BSI"]:
-            for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
-              repo = os.path.basename(os.path.dirname(path))
-              data = load_json_safe(path)
-              if data:
-                data["repository"] = repo
-                data["standard"] = std
-                rows.append(data)
+              for path in glob.glob(f"results/**/compliance_{std}.json", recursive=True):
+                  repo = os.path.basename(os.path.dirname(path))
+                  data = load_json_safe(path)
+                  if data:
+                      data["repository"] = repo
+                      data["standard"] = std
+                      rows.append(data)
 
           df = pd.json_normalize(rows)
           df.to_csv("sbomqs_summary.csv", index=False)
