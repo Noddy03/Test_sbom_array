@@ -126,9 +126,6 @@ jobs:
             .components = (if (.components | type) == "array" then .components else [] end)
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      #######################################################################
-      # BSI FIX 1 — Guarantee root component name + version
-      #######################################################################
       - name: Ensure component has version + name (BSI helper)
         if: env.skip_repo != 'true'
         run: |
@@ -138,9 +135,6 @@ jobs:
             .metadata.component.version = (.metadata.component.version // "0.0.0")
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      #######################################################################
-      # BSI FIX 2 — Generate PURLs for all components (required for BSI)
-      #######################################################################
       - name: Add synthetic PURLs for BSI compliance (BSI helper)
         if: env.skip_repo != 'true'
         run: |
@@ -299,50 +293,13 @@ jobs:
 
       - name: Aggregate SBOMQS results to CSV
         run: |
-          cat > agg.py << 'EOF'
-          import json
-          import glob
-          import pandas as pd
-          import os
-
-          def load_json_safe(path):
-              try:
-                  with open(path, "r") as f:
-                      txt = f.read().strip()
-                      return json.loads(txt) if txt else None
-              except:
-                  return None
-
-          rows = []
-
-          for path in glob.glob("results/**/*.json", recursive=True):
-              name = os.path.basename(path).lower()
-
-              if "score" in name:
-                  category = "score"
-              elif "ntia" in name:
-                  category = "compliance_NTIA"
-              elif "bsi" in name:
-                  category = "compliance_BSI"
-              else:
-                  continue
-
-              data = load_json_safe(path)
-              if not data:
-                  continue
-
-              folder = os.path.basename(os.path.dirname(path))
-              repo = folder.replace("sbom-reports-", "")
-
-              data["repository"] = repo
-              data["category"] = category
-              rows.append(data)
-
-          df = pandas.DataFrame(rows)
-          df.to_csv("sbomqs_summary.csv", index=False)
+          cat << 'EOF' | base64 --decode > agg.py
+          aW1wb3J0IGpzb24KaW1wb3J0IGdsb2IKaW1wb3J0IHBhbmRhcyBhcyBwZAppbXBvcnQgb3MKCgpkZWYgbG9hZF9qc29uX3NhZmUocGF0aCk6CiAgICB0cnk6CiAgICAgICAgd2l0aCBvcGVuKHBhdGgsICJyIikgYXMgZjoKICAgICAgICAgICAgdHh0ID0gZi5yZWFkKCkuc3RyaXAoKQogICAgICAgICAgICByZXR1cm4ganNvbi5sb2Fkcyh0eHQpIGlmIHR4dCBlbHNlIE5vbmUKICAgIGV4Y2VwdDoKICAgICAgICByZXR1cm4gTm9uZQoKcm93cyA9IFtdCgoKZm9yIHBhdGggaW4gZ2xvYi5nbG9iKCJyZXN1bHRzLyoqLyouanNvbiIsIHJlY3Vyc2l2ZT1UdWUpOgogICAgbmFtZSA9IG9zLnBhdGguYmFzZW5hbWUocGF0aCkubG93ZXIoKQoKICAgIGlmICJzY29yZSIgaW4gbmFtZToKICAgICAgICBjYXRlZ29yeSA9ICJzY29yZSIKICAgIGVsaWYgIm50aWEiIGluIG5hbWU6CiAgICAgICAgY2F0ZWdvcnkgPSAiY29tcGxpYW5jZV9OVElBIgogICAgZWxpZiAiYnNpIiBpbiBuYW1lOgogICAgICAgIGNhdGVnb3J5ID0gImNvbXBsaWFuY2VfQlNJIgoKICAgIGVsc2U6CiAgICAgICAgY29udGludWUKCgogICAgZGF0YSA9IGxvYWRfanNvbl9zYWZlKHBhdGgpCiAgICBpZiBub3QgZGF0YToKICAgICAgICBjb250aW51ZQoKICAgIGZvbGRlciA9IG9zLnBhdGguYmFzZW5hbWUob3MucGF0aC5kaXJuYW1lKHBhdGgpKQogICAgcmVwbyA9IGZvbGRlci5yZXBsYWNlKCJzYm9tLXJlcG9ydHMtIiwgIiIpCgogICAgZGF0YVsicmVwb3NpdG9yeSJdID0gcmVwbwogICAgZGF0YVsiY2F0ZWdvcnkiXSA9IGNhdGVnb3J5CiAgICByb3dzLmFwcGVuZChkYXRhKQoKCmRmID0gcGQuRGF0YUZyYW1lKHJvd3MpCmRmLnRvX3N2KCJzYm9tcXNfc3VtbWFyeS5jc3YiLCBpbmRleD1GYWxzZSk=
           EOF
 
           python3 agg.py
+
+
 
       - name: Upload aggregated summary
         uses: actions/upload-artifact@v4
