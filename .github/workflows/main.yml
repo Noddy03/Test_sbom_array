@@ -35,11 +35,11 @@ jobs:
           set -euo pipefail
           RAW_Q="topic:IoT language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
-             --raw-field q="$RAW_Q" \
-             --raw-field sort=stars \
-             --raw-field order=desc \
-             --raw-field per_page=100 \
-             --jq '.items[].full_name')
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=100 \
+              --jq '.items[].full_name')
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -87,18 +87,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api -H "Accept: application/vnd.github+json" "/repos/$REPO/license" \
-             > project-src/gh-license.json 2>/dev/null \
-             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
+              > project-src/gh-license.json 2>/dev/null \
+              || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       - name: Local SPDX license fallback
         if: env.skip_repo != 'true'
         run: |
           FILE=$(find project-src -maxdepth=4 -type f \
-            -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
+             -iregex ".*\(LICENSE\|LICENCE\|COPYING\|COPYRIGHT\|LICENSE\.md\|LICENSE\.txt\)" | head -1)
           if [ -n "$FILE" ]; then
-            cp "$FILE" project-src/local-license.txt
+               cp "$FILE" project-src/local-license.txt
           else
-            echo "" > project-src/local-license.txt
+               echo "" > project-src/local-license.txt
           fi
 
       - name: Conan SBOM
@@ -107,14 +107,14 @@ jobs:
           cd project-src
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json \
-            || echo '{"components":[]}' > conan-sbom.json
+              || echo '{"components":[]}' > conan-sbom.json
 
       - name: Trivy SBOM
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
-            -o project-src/trivy-fs.json project-src \
-            || echo '{"components":[]}' > project-src/trivy-fs.json
+              -o project-src/trivy-fs.json project-src \
+              || echo '{"components":[]}' > project-src/trivy-fs.json
 
       - name: Normalize SBOM components
         if: env.skip_repo != 'true'
@@ -149,22 +149,22 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --ntia /sbom/trivy-fs.json \
-            > project-src/compliance_NTIA.json || true
+             compliance --ntia /sbom/trivy-fs.json \
+             > project-src/compliance_NTIA.json || true
 
       - name: BSI v2 Compliance
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            compliance --bsi-v2 /sbom/trivy-fs.json \
-            > project-src/compliance_BSI.json || true
+             compliance --bsi-v2 /sbom/trivy-fs.json \
+             > project-src/compliance_BSI.json || true
 
       - name: Score SBOM
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-            score /sbom/trivy-fs.json --json \
-            > project-src/score.json || true
+             score /sbom/trivy-fs.json --json \
+             > project-src/score.json || true
 
       - name: Sanitize artifact name
         id: sanitize
@@ -179,6 +179,7 @@ jobs:
           name: sbom-reports-${{ steps.sanitize.outputs.name }}
           path: project-src/*
           if-no-files-found: warn
+
 
 
   aggregate_results:
@@ -200,79 +201,80 @@ jobs:
 
       - name: Aggregate SBOMQS results to CSV
         run: |
-          printf '%s\n' "import json, glob, pandas as pd, os, re" > sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "def load_json(path):" >> sbomqs_aggregate.py
-          printf '%s\n' "    try:" >> sbomqs_aggregate.py
-          printf '%s\n' "        with open(path) as f:" >> sbomqs_aggregate.py
-          printf '%s\n' "            txt = f.read().strip()" >> sbomqs_aggregate.py
-          printf '%s\n' "            return json.loads(txt) if txt else None" >> sbomqs_aggregate.py
-          printf '%s\n' "    except:" >> sbomqs_aggregate.py
-          printf '%s\n' "        return None" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "def load_text(path):" >> sbomqs_aggregate.py
-          printf '%s\n' "    try:" >> sbomqs_aggregate.py
-          printf '%s\n' "        with open(path) as f:" >> sbomqs_aggregate.py
-          printf '%s\n' "            return f.read().strip()" >> sbomqs_aggregate.py
-          printf '%s\n' "    except:" >> sbomqs_aggregate.py
-          printf '%s\n' "        return \"\"" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "rows = []" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "for folder in glob.glob(\"results/*/\"):" >> sbomqs_aggregate.py
-          printf '%s\n' "    repo = os.path.basename(os.path.dirname(folder))" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    trivy = load_json(os.path.join(folder, \"trivy-fs.json\")) or {}" >> sbomqs_aggregate.py
-          printf '%s\n' "    conan = load_json(os.path.join(folder, \"conan-sbom.json\")) or {}" >> sbomqs_aggregate.py
-          printf '%s\n' "    score = load_json(os.path.join(folder, \"score.json\"))" >> sbomqs_aggregate.py
-          printf '%s\n' "    ntia  = load_json(os.path.join(folder, \"compliance_NTIA.json\"))" >> sbomqs_aggregate.py
-          printf '%s\n' "    bsi   = load_json(os.path.join(folder, \"compliance_BSI.json\"))" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    # LICENSES" >> sbomqs_aggregate.py
-          printf '%s\n' "    gh_license = load_json(os.path.join(folder, \"gh-license.json\")) or {}" >> sbomqs_aggregate.py
-          printf '%s\n' "    github_license_spdx = gh_license.get(\"license\", {}).get(\"spdx_id\", \"\")" >> sbomqs_aggregate.py
-          printf '%s\n' "    github_license_name = gh_license.get(\"license\", {}).get(\"name\", \"\")" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    local_license_txt = load_text(os.path.join(folder, \"local-license.txt\"))" >> sbomqs_aggregate.py
-          printf '%s\n' "    m = re.search(r\"SPDX-License-Identifier:\\s*([A-Za-z0-9.\\-+]+)\", local_license_txt)" >> sbomqs_aggregate.py
-          printf '%s\n' "    local_spdx = m.group(1) if m else \"\"" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    final_license = load_text(os.path.join(folder, \"final_license.txt\"))" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    # COMPONENT METADATA" >> sbomqs_aggregate.py
-          printf '%s\n' "    components = trivy.get(\"components\", []) or []" >> sbomqs_aggregate.py
-          printf '%s\n' "    component_names = [c.get(\"name\") for c in components]" >> sbomqs_aggregate.py
-          printf '%s\n' "    component_versions = [c.get(\"version\") for c in components]" >> sbomqs_aggregate.py
-          printf '%s\n' "    component_purls = [c.get(\"purl\") for c in components]" >> sbomqs_aggregate.py
-          printf '%s\n' "    component_suppliers = [c.get(\"supplier\", {}).get(\"name\") for c in components]" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    base = {" >> sbomqs_aggregate.py
-          printf '%s\n' "        \"repository\": repo," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"github_license_spdx\": github_license_spdx," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"github_license_name\": github_license_name," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"local_spdx_license\": local_spdx," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"final_assigned_license\": final_license," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"num_trivy_components\": len(components)," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"num_conan_components\": len(conan.get(\"components\", []))," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"component_names\": component_names," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"component_versions\": component_versions," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"component_purls\": component_purls," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"component_suppliers\": component_suppliers," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"trivy_scan_success\": trivy != {}," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"conan_scan_success\": conan != {}," >> sbomqs_aggregate.py
-          printf '%s\n' "        \"sbom_empty\": len(components) == 0," >> sbomqs_aggregate.py
-          printf '%s\n' "    }" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "    if score:" >> sbomqs_aggregate.py
-          printf '%s\n' "        rows.append({**base, \"type\": \"score\", **score})" >> sbomqs_aggregate.py
-          printf '%s\n' "    if ntia:" >> sbomqs_aggregate.py
-          printf '%s\n' "        rows.append({**base, \"type\": \"ntia\", **ntia})" >> sbomqs_aggregate.py
-          printf '%s\n' "    if bsi:" >> sbomqs_aggregate.py
-          printf '%s\n' "        rows.append({**base, \"type\": \"bsi\", **bsi})" >> sbomqs_aggregate.py
-          printf '%s\n' "" >> sbomqs_aggregate.py
-          printf '%s\n' "df = pd.json_normalize(rows)" >> sbomqs_aggregate.py
-          printf '%s\n' "df.to_csv(\"sbomqs_summary.csv\", index=False)" >> sbomqs_aggregate.py
-          python3 sbomqs_aggregate.py
+          python3 <<'PY'
+          import json, glob, pandas as pd, os, re
+
+          def load_json(path):
+              try:
+                  with open(path) as f:
+                      txt = f.read().strip()
+                      return json.loads(txt) if txt else None
+              except:
+                  return None
+
+          def load_text(path):
+              try:
+                  with open(path) as f:
+                      return f.read().strip()
+              except:
+                  return ""
+
+          rows = []
+
+          for folder in glob.glob("results/*/"):
+              repo = os.path.basename(os.path.dirname(folder))
+
+              trivy = load_json(os.path.join(folder, "trivy-fs.json")) or {}
+              conan = load_json(os.path.join(folder, "conan-sbom.json")) or {}
+              score = load_json(os.path.join(folder, "score.json"))
+              ntia  = load_json(os.path.join(folder, "compliance_NTIA.json"))
+              bsi   = load_json(os.path.join(folder, "compliance_BSI.json"))
+
+              gh_license = load_json(os.path.join(folder, "gh-license.json")) or {}
+              github_license_spdx = gh_license.get("license", {}).get("spdx_id", "")
+              github_license_name = gh_license.get("license", {}).get("name", "")
+
+              local_license_txt = load_text(os.path.join(folder, "local-license.txt"))
+              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local_license_txt)
+              local_spdx = m.group(1) if m else ""
+
+              final_license = load_text(os.path.join(folder, "final_license.txt"))
+
+              components = trivy.get("components", []) or []
+
+              component_names = [c.get("name") for c in components]
+              component_versions = [c.get("version") for c in components]
+              component_purls = [c.get("purl") for c in components]
+              component_suppliers = [c.get("supplier", {}).get("name") for c in components]
+
+              base = {
+                  "repository": repo,
+                  "github_license_spdx": github_license_spdx,
+                  "github_license_name": github_license_name,
+                  "local_spdx_license": local_spdx,
+                  "final_assigned_license": final_license,
+                  "num_trivy_components": len(components),
+                  "num_conan_components": len(conan.get("components", [])),
+                  "component_names": component_names,
+                  "component_versions": component_versions,
+                  "component_purls": component_purls,
+                  "component_suppliers": component_suppliers,
+                  "trivy_scan_success": trivy != {},
+                  "conan_scan_success": conan != {},
+                  "sbom_empty": len(components) == 0,
+              }
+
+              if score:
+                  rows.append({**base, "type": "score", **score})
+              if ntia:
+                  rows.append({**base, "type": "ntia", **ntia})
+              if bsi:
+                  rows.append({**base, "type": "bsi", **bsi})
+
+          df = pd.json_normalize(rows)
+          df.to_csv("sbomqs_summary.csv", index=False)
+          PY
+
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
