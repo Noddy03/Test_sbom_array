@@ -70,9 +70,11 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
-      - name: Install Syft (Anchore)
+      - name: Install Syft (Anchore) to /usr/bin (chosen)
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          # install Syft into /usr/bin so the runner can execute it reliably
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/bin
+          /usr/bin/syft version || /usr/bin/syft -v
 
       - name: Checkout repository
         env:
@@ -89,8 +91,10 @@ jobs:
         if: env.skip_repo != 'true'
         run: |
           mkdir -p project-src/.scan_refs || true
+          # developer-uploaded file (will be converted to URL by external tooling)
           if [ -f "/mnt/data/TOP 50 IOT REPOSITRIES.txt" ]; then
             cp "/mnt/data/TOP 50 IOT REPOSITRIES.txt" project-src/.scan_refs/ || true
+            echo "copied_uploaded_refs=/mnt/data/TOP 50 IOT REPOSITRIES.txt" >> $GITHUB_OUTPUT
           fi
 
       - name: Fetch GitHub license metadata
@@ -132,7 +136,7 @@ jobs:
       - name: Syft SBOM (metadata enrichment)
         if: env.skip_repo != 'true'
         run: |
-          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || \
+          /usr/bin/syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || \
             echo '{"components":[]}' > project-src/syft-sbom.json
 
       - name: Normalize SBOM component arrays
@@ -145,74 +149,94 @@ jobs:
             fi
           done
 
-      - name: Merge Syft metadata into Trivy SBOM (Trivy primary, Syft enriches) — safe
+      - name: Merge Syft metadata into Trivy SBOM (Python — Trivy primary, Syft enriches)
         if: env.skip_repo != 'true'
         run: |
-          set -euo pipefail
-          TRIVY=project-src/trivy-fs.json
-          SYFT=project-src/syft-sbom.json
-          OUT=project-src/merged-sbom.json
+          # Python merge: reliable, robust merging (Trivy is authoritative; Syft enriches missing fields)
+          python3 <<'PY'
+          import json, os
+          TRIVY = "project-src/trivy-fs.json"
+          SYFT  = "project-src/syft-sbom.json"
+          OUT   = "project-src/merged-sbom.json"
 
-          # Ensure both exist
-          [ -f "$TRIVY" ] || echo '{"components":[]}' > "$TRIVY"
-          [ -f "$SYFT" ] || echo '{"components":[]}' > "$SYFT"
+          def load(path):
+              if not os.path.exists(path):
+                  return {"components": []}
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception:
+                  return {"components": []}
 
-          # Attempt conservative merge: prefer Trivy fields, enrich missing values from Syft, append unmatched Syft components.
-          # Use a safe jq run with fallback if something goes wrong.
-          set +e
-          jq --argfile syft "$SYFT" '
-            def pkey(c): (c.purl // ((c.name // "") + ":" + (c.version // "")));
-            ($syft.components // []) as $scom |
-            ($ARGS.positional[0] | .components // []) as $tcom |
-            # For each syft component, try match by purl then name:version, else append
-            reduce $scom[] as $s ($tcom;
-              ($s.purl // "") as $spurl |
-              (($s.name // "") + ":" + ($s.version // "")) as $skey |
-              if ($spurl != "" and (map(select((.purl // "") == $spurl)) | length) > 0) then
-                map(
-                  if (.purl // "" == $spurl) then
-                    . + {
-                      version: (.version // $s.version),
-                      purl: (.purl // $s.purl),
-                      supplier: (.supplier // $s.supplier),
-                      hashes: (.hashes // $s.hashes),
-                      externalReferences: (.externalReferences // $s.externalReferences),
-                      evidence: (.evidence // $s.evidence),
-                      copyright: (.copyright // $s.copyright),
-                      type: (.type // $s.type)
-                    } else . end
-                )
-              elif (($skey != ":") and (map(select(((.name // "") + ":" + (.version // "")) == $skey)) | length) > 0) then
-                map(
-                  if (((.name // "") + ":" + (.version // "")) == $skey) then
-                    . + {
-                      version: (.version // $s.version),
-                      purl: (.purl // $s.purl),
-                      supplier: (.supplier // $s.supplier),
-                      hashes: (.hashes // $s.hashes),
-                      externalReferences: (.externalReferences // $s.externalReferences),
-                      evidence: (.evidence // $s.evidence),
-                      copyright: (.copyright // $s.copyright),
-                      type: (.type // $s.type)
-                    } else . end
-                )
-              else
-                . + [ $s ]
-              end
-            )
-            | { components: . }
-          ' --argfile tr "$TRIVY" "$TRIVY" > "$OUT"
-          JQ_EXIT=$?
-          set -e
+          trivy = load(TRIVY)
+          syft  = load(SYFT)
 
-          # Fallback: if merged file not created or empty, copy Trivy as merged to avoid breaking downstream steps
-          if [ ! -s "$OUT" ]; then
-            echo "Merge failed or produced empty output — falling back to Trivy SBOM"
-            cp "$TRIVY" "$OUT"
+          tcom = trivy.get("components", []) or []
+          scom = syft.get("components", []) or []
+
+          # build indices for syft by purl and name:version
+          idx_purl = {}
+          idx_nv   = {}
+          for c in scom:
+              purl = c.get("purl")
+              name = c.get("name")
+              ver  = c.get("version")
+              if purl:
+                  idx_purl[purl] = c
+              if name and ver:
+                  idx_nv[f"{name}:{ver}"] = c
+
+          def enrich(base, extra):
+              fields = ["supplier", "purl", "hashes", "externalReferences",
+                        "evidence", "copyright", "type", "properties"]
+              for k in fields:
+                  if not base.get(k) and extra.get(k):
+                      base[k] = extra[k]
+              return base
+
+          merged = []
+          # enrich Trivy components
+          for c in tcom:
+              new = dict(c)
+              purl = c.get("purl")
+              name = c.get("name")
+              ver  = c.get("version")
+              matched = None
+              if purl and purl in idx_purl:
+                  matched = idx_purl[purl]
+              elif name and ver and f"{name}:{ver}" in idx_nv:
+                  matched = idx_nv[f"{name}:{ver}"]
+              if matched:
+                  new = enrich(new, matched)
+              merged.append(new)
+
+          # append syft components not already present (by purl or name:version)
+          existing_purls = {m.get("purl") for m in merged if m.get("purl")}
+          existing_nv = { (m.get("name"), m.get("version")) for m in merged }
+          for c in scom:
+              purl = c.get("purl")
+              name = c.get("name")
+              ver  = c.get("version")
+              if purl and purl in existing_purls:
+                  continue
+              if name and ver and (name, ver) in existing_nv:
+                  continue
+              merged.append(c)
+
+          # If nothing in merged, fall back to trivy
+          if len(merged) == 0:
+              merged = tcom
+
+          outobj = {"components": merged}
+          with open(OUT, "w") as f:
+              json.dump(outobj, f, indent=2)
+          PY
+
+          # safety: ensure merged-sbom exists
+          if [ ! -s project-src/merged-sbom.json ]; then
+            echo "merged missing — fallback to trivy"
+            cp project-src/trivy-fs.json project-src/merged-sbom.json || true
           fi
-
-          # Ensure components array exists
-          jq '.components |= (if . == null then [] else . end)' "$OUT" > tmp && mv tmp "$OUT"
 
       - name: Determine final assigned license
         if: env.skip_repo != 'true'
