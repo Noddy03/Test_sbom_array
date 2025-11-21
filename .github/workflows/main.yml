@@ -1,4 +1,4 @@
-name: Fetch Top IoT Repositories + Trivy/Conan SBOM Scan (NTIA + BSI V2 Bulletproof)
+name: Fetch Top IoT Repositories + Trivy/Conan/Syft SBOM Merge + Trivy Vulnerabilities (NTIA + BSI V2 Bulletproof)
 
 on:
   workflow_dispatch:
@@ -55,7 +55,7 @@ jobs:
 
     steps:
 
-      - name: Install Conan + CycloneDX + jq + Trivy
+      - name: Install Conan + CycloneDX + jq + Trivy + other tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq wget curl python3-pip rpm gnupg lsb-release
@@ -70,6 +70,11 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
+      - name: Install Syft (Anchore)
+        run: |
+          # small syft installer — minimal footprint
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
       - name: Checkout repository
         env:
           REPO: ${{ matrix.repo }}
@@ -79,6 +84,15 @@ jobs:
               echo "skip_repo=false" >> $GITHUB_ENV
           else
               echo "skip_repo=true" >> $GITHUB_ENV
+          fi
+
+      - name: (optional) Copy uploaded reference file into workspace
+        if: env.skip_repo != 'true'
+        run: |
+          # developer-provided uploaded file (keeps a local copy for reference)
+          mkdir -p project-src/.scan_refs || true
+          if [ -f "/mnt/data/TOP 50 IOT REPOSITRIES.txt" ]; then
+            cp "/mnt/data/TOP 50 IOT REPOSITRIES.txt" project-src/.scan_refs/ || true
           fi
 
       - name: Fetch GitHub license metadata
@@ -110,20 +124,113 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM
+      - name: Trivy SBOM (primary vulnerability & license evidence)
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
               -o project-src/trivy-fs.json project-src \
               || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      - name: Normalize SBOM components
+      - name: Syft SBOM (metadata enrichment)
         if: env.skip_repo != 'true'
         run: |
-          SBOM="project-src/trivy-fs.json"
-          jq '
-            .components |= (if type=="array" then . else [] end)
-          ' "$SBOM" > tmp && mv tmp "$SBOM"
+          # generate CycloneDX JSON from Syft for rich metadata
+          syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || \
+            echo '{"components":[]}' > project-src/syft-sbom.json
+
+      - name: Normalize SBOM component arrays
+        if: env.skip_repo != 'true'
+        run: |
+          for f in project-src/trivy-fs.json project-src/syft-sbom.json; do
+            if [ -f "$f" ]; then
+              jq '
+                .components |= (if (has("components") and (.components|type=="array")) then .components else (.components // []) end)
+              ' "$f" > tmp && mv tmp "$f" || true
+            fi
+          done
+
+      - name: Merge Syft metadata into Trivy SBOM (Trivy primary, Syft enriches)
+        if: env.skip_repo != 'true'
+        run: |
+          # Strategy:
+          # - Use Trivy SBOM as base (project-src/trivy-fs.json)
+          # - For each Syft component, try to match by purl; if matched, fill missing fields in Trivy component:
+          #     version, purl, supplier, hashes, externalReferences, evidence, copyrights, packageUrl
+          # - If Syft component doesn't match any Trivy component, append it
+          #
+          # The resulting file is project-src/merged-sbom.json (CycloneDX style)
+          set -euo pipefail
+          TRIVY=project-src/trivy-fs.json
+          SYFT=project-src/syft-sbom.json
+          OUT=project-src/merged-sbom.json
+
+          # Ensure files exist
+          [ -f "$TRIVY" ] || echo '{"components":[]}' > "$TRIVY"
+          [ -f "$SYFT" ] || echo '{"components":[]}' > "$SYFT"
+
+          # Merge using jq. This script carefully prefers Trivy fields, adds missing ones from Syft.
+          jq --argfile syft "$SYFT" '
+            def id_of(c):
+              (c.purl // ( (c.name // "") + ":" + (c.version // "") ) );
+
+            . as $tr |
+            ($syft.components // []) as $scom |
+            ($tr.components // []) as $tcom |
+
+            # build an index of trivy components by purl and by name:version
+            ($tcom | map({key: ( .purl // ( (.name // "") + ":" + ( .version // "" ) ), val: .})) ) as $index |
+
+            # start with a copy of Trivy components
+            $tcom as $base |
+
+            # update base components by merging matching syft info
+            $base
+            | reduce $scom[] as $s (
+                .;
+                # compute matching predicate by purl first, else by name+version
+                ( $s.purl // "" ) as $spurl |
+                ( ($s.name // "") + ":" + ($s.version // "") ) as $skey |
+                if ($spurl != "" and (map(select((.purl // "") == $spurl)) | length) > 0) then
+                  map(
+                    if (.purl // "" == $spurl) then
+                      . + ( {
+                        version: (.version // $s.version),
+                        purl: (.purl // $s.purl),
+                        supplier: (.supplier // $s.supplier),
+                        hashes: (.hashes // $s.hashes),
+                        externalReferences: (.externalReferences // $s.externalReferences),
+                        evidence: (.evidence // $s.evidence),
+                        copyright: (.copyright // $s.copyright),
+                        type: (.type // $s.type)
+                      } )
+                    else .
+                    end
+                  )
+                elif ( ($skey != ":") and (map(select(((.name // "") + ":" + (.version // "")) == $skey)) | length) > 0) then
+                  map(
+                    if (((.name // "") + ":" + (.version // "")) == $skey) then
+                      . + ( {
+                        version: (.version // $s.version),
+                        purl: (.purl // $s.purl),
+                        supplier: (.supplier // $s.supplier),
+                        hashes: (.hashes // $s.hashes),
+                        externalReferences: (.externalReferences // $s.externalReferences),
+                        evidence: (.evidence // $s.evidence),
+                        copyright: (.copyright // $s.copyright),
+                        type: (.type // $s.type)
+                      } )
+                    else .
+                    end
+                  )
+                else
+                  # no match found in Trivy base: append the syft component
+                  . + [ $s ]
+                end
+              )
+          ' "$TRIVY" > tmp && mv tmp "$OUT"
+
+          # Ensure merged file is valid JSON and contains components array
+          jq '.components |= (if . == null then [] else . end)' "$OUT" > tmp && mv tmp "$OUT" || true
 
       - name: Determine final assigned license
         if: env.skip_repo != 'true'
@@ -135,37 +242,47 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
-      # ⭐ NEW POSITION — before compliance / scoring
-      - name: Apply final license to SBOM components
+      - name: Apply final license to MERGED SBOM components (only fill missing licenses)
         if: env.skip_repo != 'true'
         run: |
-          SBOM="project-src/trivy-fs.json"
+          SBOM="project-src/merged-sbom.json"
           FINAL=$(cat project-src/final_license.txt)
+          # Only set license if component has no licenses array or empty licenses
           jq --arg lic "$FINAL" '
             .components |= map(
-              .licenses = [{ "license": { "id": $lic }}]
+              if (.licenses? | length // 0) == 0 then
+                . + { licenses: [{ "license": { "id": $lic }}] }
+              else
+                # if licenses exist, try to ensure they have id field, otherwise keep
+                .licenses = ( .licenses | map(
+                  if (.license? and (.license.id? // "") == "") then
+                    .license.id = $lic | .
+                  else .
+                  end
+                )) | .
+              end
             )
           ' "$SBOM" > tmp && mv tmp "$SBOM"
 
-      - name: NTIA Compliance
+      - name: NTIA Compliance (use merged SBOM)
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             compliance --ntia /sbom/trivy-fs.json \
+             compliance --ntia /sbom/merged-sbom.json \
              > project-src/compliance_NTIA.json || true
 
-      - name: BSI v2 Compliance
+      - name: BSI v2 Compliance (use merged SBOM)
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             compliance --bsi-v2 /sbom/trivy-fs.json \
+             compliance --bsi-v2 /sbom/merged-sbom.json \
              > project-src/compliance_BSI.json || true
 
-      - name: Score SBOM
+      - name: Score SBOM (use merged SBOM)
         if: env.skip_repo != 'true'
         run: |
           docker run --rm -v $PWD/project-src:/sbom ghcr.io/interlynk-io/sbomqs:latest \
-             score /sbom/trivy-fs.json --json \
+             score /sbom/merged-sbom.json --json \
              > project-src/score.json || true
 
       - name: Sanitize artifact name
@@ -227,6 +344,8 @@ jobs:
               repo = os.path.basename(os.path.dirname(folder))
 
               trivy = load_json(os.path.join(folder, "trivy-fs.json")) or {}
+              syft = load_json(os.path.join(folder, "syft-sbom.json")) or {}
+              merged = load_json(os.path.join(folder, "merged-sbom.json")) or {}
               conan = load_json(os.path.join(folder, "conan-sbom.json")) or {}
               score = load_json(os.path.join(folder, "score.json"))
               ntia  = load_json(os.path.join(folder, "compliance_NTIA.json"))
@@ -242,11 +361,11 @@ jobs:
 
               final_license = load_text(os.path.join(folder, "final_license.txt"))
 
-              components = trivy.get("components", []) or []
+              components = merged.get("components", []) or []
               component_names = [c.get("name") for c in components]
               component_versions = [c.get("version") for c in components]
               component_purls = [c.get("purl") for c in components]
-              component_suppliers = [c.get("supplier", {}).get("name") for c in components]
+              component_suppliers = [c.get("supplier", {}).get("name") if isinstance(c.get("supplier"), dict) else c.get("supplier") for c in components]
 
               base = {
                   "repository": repo,
@@ -254,13 +373,16 @@ jobs:
                   "github_license_name": github_license_name,
                   "local_spdx_license": local_spdx,
                   "final_assigned_license": final_license,
-                  "num_trivy_components": len(components),
+                  "num_trivy_components": len(trivy.get("components", []) or []),
+                  "num_syft_components": len(syft.get("components", []) or []),
+                  "num_merged_components": len(components),
                   "num_conan_components": len(conan.get("components", [])),
                   "component_names": component_names,
                   "component_versions": component_versions,
                   "component_purls": component_purls,
                   "component_suppliers": component_suppliers,
                   "trivy_scan_success": trivy != {},
+                  "syft_scan_success": syft != {},
                   "conan_scan_success": conan != {},
                   "sbom_empty": len(components) == 0,
               }
