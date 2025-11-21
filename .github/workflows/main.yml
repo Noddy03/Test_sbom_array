@@ -65,10 +65,8 @@ jobs:
           # Install Trivy
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
-
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
             | sudo tee /etc/apt/sources.list.d/trivy.list
-
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
@@ -78,7 +76,6 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b $HOME/bin
           echo "$HOME/bin" >> $GITHUB_PATH
-          # PATH does not update inside the same step, so call explicitly:
           $HOME/bin/syft version
 
       - name: Checkout repository
@@ -121,14 +118,14 @@ jobs:
           conan graph info . --format=json > conan-sbom.json \
               || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy SBOM (primary SBOM)
+      - name: Trivy SBOM (primary)
         if: env.skip_repo != 'true'
         run: |
           trivy fs --scanners vuln,license --format cyclonedx \
               -o project-src/trivy-fs.json project-src \
               || echo '{"components":[]}' > project-src/trivy-fs.json
 
-      - name: Syft SBOM (metadata enrichment source)
+      - name: Syft SBOM (metadata enrichment)
         if: env.skip_repo != 'true'
         run: |
           $HOME/bin/syft dir:project-src -o cyclonedx-json \
@@ -219,7 +216,6 @@ jobs:
           json.dump({"components": merged}, open(OUT,"w"), indent=2)
           PY
 
-          # Safety fallback
           if [ ! -s project-src/merged-sbom.json ]; then
             cp project-src/trivy-fs.json project-src/merged-sbom.json
           fi
@@ -275,10 +271,6 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
 
-      # ─────────────────────────────────────────────────────
-      # FIXED UPLOAD STEP (IMPORTANT!)
-      # Upload ONLY the SBOM output files (not source code)
-      # ─────────────────────────────────────────────────────
       - name: Upload SBOM reports
         uses: actions/upload-artifact@v4
         with:
@@ -328,21 +320,21 @@ jobs:
           rows=[]
 
           for folder in glob.glob("results/*/"):
-              repo=os.path.basename(os.path.dirname(folder))
+              repo = os.path.basename(folder.rstrip("/"))  # FIXED
 
-              merged=load_json(os.path.join(folder,"merged-sbom.json")) or {}
-              trivy=load_json(os.path.join(folder,"trivy-fs.json")) or {}
-              syft =load_json(os.path.join(folder,"syft-sbom.json")) or {}
-              conan=load_json(os.path.join(folder,"conan-sbom.json")) or {}
-
+              merged = load_json(os.path.join(folder,"merged-sbom.json")) or {}
               if not merged.get("components"):
-                  continue  # skip empty folders
+                  continue
 
-              score=load_json(os.path.join(folder,"score.json"))
-              ntia =load_json(os.path.join(folder,"compliance_NTIA.json"))
-              bsi  =load_json(os.path.join(folder,"compliance_BSI.json"))
+              trivy = load_json(os.path.join(folder,"trivy-fs.json")) or {}
+              syft  = load_json(os.path.join(folder,"syft-sbom.json")) or {}
+              conan = load_json(os.path.join(folder,"conan-sbom.json")) or {}
 
-              gh=load_json(os.path.join(folder,"gh-license.json")) or {}
+              score = load_json(os.path.join(folder,"score.json"))
+              ntia  = load_json(os.path.join(folder,"compliance_NTIA.json"))
+              bsi   = load_json(os.path.join(folder,"compliance_BSI.json"))
+
+              gh= load_json(os.path.join(folder,"gh-license.json")) or {}
               gh_spdx=gh.get("license",{}).get("spdx_id","")
               gh_name=gh.get("license",{}).get("name","")
 
@@ -352,14 +344,13 @@ jobs:
 
               final_license=load_text(os.path.join(folder,"final_license.txt"))
 
-              comps=merged.get("components",[]) or []
+              comps=merged.get("components",[])
               names=[c.get("name") for c in comps]
               vers=[c.get("version") for c in comps]
               purls=[c.get("purl") for c in comps]
               suppliers=[
-                (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) 
-                 else {"name":c.get("supplier")}).get("name")
-                for c in comps
+                 (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) else {"name":c.get("supplier")}).get("name")
+                 for c in comps
               ]
 
               base=dict(
