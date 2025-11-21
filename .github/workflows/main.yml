@@ -66,7 +66,6 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm
           pip install --upgrade pip
           pip install conan cyclonedx-bom
-
           # Trivy
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
@@ -147,13 +146,12 @@ jobs:
 
 
       ##############################
-      # MERGE SBOMS (WORKING)
+      # MERGE SBOMS
       ##############################
       - name: Merge SBOMs
         run: |
           python3 <<'PY'
           import json
-
           def load(f):
               try: return json.load(open(f))
               except: return {"components":[]}
@@ -165,7 +163,7 @@ jobs:
           scom = syft.get("components",[])
 
           idx_purl = {c.get("purl"):c for c in scom if c.get("purl")}
-          idx_nv = {(c.get("name"),c.get("version")):c for c in scom}
+          idx_nv   = {(c.get("name"),c.get("version")):c for c in scom}
 
           def enrich(a,b):
               for k in ["supplier","purl","hashes","externalReferences",
@@ -179,8 +177,8 @@ jobs:
 
           for c in tcom:
               key=(c.get("name"),c.get("version"))
-              match=idx_purl.get(c.get("purl")) or idx_nv.get(key)
-              new=dict(c)
+              match = idx_purl.get(c.get("purl")) or idx_nv.get(key)
+              new = dict(c)
               if match: new=enrich(new,match)
               merged.append(new)
               seen.add(key)
@@ -190,9 +188,14 @@ jobs:
               if key not in seen:
                   merged.append(c)
 
-          json.dump({"components":merged},
-                    open("project-src/merged-sbom.json","w"),
-                    indent=2)
+          # Add repo license at top level (do not override component licenses)
+          repo_license = open("project-src/final_license.txt").read().strip() if \
+                          __import__("os").path.exists("project-src/final_license.txt") \
+                          else "NOASSERTION"
+
+          out = {"repo_license": repo_license, "components": merged}
+
+          json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
 
 
@@ -208,19 +211,14 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
-      - name: Apply license to merged SBOM
-        run: |
-          L=$(cat project-src/final_license.txt)
-          jq --arg lic "$L" '
-            .components |= map(.licenses=[{"license":{"id":$lic}}])
-          ' project-src/merged-sbom.json \
-          > tmp && mv tmp project-src/merged-sbom.json
+      # ❗ No longer overwriting component licenses
+      # SBOM stays intact, repo license stored at top level
 
 
       ##############################
       # NTIA + BSI COMPLIANCE
       ##############################
-      - name: NTIA compliance (JSON FIXED)
+      - name: NTIA compliance
         run: |
           docker run --rm -v $PWD/project-src:/sbom \
             ghcr.io/interlynk-io/sbomqs \
@@ -272,20 +270,17 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: results/
-          merge-multiple: true   # REQUIRED
-
+          merge-multiple: true
 
       - name: Install Python
         run: |
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
-
 
       - name: Aggregate into summary.csv
         run: |
@@ -302,9 +297,8 @@ jobs:
 
           rows=[]
 
-          # ⭐ FIX: SEARCH CORRECT NESTING LEVEL
-          for repo_dir in glob.glob("results/*/*/"):
-
+          # FIXED: correct directory depth
+          for repo_dir in glob.glob("results/*/"):
               merged = load(repo_dir + "merged-sbom.json")
               if not merged:
                   continue
@@ -315,8 +309,8 @@ jobs:
               bsi   = load(repo_dir + "compliance_BSI.json")
               ntia  = load(repo_dir + "compliance_NTIA.json")
               score = load(repo_dir + "score.json")
+              gh    = load(repo_dir + "gh-license.json") or {}
 
-              gh = load(repo_dir + "gh-license.json") or {}
               gh_spdx = gh.get("license",{}).get("spdx_id","")
               gh_name = gh.get("license",{}).get("name","")
 
@@ -325,8 +319,10 @@ jobs:
               local_spdx = m.group(1) if m else ""
 
               final_license = loadtext(repo_dir + "final_license.txt")
+              repo_license  = merged.get("repo_license","")
 
               comps = merged.get("components",[]) or []
+
               names=[c.get("name") for c in comps]
               vers=[c.get("version") for c in comps]
               purls=[c.get("purl") for c in comps]
@@ -334,23 +330,28 @@ jobs:
                 (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) else {"name":c.get("supplier")}).get("name")
                 for c in comps
               ]
+              comp_licenses=[
+                c.get("licenses") for c in comps
+              ]
 
-              repo = os.path.basename(os.path.dirname(repo_dir.rstrip("/")))
+              repo = os.path.basename(repo_dir.rstrip("/"))
 
               base=dict(
                 repository=repo,
+                repo_license=repo_license,
                 github_license_spdx=gh_spdx,
                 github_license_name=gh_name,
                 local_spdx_license=local_spdx,
                 final_assigned_license=final_license,
                 num_components=len(comps),
-                num_trivy=len(trivy.get("components",[]) or []),
-                num_syft=len(syft.get("components",[]) or []),
-                num_conan=len(conan.get("components",[]) or []),
                 component_names=names,
                 component_versions=vers,
                 component_purls=purls,
-                component_suppliers=suppliers
+                component_suppliers=suppliers,
+                component_licenses=comp_licenses,
+                num_trivy=len(trivy.get("components",[]) or []),
+                num_syft=len(syft.get("components",[]) or []),
+                num_conan=len(conan.get("components",[]) or [])
               )
 
               if score: rows.append({**base,"type":"score",**score})
@@ -359,7 +360,6 @@ jobs:
 
           pd.json_normalize(rows).to_csv("summary.csv",index=False)
           PY
-
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
