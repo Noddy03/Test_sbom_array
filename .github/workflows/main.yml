@@ -44,6 +44,7 @@ jobs:
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
 
+
   sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -71,12 +72,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy
 
+      # ----------------------
+      #   FIXED SYFT INSTALL
+      # ----------------------
       - name: Install Syft safely
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b $HOME/bin
           echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Verify Syft
+        run: |
           syft version
 
       - name: Checkout repository
@@ -251,6 +258,7 @@ jobs:
             project-src/local-license.txt
             project-src/final_license.txt
           if-no-files-found: warn
+
 
 
   aggregate_results:
