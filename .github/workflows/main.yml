@@ -43,7 +43,6 @@ jobs:
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-
   sbom_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
@@ -62,6 +61,8 @@ jobs:
           sudo apt-get install -y jq wget curl python3-pip rpm gnupg lsb-release
           pip install --upgrade pip
           pip install conan cyclonedx-bom
+
+          # Trivy installation
           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
             | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
@@ -134,6 +135,7 @@ jobs:
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
 
+      # ⭐ NEW POSITION — before compliance / scoring
       - name: Apply final license to SBOM components
         if: env.skip_repo != 'true'
         run: |
@@ -241,7 +243,6 @@ jobs:
               final_license = load_text(os.path.join(folder, "final_license.txt"))
 
               components = trivy.get("components", []) or []
-
               component_names = [c.get("name") for c in components]
               component_versions = [c.get("version") for c in components]
               component_purls = [c.get("purl") for c in components]
@@ -274,7 +275,6 @@ jobs:
           df = pd.json_normalize(rows)
           df.to_csv("sbomqs_summary.csv", index=False)
           PY
-
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
