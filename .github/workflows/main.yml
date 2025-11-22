@@ -37,7 +37,7 @@ jobs:
           fi
 
           JSON_ARRAY=$(printf "%s
-" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          " "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
 
