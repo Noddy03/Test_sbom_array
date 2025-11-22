@@ -98,6 +98,12 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y trivy || true
 
+      - name: Trivy: download DB (best-effort)
+        run: |
+          set -euo pipefail
+          # prefetch DB to avoid empty results when network delay occurs
+          sudo trivy --download-db-only || true
+
       - name: Install Syft
         run: |
           set -euo pipefail
@@ -179,14 +185,15 @@ jobs:
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
 
-      - name: Trivy FS SBOM (CycloneDX, recursive)
+      - name: Trivy FS SBOM (CycloneDX) + vulnerabilities (recursive, library+os)
         run: |
           set -euo pipefail
-          # Full recursive filesystem CycloneDX SBOM and vulnerability scan (licenses + vulns).
+          # generate CycloneDX SBOM (components + license info)
           trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
-          # Also capture detailed vuln JSON for unified vuln list
-          trivy fs --format json -o project-src/vulnerabilities_fs.json project-src \
+
+          # full filesystem vuln scan: include library vulnerabilities and OS vulnerabilities
+          trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src \
             || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
 
       - name: Syft FS SBOM (CycloneDX, deep scan)
@@ -289,12 +296,12 @@ jobs:
           jq --arg lic "$L" '.repo_license = $lic' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
 
       ##############################
-      # TRIVY VULNERABILITIES (FULL)
+      # TRIVY SBOM vulnerability scan (use SBOM as source, check library+os)
       ##############################
-      - name: Trivy SBOM vulnerability scan (full)
+      - name: Trivy SBOM vulnerability scan (full: check libraries + os)
         run: |
           set -euo pipefail
-          trivy sbom --format json -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
+          trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
             || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
 
       ##############################
