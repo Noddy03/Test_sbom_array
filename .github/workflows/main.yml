@@ -54,7 +54,6 @@ jobs:
           fi
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
   ##############################
   # SBOM / SCAN JOB
   ##############################
@@ -76,7 +75,6 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom pandas
-
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
@@ -84,7 +82,6 @@ jobs:
           sudo systemctl restart docker || true
           sudo docker --version || true
           sudo docker info || true
-
       ##############################
       # TRIVY, SYFT, CDXGEN PREP
       ##############################
@@ -97,13 +94,11 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/trivy.list
           sudo apt-get update -y
           sudo apt-get install -y trivy || true
-
       - name: Trivy download DB (best-effort)
         run: |
           set -euo pipefail
           # prefetch DB to avoid empty results when network delay occurs
           sudo trivy --download-db-only || true
-
       - name: Install Syft
         run: |
           set -euo pipefail
@@ -111,7 +106,6 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
-
       - name: Try install cdxgen via npm (mark fallback)
         run: |
           set -euo pipefail
@@ -123,42 +117,26 @@ jobs:
           else
             echo "docker" > /tmp/cdxgen_fallback
           fi
-
       - name: Verify Syft
         run: syft version || true
 
       ##############################
       # BULLETPROOF CHECKOUT
       ##############################
-      - name: Bulletproof checkout (safe for submodules)
+      - name: Checkout target repository (fixed & reliable)
         run: |
           set -euo pipefail
-          rm -rf project-src || true
-          mkdir project-src
-          cd project-src
-          git init
-          git config --local submodule.recurse false || true
-          git config core.sparseCheckout true
-          echo "/*" > .git/info/sparse-checkout
-          git remote add origin https://github.com/${{ matrix.repo }}.git
-          git fetch --depth=1 origin HEAD || true
-          if [ -f .git/FETCH_HEAD ]; then
-            git checkout FETCH_HEAD || git reset --hard FETCH_HEAD || true
-          else
-            cd ..
-            rm -rf tmp_clone || true
-            git clone --depth 1 --no-tags https://github.com/${{ matrix.repo }}.git tmp_clone || true
-            if [ -d tmp_clone ]; then
-              shopt -s dotglob || true
-              mv tmp_clone/* project-src/ || true
-              rm -rf tmp_clone || true
-            fi
+          # clean any previous directory
+          rm -rf project-src
+          # clone the target repository into project-src
+          git clone --depth 1 https://github.com/${{ matrix.repo }}.git project-src || (echo "git clone failed" >&2; exit 1)
+          # sanity check
+          if [ ! -d project-src ] || [ -z "$(ls -A project-src)" ]; then
+            echo "ERROR: project-src is empty after clone" >&2
+            exit 1
           fi
-          cd ..
-
-      ##############################
-      # LICENSE DISCOVERY
-      ##############################
+          echo "Cloned repository content (top entries):"
+          ls -la project-src | sed -n '1,200p'
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
@@ -166,7 +144,6 @@ jobs:
         run: |
           gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
-
       - name: Local SPDX detection
         run: |
           FILE=$(find project-src -maxdepth=6 -type f \
@@ -174,7 +151,6 @@ jobs:
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt
           else echo "" > project-src/local-license.txt
           fi
-
       ##############################
       # SBOM GENERATION — FULL RECURSIVE FILESYSTEM SCAN (rich detection + binary hashes)
       ##############################
@@ -184,25 +160,21 @@ jobs:
           cd project-src || exit 0
           conan profile detect --force || true
           conan graph info . --format=json > conan-sbom.json || echo '{"components":[]}' > conan-sbom.json
-
       - name: Trivy FS SBOM (CycloneDX) + vulnerabilities (recursive, library+os)
         run: |
           set -euo pipefail
           # generate CycloneDX SBOM (components + license info)
           trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src \
             || echo '{"components":[]}' > project-src/trivy-fs.json
-
           # full filesystem vuln scan: include library vulnerabilities and OS vulnerabilities
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src \
             || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
-
       - name: Syft FS SBOM (CycloneDX, deep scan)
         run: |
           set -euo pipefail
           # syft filesystem scan (deep) — syft will analyze file types, binaries, and produce component hashes where available
           syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json \
             || echo '{"components":[]}' > project-src/syft-sbom.json
-
       - name: Cdxgen SBOM (local or docker fallback)
         run: |
           set -euo pipefail
@@ -216,7 +188,6 @@ jobs:
               echo '{"components":[]}' > project-src/cdxgen-sbom.json
             fi
           fi
-
       - name: Normalize SBOM arrays
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
@@ -226,7 +197,6 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-
       ##############################
       # MERGE SBOMS (preserve component licenses, write repo_license)
       ##############################
@@ -279,7 +249,6 @@ jobs:
           out = {"repo_license": repo_license, "components": merged}
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-
       ##############################
       # DETERMINE FINAL REPO LICENSE
       ##############################
@@ -294,7 +263,6 @@ jobs:
         run: |
           L=$(cat project-src/final_license.txt)
           jq --arg lic "$L" '.repo_license = $lic' project-src/merged-sbom.json > tmp && mv tmp project-src/merged-sbom.json
-
       ##############################
       # TRIVY SBOM vulnerability scan (use SBOM as source, check library+os)
       ##############################
@@ -303,7 +271,6 @@ jobs:
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
             || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
-
       ##############################
       # Create unified vulnerabilities list (json + csv)
       ##############################
@@ -339,7 +306,6 @@ jobs:
               for v in allv:
                   w.writerow([v.get("id"), v.get("package"), v.get("version"), v.get("severity"), v.get("source"), v.get("description")])
           PY
-
       ##############################
       # Create libraries list (json + csv)
       ##############################
@@ -372,7 +338,6 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
-
       ##############################
       # NTIA + BSI V2 + SCORE (write JSON outputs) with robust fallback
       ##############################
@@ -383,7 +348,6 @@ jobs:
             ghcr.io/interlynk-io/sbomqs \
             compliance --ntia --format json /sbom/merged-sbom.json \
             > project-src/compliance_NTIA.json) || (echo '{"error":true}' > project-src/compliance_NTIA.json)
-
       - name: BSI-V2 compliance (json)
         run: |
           set -euo pipefail
@@ -391,7 +355,6 @@ jobs:
             ghcr.io/interlynk-io/sbomqs \
             compliance --bsi-v2 --format json /sbom/merged-sbom.json \
             > project-src/compliance_BSI.json) || (echo '{"error":true}' > project-src/compliance_BSI.json)
-
       - name: SBOM Score (json)
         run: |
           set -euo pipefail
@@ -399,7 +362,6 @@ jobs:
             ghcr.io/interlynk-io/sbomqs \
             score /sbom/merged-sbom.json --json \
             > project-src/score.json) || (echo '{"error":true}' > project-src/score.json)
-
       ##############################
       # Debug: show generated files (helps troubleshooting)
       ##############################
@@ -412,7 +374,6 @@ jobs:
           jq -c '.error // empty' project-src/compliance_NTIA.json || true
           jq -c '.error // empty' project-src/compliance_BSI.json || true
           jq -c '.error // empty' project-src/score.json || true
-
       ##############################
       # Sanitize artifact name and upload all project-src files (preserve structure)
       ##############################
@@ -422,11 +383,9 @@ jobs:
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
-
       - name: List files to upload (for debugging)
         run: |
           find project-src -maxdepth 3 -type f | sed -n '1,200p'
-
       - name: Upload results (per-repo artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -453,7 +412,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip3 install pandas
-
       - name: Build bulletproof summary.csv (recursive, normalizes nested artifacts)
         run: |
           python3 <<'PY'
@@ -673,7 +631,6 @@ jobs:
           df.to_csv(os.path.join(outdir,"summary.csv"), index=False)
           print("Wrote", os.path.join(outdir,"summary.csv"))
           PY
-
       - name: Upload sbom-reports (summary + per-repo)
         uses: actions/upload-artifact@v4
         with:
