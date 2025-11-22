@@ -298,7 +298,7 @@ jobs:
       ##############################
       # TRIVY SBOM vulnerability scan (use SBOM as source, check library+os)
       ##############################
-      - name: Trivy SBOM vulnerability scan (full: check libraries + os)
+      - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json \
