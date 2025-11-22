@@ -34,7 +34,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          RAW_Q="topic:IoT language:$LANG fork:false archived:false"
+          # NOTE: topic matching can be case-sensitive on GitHub; adjust if needed
+          RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
@@ -62,7 +63,7 @@ jobs:
       - name: Install base deps (without docker.io)
         run: |
           sudo apt-get update -y
-          # NOTE: do NOT install docker.io (conflicts on Ubuntu 24.04)
+          # DO NOT install docker.io (causes containerd.io conflicts on Ubuntu 24.04)
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm
           pip install --upgrade pip
           pip install cyclonedx-bom pandas
@@ -72,12 +73,10 @@ jobs:
           set -euo pipefail
           # use official installer which avoids the containerd.io apt conflict
           curl -fsSL https://get.docker.com | sudo sh
-          # best-effort add runner user to docker group (non-fatal)
           sudo usermod -aG docker $USER || true
-          # ensure docker is available (may not be started on some runners)
           docker version || true
 
-      - name: Install Trivy (retry)
+      - name: Install Trivy (with retry)
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -89,7 +88,7 @@ jobs:
               && sudo apt-get install -y trivy && break || sleep 5
           done || true
 
-      - name: Install Syft (retry)
+      - name: Install Syft (with retry)
         run: |
           set -euo pipefail
           for i in 1 2 3; do
@@ -102,26 +101,25 @@ jobs:
         run: |
           set -euo pipefail
           if npm --version >/dev/null 2>&1; then
-            # best-effort; do not fail the job if npm install fails
             sudo npm install -g @cyclonedx/cdxgen || true
           fi
           if command -v cdxgen >/dev/null 2>&1; then
             rm -f /tmp/cdxgen_fallback || true
           else
-            # fallback to docker-based cdxgen
             echo "docker" > /tmp/cdxgen_fallback
           fi
 
       - name: Verify Syft
         run: syft version || true
 
-      - name: Checkout repository
+      - name: Checkout repository (no submodules)
         uses: actions/checkout@v4
         with:
           repository: ${{ matrix.repo }}
           token: ${{ github.token }}
           path: project-src
           fetch-depth: 1
+          submodules: false
 
       ##############################
       # LICENSE DISCOVERY
@@ -131,8 +129,7 @@ jobs:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "/repos/$REPO/license" \
-            > project-src/gh-license.json 2>/dev/null \
+          gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null \
             || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json
 
       - name: Local SPDX detection
@@ -160,10 +157,8 @@ jobs:
         run: |
           set -euo pipefail
           for i in 1 2 3; do
-            trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src && break || (echo "[]" > project-src/trivy-fs.json && sleep 3)
+            trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src && break || (echo '{"components":[]}' > project-src/trivy-fs.json && sleep 3)
           done || true
-          # ensure fallback structure
-          jq 'if has("components") then . else (. + {components: []}) end' project-src/trivy-fs.json > tmp || echo '{"components":[]}' > tmp; mv tmp project-src/trivy-fs.json
 
       - name: Syft SBOM (retry)
         run: |
@@ -172,7 +167,7 @@ jobs:
             syft dir:project-src -o cyclonedx-json > project-src/syft-sbom.json && break || (echo '{"components":[]}' > project-src/syft-sbom.json && sleep 2)
           done || true
 
-      - name: Cdxgen SBOM (local cdxgen if available, else docker)
+      - name: Cdxgen SBOM (local or docker fallback)
         run: |
           set -euo pipefail
           if [ -f /tmp/cdxgen_fallback ] && grep -q docker /tmp/cdxgen_fallback 2>/dev/null; then
@@ -205,10 +200,8 @@ jobs:
           python3 <<'PY'
           import json, os
           def load(p):
-              try:
-                  return json.load(open(p))
-              except:
-                  return {"components":[]}
+              try: return json.load(open(p))
+              except: return {"components":[]}
           trivy = load("project-src/trivy-fs.json")
           syft = load("project-src/syft-sbom.json")
           cdx = load("project-src/cdxgen-sbom.json")
@@ -263,6 +256,7 @@ jobs:
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
+
       - name: Ensure merged-sbom.json contains repo_license (inject if missing)
         run: |
           L=$(cat project-src/final_license.txt)
@@ -388,6 +382,7 @@ jobs:
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
+
       - name: Upload results (per-repo artifact)
         uses: actions/upload-artifact@v4
         with:
@@ -401,8 +396,8 @@ jobs:
   aggregate_results:
     needs: sbom_scan
     runs-on: ubuntu-latest
-
     steps:
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -414,15 +409,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3-pip
           pip install pandas
-      - name: Build summary.csv (repo_name, engine, ntia_sha256, bsi_v2_sha256, timestamp)
+
+      - name: Build bulletproof summary.csv (recursive, normalizes nested artifacts)
         run: |
           python3 <<'PY'
           import os, glob, json, hashlib, pandas as pd, datetime, re
+
           def load(path):
               try:
                   return json.load(open(path))
               except:
                   return None
+
           def sha256_of_file(path):
               try:
                   import hashlib
@@ -431,77 +429,257 @@ jobs:
                       for chunk in iter(lambda: f.read(65536), b""):
                           h.update(chunk)
                   return h.hexdigest()
-              except:
+              except Exception:
                   return "error:no_file"
-          rows=[]
-          # iterate downloaded artifact directories
-          for artifact_dir in glob.glob("results/*/"):
-              if not artifact_dir.endswith("/"):
-                  artifact_dir += "/"
-              # possible bases inside artifact
-              bases = [artifact_dir, os.path.join(artifact_dir, "project-src") + "/"]
+
+          rows = []
+
+          # Find all merged-sbom.json files anywhere under results/
+          candidates = glob.glob("results/**/merged-sbom.json", recursive=True)
+
+          # Also consider any file ending with merged-sbom.json or *merged-sbom.json
+          candidates += [p for p in glob.glob("results/**", recursive=True) if p.endswith("merged-sbom.json") and p not in candidates]
+
+          # Deduplicate
+          candidates = sorted(set(candidates))
+
+          # If none found, try to find any cyclonedx-like files (trivy/syft/cdxgen)
+          if not candidates:
+              alt = glob.glob("results/**/trivy-fs.json", recursive=True) + \
+                    glob.glob("results/**/syft-sbom.json", recursive=True) + \
+                    glob.glob("results/**/cdxgen-sbom.json", recursive=True)
+              candidates = sorted(set(alt))
+
+          # For each candidate, compute its artifact root (the artifact folder)
+          seen_roots = set()
+          for merged_path in candidates:
+              # Find nearest ancestor that looks like an artifact folder
+              # e.g., results/sbom-reports-.../merged-sbom.json  OR
+              #       results/sbom-reports-.../project-src/merged-sbom.json OR nested deeper
+              merged_abs = os.path.abspath(merged_path)
+              # walk up until we find a directory whose name starts with sbom-reports- or until results/
+              cur = os.path.dirname(merged_abs)
+              root_candidate = None
+              while True:
+                  if os.path.basename(cur).startswith("sbom-reports-") or os.path.basename(cur) == "results":
+                      root_candidate = cur
+                      break
+                  parent = os.path.dirname(cur)
+                  if parent == cur:
+                      root_candidate = cur
+                      break
+                  cur = parent
+              # choose artifact_dir as the folder under results/ that contains the artifact name
+              # ensure it's under results/
+              if "results" in root_candidate:
+                  # prefer the sbom-reports-* folder
+                  parts = root_candidate.split(os.sep)
+                  try:
+                      idx = parts.index("results")
+                      # artifact_dir is results/<next-part> (if present)
+                      if idx + 1 < len(parts):
+                          artifact_dir = os.path.join(*parts[:idx+2])
+                      else:
+                          artifact_dir = root_candidate
+                  except ValueError:
+                      artifact_dir = root_candidate
+              else:
+                  artifact_dir = os.path.dirname(merged_abs)
+
+              artifact_dir = os.path.normpath(artifact_dir) + os.sep
+
+              if artifact_dir in seen_roots:
+                  continue
+              seen_roots.add(artifact_dir)
+
+              # Now search within artifact_dir for the actual files (handle nested subfolder)
+              # prefer locating files nearest merged_path
+              base_paths = [artifact_dir,
+                            os.path.join(artifact_dir, "project-src") + os.sep,
+                            os.path.join(artifact_dir, os.path.basename(artifact_dir.rstrip(os.sep))) + os.sep]
+
+              # Also include any directories under artifact_dir (first level)
+              try:
+                  subdirs = [os.path.join(artifact_dir, d) + os.sep for d in os.listdir(artifact_dir) if os.path.isdir(os.path.join(artifact_dir, d))]
+                  base_paths = base_paths + subdirs
+              except Exception:
+                  pass
+
               merged = None
-              base_path = None
-              # Try to find merged-sbom.json in known locations
-              for b in bases:
-                  if os.path.exists(os.path.join(b, "merged-sbom.json")):
-                      try:
-                          merged = load(os.path.join(b,"merged-sbom.json"))
-                          base_path = b
-                          break
-                      except:
-                          merged = None
-              # also support flattened/alternate filenames: e.g., artifact_merged-sbom.json
+              for b in base_paths:
+                  candidate = os.path.join(b, "merged-sbom.json")
+                  if os.path.exists(candidate):
+                      merged = load(candidate)
+                      base_path = b
+                      break
+              # fallback: if merged_path exists use its dir
+              if merged is None and os.path.exists(merged_path):
+                  merged = load(merged_path)
+                  base_path = os.path.dirname(merged_path) + os.sep
               if merged is None:
-                  for f in glob.glob(os.path.join(artifact_dir, "*merged-sbom.json")):
-                      try:
-                          merged = load(f)
-                          base_path = os.path.dirname(f) + "/"
-                          break
-                      except:
-                          merged = None
+                  # try any merged file somewhere under artifact_dir
+                  for p in glob.glob(os.path.join(artifact_dir, "**/*merged-sbom.json"), recursive=True):
+                      merged = load(p)
+                      base_path = os.path.dirname(p) + os.sep
+                      break
               if merged is None:
                   # nothing to aggregate here
                   continue
-              # read compliance files and compute sha256 (or error:no_file)
-              ntia_file = os.path.join(base_path, "compliance_NTIA.json")
-              bsi_file = os.path.join(base_path, "compliance_BSI.json")
-              ntia_hash = sha256_of_file(ntia_file) if os.path.exists(ntia_file) else "error:no_file"
-              bsi_hash  = sha256_of_file(bsi_file) if os.path.exists(bsi_file) else "error:no_file"
-              # determine engine string: which SBOM engines produced components
-              engines = []
-              for eng_name, fname in [("trivy","trivy-fs.json"),("syft","syft-sbom.json"),("cdxgen","cdxgen-sbom.json"),("conan","conan-sbom.json")]:
-                  p1 = os.path.join(base_path, fname)
-                  if os.path.exists(p1):
+
+              # load supporting files if present
+              def try_load(fname):
+                  for b in base_paths:
+                      p = os.path.join(b, fname)
+                      if os.path.exists(p):
+                          return load(p) or {}
+                  # also try anywhere under artifact_dir
+                  for p in glob.glob(os.path.join(artifact_dir, "**", fname), recursive=True):
                       try:
-                          data = load(p1) or {}
-                          if data.get("components"):
-                              engines.append(eng_name)
+                          return load(p) or {}
                       except:
                           pass
-              engine_str = ",".join(sorted(set(engines))) if engines else "unknown"
-              # repo name: derive from artifact folder name
-              artifact_name = os.path.basename(os.path.normpath(artifact_dir.rstrip("/")))
-              repo_name = artifact_name.replace("sbom-reports-","").replace("_","/")
+                  return {}
+
+              trivy = try_load("trivy-fs.json") or {}
+              syft = try_load("syft-sbom.json") or {}
+              cdx = try_load("cdxgen-sbom.json") or {}
+              conan = try_load("conan-sbom.json") or {}
+              bsi = try_load("compliance_BSI.json")
+              ntia = try_load("compliance_NTIA.json")
+              score = try_load("score.json")
+              gh = try_load("gh-license.json") or {}
+              gh_spdx = gh.get("license",{}).get("spdx_id","")
+              gh_name = gh.get("license",{}).get("name","")
+              # local license
+              local_txt = ""
+              for b in base_paths:
+                  p = os.path.join(b, "local-license.txt")
+                  if os.path.exists(p):
+                      try:
+                          local_txt = open(p).read()
+                          break
+                      except:
+                          local_txt = ""
+              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.\-+]+)", local_txt or "")
+              local_spdx = m.group(1) if m else ""
+              final_license = ""
+              for b in base_paths:
+                  p = os.path.join(b, "final_license.txt")
+                  if os.path.exists(p):
+                      try:
+                          final_license = open(p).read().strip()
+                          break
+                      except:
+                          final_license = ""
+              # components
+              comps = merged.get("components",[]) or []
+              names=[c.get("name") for c in comps]
+              vers=[c.get("version") for c in comps]
+              purls=[c.get("purl") for c in comps]
+              suppliers=[
+                  (c.get("supplier",{}) if isinstance(c.get("supplier"),dict) else {"name":c.get("supplier")}).get("name")
+                  for c in comps
+              ]
+              # compute sha256 for compliance files if present
+              ntia_file = None
+              bsi_file = None
+              for b in base_paths:
+                  p_nt = os.path.join(b, "compliance_NTIA.json")
+                  p_bsi = os.path.join(b, "compliance_BSI.json")
+                  if os.path.exists(p_nt):
+                      ntia_file = p_nt
+                  if os.path.exists(p_bsi):
+                      bsi_file = p_bsi
+              ntia_hash = sha256_of_file(ntia_file) if ntia_file else "error:no_file"
+              bsi_hash = sha256_of_file(bsi_file) if bsi_file else "error:no_file"
+
+              # determine engine string by scanning for engine files anywhere under base
+              engines = set()
+              for fpath in glob.glob(os.path.join(artifact_dir, "**/*"), recursive=True):
+                  fname = os.path.basename(fpath)
+                  if fname in ("trivy-fs.json","syft-sbom.json","cdxgen-sbom.json","conan-sbom.json"):
+                      try:
+                          data = load(fpath) or {}
+                          if data.get("components"):
+                              if fname=="trivy-fs.json": engines.add("trivy")
+                              if fname=="syft-sbom.json": engines.add("syft")
+                              if fname=="cdxgen-sbom.json": engines.add("cdxgen")
+                              if fname=="conan-sbom.json": engines.add("conan")
+                      except:
+                          pass
+
+              engine_str = ",".join(sorted(engines)) if engines else "unknown"
+
+              # repo name derived from artifact dir name
+              # artifact_dir expected like .../results/sbom-reports-owner_repo/
+              repo_basename = os.path.basename(os.path.normpath(artifact_dir.rstrip(os.sep)))
+              repo = repo_basename.replace("sbom-reports-","").replace("_","/")
               timestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-              rows.append({
-                  "repo_name": repo_name,
-                  "engine": engine_str,
-                  "ntia_sha256": ntia_hash,
-                  "bsi_v2_sha256": bsi_hash,
-                  "timestamp": timestamp
-              })
-          if not rows:
-              # produce an empty CSV with headers so the artifact exists
-              df = pd.DataFrame(columns=["repo_name","engine","ntia_sha256","bsi_v2_sha256","timestamp"])
-          else:
-              df = pd.DataFrame(rows)
+
+              base = dict(
+                  repository=repo,
+                  github_license_spdx=gh_spdx,
+                  github_license_name=gh_name,
+                  local_spdx_license=local_spdx,
+                  final_assigned_license=final_license,
+                  num_components=len(comps),
+                  num_trivy=len(trivy.get("components",[]) or []),
+                  num_syft=len(syft.get("components",[]) or []),
+                  num_conan=len(conan.get("components",[]) or []),
+                  component_names=names,
+                  component_versions=vers,
+                  component_purls=purls,
+                  component_suppliers=suppliers,
+                  engine=engine_str,
+                  ntia_sha256=ntia_hash,
+                  bsi_v2_sha256=bsi_hash,
+                  timestamp=timestamp
+              )
+
+              # Add rows for score / ntia / bsi if present
+              if score:
+                  row = {**base, "type":"score"}
+                  # flatten score json fields if needed
+                  try:
+                      row.update(score if isinstance(score, dict) else {})
+                  except:
+                      pass
+                  rows.append(row)
+              if ntia:
+                  row = {**base, "type":"ntia"}
+                  try:
+                      row.update(ntia if isinstance(ntia, dict) else {})
+                  except:
+                      pass
+                  rows.append(row)
+              if bsi:
+                  row = {**base, "type":"bsi"}
+                  try:
+                      row.update(bsi if isinstance(bsi, dict) else {})
+                  except:
+                      pass
+                  rows.append(row)
+
+          # write output
           outdir = "sbom-reports"
           os.makedirs(outdir, exist_ok=True)
+          if not rows:
+              df = pd.DataFrame(columns=["repository","github_license_spdx","github_license_name","local_spdx_license","final_assigned_license","num_components","num_trivy","num_syft","num_conan","component_names","component_versions","component_purls","component_suppliers","engine","ntia_sha256","bsi_v2_sha256","timestamp","type"])
+          else:
+              df = pd.json_normalize(rows)
+              # ensure consistent column order
+              cols = ["repository","engine","type","ntia_sha256","bsi_v2_sha256","timestamp"]
+              # append remaining columns if present
+              for c in df.columns:
+                  if c not in cols:
+                      cols.append(c)
+              df = df.reindex(columns=cols, fill_value="")
           df.to_csv(os.path.join(outdir,"summary.csv"), index=False)
+          print("Wrote", os.path.join(outdir,"summary.csv"))
           PY
-      - name: Upload summary.csv
+
+      - name: Upload sbom-reports (summary + per-repo)
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-summary
-          path: sbom-reports/summary.csv
+          name: sbom-reports
+          path: sbom-reports/
