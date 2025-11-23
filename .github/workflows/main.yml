@@ -469,7 +469,7 @@ jobs:
                           break
                       except:
                           local_txt = ""
-              m = re.search(r"SPDX-License-Identifier:\s*([A-Za-z0-9.+-]+)", local_txt or "")
+              m = re.search(r"SPDX-License-Identifier:\\s*([A-Za-z0-9.\\-+]+)", local_txt or "")
               local_spdx = m.group(1) if m else ""
 
               final_license = ""
@@ -520,7 +520,7 @@ jobs:
 
               repo_basename = os.path.basename(os.path.normpath(artifact_dir.rstrip(os.sep)))
               repo = repo_basename.replace("sbom-","").replace("_","/") if repo_basename else ""
-              timestamp = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+              timestamp = datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()
 
               base = dict(
                   repository=repo,
@@ -529,7 +529,7 @@ jobs:
                   local_spdx_license=local_spdx,
                   final_assigned_license=final_license,
                   num_components=len(comps),
-                  num_trivy=len(tri.get("components",[]) or []),
+                  num_trivy=len(trivy.get("components",[]) or []),
                   num_syft=len(syft.get("components",[]) or []),
                   num_conan=len(conan.get("components",[]) or []),
                   component_names=names,
