@@ -68,17 +68,20 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom pandas
+
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
           sudo usermod -aG docker $USER || true
           sudo systemctl restart docker || true
           sudo docker --version || true
+
       - name: Install Syft (local)
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
+
       - name: Install Trivy (deb)
         run: |
           set -euo pipefail
@@ -139,16 +142,12 @@ jobs:
         run: |
           set -euo pipefail
           cd project-src || exit 1
-          # Prefer CMake if present
           if [ -f CMakeLists.txt ]; then
             mkdir -p build && cd build
-            cmake -DCMAKE_BUILD_TYPE=Release .. || true
+            cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .. || true
             cmake --build . -- -j$(nproc) || true
-            # generate compile_commands.json for cdxgen
             if [ -f compile_commands.json ]; then
               cp compile_commands.json .. || true
-            elif [ -f compile_commands.json ]; then
-              true
             fi
             cd ..
           else
@@ -158,7 +157,6 @@ jobs:
       - name: Cdxgen SBOM (C/C++ enhanced, prefer npx, docker fallback) - canonical SBOM
         run: |
           set -euo pipefail
-          # Try npx cdxgen with C/C++ focused flags for deeper detection
           if command -v npx >/dev/null 2>&1; then
             (cd project-src && \
               npx --yes @cyclonedx/cdxgen \
@@ -171,18 +169,15 @@ jobs:
                 . \
             ) || true
           fi
-          # Try local cdxgen if installed
           if command -v cdxgen >/dev/null 2>&1; then
             (cd project-src && cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence -o cdxgen-sbom.json .) || true
           fi
-          # Docker fallback with same flags
           if [ ! -f project-src/cdxgen-sbom.json ] || [ ! -s project-src/cdxgen-sbom.json ]; then
             sudo docker run --rm -v "$PWD/project-src":/src ghcr.io/cyclonedx/cdxgen:latest \
               cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence -o /src/cdxgen-sbom.json /src || true
           fi
-          # Final fallback to empty SBOM to avoid pipeline errors
           if [ ! -s project-src/cdxgen-sbom.json ]; then
-            echo '{"components":[]}' > project-src/cdxgen-sbom.json
+            echo '{"components":[],"bomFormat":"CycloneDX","specVersion":"1.4","version":1}' > project-src/cdxgen-sbom.json
           fi
 
       - name: Trivy FS SBOM (CycloneDX) + filesystem vulnerability scan
@@ -215,7 +210,7 @@ jobs:
               try:
                   return json.load(open(p))
               except:
-                  return {"components":[]}
+                  return {"components": []}
           cdx = load("project-src/cdxgen-sbom.json")
           trivy = load("project-src/trivy-fs.json")
           syft = load("project-src/syft-sbom.json")
@@ -224,7 +219,7 @@ jobs:
           seen = set()
           def key_of(c):
               return (c.get("name"), c.get("version"))
-          for comp in cdx.get("components",[]) or []:
+          for comp in cdx.get("components", []) or []:
               k = key_of(comp)
               merged.append(comp)
               seen.add(k)
@@ -233,7 +228,7 @@ jobs:
                   k = key_of(c)
                   if k in seen:
                       for m in merged:
-                          if key_of(m)==k:
+                          if key_of(m) == k:
                               for kf in ["supplier","purl","hashes","externalReferences","evidence","type","properties","copyright","licenses"]:
                                   if not m.get(kf) and c.get(kf):
                                       m[kf] = c.get(kf)
@@ -241,19 +236,19 @@ jobs:
                   else:
                       merged.append(c)
                       seen.add(k)
-          add_if_new_or_enrich(trivy.get("components",[]))
-          add_if_new_or_enrich(syft.get("components",[]))
-          add_if_new_or_enrich(conan.get("components",[]))
+          add_if_new_or_enrich(trivy.get("components", []))
+          add_if_new_or_enrich(syft.get("components", []))
+          add_if_new_or_enrich(conan.get("components", []))
           repo_license = ""
           if os.path.exists("project-src/final_license.txt"):
               repo_license = open("project-src/final_license.txt").read().strip()
           if not repo_license:
               try:
                   gh = json.load(open("project-src/gh-license.json"))
-                  repo_license = gh.get("license",{}).get("spdx_id","") or "NOASSERTION"
+                  repo_license = gh.get("license", {}).get("spdx_id", "") or "NOASSERTION"
               except:
                   repo_license = "NOASSERTION"
-          out = {"repo_license": repo_license, "components": merged}
+          out = {"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"repo_license": repo_license, "components": merged}
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
 
