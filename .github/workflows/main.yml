@@ -468,7 +468,7 @@ jobs:
             echo "${{ matrix.repo }},NOASSERTION,0,0,0,0,0,0,,false,false" >> project-src/summary.csv
           fi
 
-      - name: Debug: list project-src contents (before upload)
+      - name: Debug list project-src contents (before upload)
         run: |
           echo "---- project-src tree (max depth 3) ----"
           ls -la project-src | sed -n '1,200p'
