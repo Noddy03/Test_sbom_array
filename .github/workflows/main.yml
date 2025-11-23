@@ -1,5 +1,3 @@
-
- 
 name: IoT Full SBOM Pipeline
 
 on:
@@ -379,6 +377,112 @@ jobs:
       ##############################
       # Sanitize artifact name and upload all project-src files (preserve structure)
       ##############################
+      - name: Create per-repo summary.csv (before upload)
+        run: |
+          python3 <<'PY'
+          import json, csv, os
+          repo = os.environ.get("MATRIX_REPO","") or "${{ matrix.repo }}"
+          # Load merged SBOM
+          try:
+              sbom = json.load(open("project-src/merged-sbom.json"))
+              comp_count = len(sbom.get("components", []))
+              repo_license = sbom.get("repo_license", "NOASSERTION")
+          except:
+              comp_count = 0
+              repo_license = "NOASSERTION"
+          # Load vulns FS
+          try:
+              vfs = json.load(open("project-src/vulnerabilities_fs.json"))
+              vfs_count = sum(len(r.get("Vulnerabilities", []) or []) for r in vfs.get("Results", []))
+          except:
+              vfs_count = 0
+          # Load vulns SBOM
+          try:
+              vsb = json.load(open("project-src/vulnerabilities_sbom.json"))
+              vsb_count = sum(len(r.get("Vulnerabilities", []) or []) for r in vsb.get("Results", []))
+          except:
+              vsb_count = 0
+          # Severity breakdown
+          high = 0
+          critical = 0
+          for src in ("vulnerabilities_fs.json", "vulnerabilities_sbom.json"):
+              try:
+                  d = json.load(open(f"project-src/{src}"))
+                  for r in d.get("Results", []):
+                      for v in r.get("Vulnerabilities", []) or []:
+                          sev = (v.get("Severity") or "").upper()
+                          if sev == "HIGH": high += 1
+                          if sev == "CRITICAL": critical += 1
+              except:
+                  pass
+          # SBOM Score
+          try:
+              score = json.load(open("project-src/score.json")).get("score", None)
+          except:
+              score = None
+          # NTIA/BSI pass?
+          def passcheck(fname):
+              try:
+                  d = json.load(open(fname))
+                  return "error" not in d
+              except:
+                  return False
+          ntia_pass = passcheck("project-src/compliance_NTIA.json")
+          bsi_pass = passcheck("project-src/compliance_BSI.json")
+          # Write CSV
+          os.makedirs("project-src", exist_ok=True)
+          with open("project-src/summary.csv", "w", newline='') as f:
+              w = csv.writer(f)
+              w.writerow([
+                  "repo",
+                  "repo_license",
+                  "component_count",
+                  "vuln_fs_total",
+                  "vuln_sbom_total",
+                  "vuln_total",
+                  "vuln_high",
+                  "vuln_critical",
+                  "score_value",
+                  "ntia_pass",
+                  "bsi_pass"
+              ])
+              w.writerow([
+                  repo,
+                  repo_license,
+                  comp_count,
+                  vfs_count,
+                  vsb_count,
+                  vfs_count + vsb_count,
+                  high,
+                  critical,
+                  score,
+                  str(ntia_pass),
+                  str(bsi_pass)
+              ])
+          PY
+
+      - name: Ensure summary.csv exists (fallback)
+        run: |
+          if [ ! -f project-src/summary.csv ]; then
+            echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > project-src/summary.csv
+            echo "${{ matrix.repo }},NOASSERTION,0,0,0,0,0,0,,false,false" >> project-src/summary.csv
+          fi
+
+      - name: Debug: list project-src contents (before upload)
+        run: |
+          echo "---- project-src tree (max depth 3) ----"
+          ls -la project-src | sed -n '1,200p'
+          find project-src -maxdepth 3 -type f -print | sed -n '1,200p' || true
+          echo "---- head of key files if present ----"
+          for f in project-src/merged-sbom.json project-src/cdxgen-sbom.json project-src/trivy-fs.json project-src/vulnerabilities_fs.json project-src/vulnerabilities_sbom.json project-src/score.json project-src/summary.csv; do
+              if [ -f "$f" ]; then
+                  echo ">>> $f exists (size=$(stat -c%s "$f")), head:"
+                  head -n 20 "$f" || true
+              else
+                  echo ">>> $f MISSING"
+              fi
+          done
+
       - name: Sanitize artifact name
         id: sanitize
         run: |
@@ -657,7 +761,6 @@ jobs:
           find all_summaries -name "summary.csv" | while read f; do
             tail -n +2 "$f" >> master_summary.csv
           done
-
       - name: Upload master_summary.csv
         uses: actions/upload-artifact@v4
         with:
