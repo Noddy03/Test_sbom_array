@@ -53,7 +53,6 @@ jobs:
           fi
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
   sbom_scan:
     needs: fetch_top_repos
     continue-on-error: true
@@ -70,20 +69,17 @@ jobs:
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas || true
-
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
           sudo usermod -aG docker $USER || true
           sudo systemctl restart docker || true
           sudo docker --version || true
-
       - name: Install Syft (local)
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
-
       - name: Install Trivy (deb)
         run: |
           set -euo pipefail
@@ -94,7 +90,6 @@ jobs:
           sudo apt-get update -y || true
           sudo apt-get install -y trivy || true
           sudo trivy --download-db-only || true
-
       - name: Checkout target repository (reliable clone)
         run: |
           set -euo pipefail
@@ -105,19 +100,16 @@ jobs:
             exit 1
           fi
           ls -la project-src | sed -n '1,200p'
-
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json || true
-
       - name: Local SPDX detection
         run: |
           FILE=$(find project-src -maxdepth=6 -type f -iregex ".*(LICENSE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1 || true)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
-
       - name: Determine final repository license
         run: |
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
@@ -125,7 +117,6 @@ jobs:
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
-
       - name: Best-effort package manager prep (npm/pip/conan)
         run: |
           set -euo pipefail
@@ -139,7 +130,6 @@ jobs:
           if ls project-src/conanfile.* >/dev/null 2>&1 || [ -f project-src/conanfile.txt ] 2>/dev/null; then
             (cd project-src && conan profile detect --force || true; conan install . --build=missing) || true
           fi
-
       - name: Build project (C/C++ best-effort)
         run: |
           set -euo pipefail
@@ -155,7 +145,6 @@ jobs:
           else
             echo "No CMakeLists.txt, skipping build" >&2
           fi
-
       - name: Cdxgen SBOM (C/C++ enhanced, prefer npx, docker fallback)
         run: |
           set -euo pipefail
@@ -178,19 +167,16 @@ jobs:
           {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}
           JSON
           fi
-
       - name: Trivy FS SBOM (CycloneDX) + filesystem vulnerability scan
         run: |
           set -euo pipefail
           trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
-
       - name: Syft FS SBOM (optional enrichment)
         run: |
           set -euo pipefail
           export PATH="$HOME/bin:$PATH"
           syft packages dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
-
       - name: Normalize SBOM arrays
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
@@ -200,7 +186,6 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-
       - name: Merge SBOMs (preserve component licenses, write repo_license, add metadata)
         run: |
           python3 <<'PY'
@@ -262,7 +247,6 @@ jobs:
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-
       - name: Validate merged SBOM (cyclonedx-python-lib)
         run: |
           set -euo pipefail
@@ -278,12 +262,10 @@ jobs:
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
           PY 
-
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
-
       - name: Create unified vulnerabilities list (json + csv)
         run: |
           python3 <<'PY'
@@ -316,7 +298,6 @@ jobs:
               for v in allv:
                   w.writerow([v.get("id"), v.get("package"), v.get("version"), v.get("severity"), v.get("source"), v.get("description")])
           PY
-
       - name: Create libraries list (json + csv)
         run: |
           python3 <<'PY'
@@ -346,22 +327,18 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
-
       - name: NTIA compliance (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json) || (echo '{"error":true}' > project-src/compliance_NTIA.json)
-
       - name: BSI-V2 compliance (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json) || (echo '{"error":true}' > project-src/compliance_BSI.json)
-
       - name: SBOM Score (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json) || (echo '{"error":true}' > project-src/score.json)
-
       - name: Debug list project-src contents (before upload)
         run: |
           echo "---- project-src tree (max depth 3) ----"
@@ -376,7 +353,6 @@ jobs:
                   echo ">>> $f MISSING"
               fi
           done
-
       - name: Create per-repo summary.csv (before upload)
         run: |
           python3 <<'PY'
@@ -433,21 +409,18 @@ jobs:
                   repo,repo_license,comp_count,vfs_count,vsb_count,vfs_count+vsb_count,high,critical,score,str(ntia_pass),str(bsi_pass)
               ])
           PY
-
       - name: Ensure summary.csv exists (fallback)
         run: |
           if [ ! -f project-src/summary.csv ]; then
             echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > project-src/summary.csv
             echo "${{ matrix.repo }},NOASSERTION,0,0,0,0,0,0,,false,false" >> project-src/summary.csv
           fi
-
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
-
       - name: Upload project-src as artifact (preserve structure)
         uses: actions/upload-artifact@v4
         with:
@@ -478,9 +451,9 @@ jobs:
           if [ $found -eq 0 ]; then
             echo "WARNING: No per-repo summary.csv files found" >&2
           fi
-
       - name: Upload master_summary.csv
         uses: actions/upload-artifact@v4
         with:
           name: master_summary
           path: master_summary.csv
+
