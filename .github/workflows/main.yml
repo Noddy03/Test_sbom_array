@@ -1,4 +1,3 @@
-
 name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
 
 on:
@@ -252,7 +251,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           try:
-              from cyclonedx.parser import build_parser
+              import json
               import json,sys
               data=json.load(open("project-src/merged-sbom.json"))
               # quick sanity checks
@@ -261,7 +260,7 @@ jobs:
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
-          PY 
+          PY
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
