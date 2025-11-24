@@ -487,14 +487,21 @@ jobs:
           set -euo pipefail
           python3 <<'PY'
           import sys, json
-          from cyclonedx.parser.json import JsonParser
+
+          # NEW CORRECT IMPORT PATH
+          try:
+              from cyclonedx.parsers.json import JsonParser
+          except ImportError:
+              from cyclonedx.parser.json import JsonParser  # fallback
+          except ImportError:
+              from cyclonedx.parser import JsonParser       # fallback 2
 
           try:
               with open("project-src/merged-sbom.json") as f:
                   parser = JsonParser(f)
                   bom = parser.get_bom()
 
-              if bom is None or bom.components is None:
+              if not bom or not getattr(bom, "components", None):
                   print("INVALID_SBOM", file=sys.stderr)
                   sys.exit(1)
 
@@ -504,6 +511,7 @@ jobs:
               print("SBOM_VALIDATION_ERROR", e)
               sys.exit(1)
           PY
+
 
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
