@@ -697,7 +697,7 @@ jobs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
       
-      # FIX: Implementing robust error capture for compliance checks
+      # NTIA compliance (json) (Fixed Error Capture and Flag)
       - name: NTIA compliance (json) (Fixed Error Capture)
         run: |
           set -euo pipefail
@@ -712,22 +712,20 @@ jobs:
             exit 0
           fi
           
-          # Run command, capturing both stdout and stderr (2>&1) to the temp file
+          # FIX: Replaced --format json with --json
           set +e
-          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > "$TEMP_OUT" 2>&1
+          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --json /sbom/merged-sbom.json > "$TEMP_OUT" 2>&1
           EXIT_CODE=$?
           set -e
           
-          # If tool crashed completely and produced no output
           if [ $EXIT_CODE -ne 0 ] && [ ! -s "$TEMP_OUT" ]; then
             echo '{"error":true, "reason":"sbomqs command failed or produced no output"}' > "$FINAL_OUT"
           else
-            # Move the output (either compliance report or crash error message) to the final file
             mv "$TEMP_OUT" "$FINAL_OUT"
           fi
           echo "NTIA Compliance Report written."
 
-      # FIX: Implementing robust error capture for compliance checks
+      # BSI-V2 compliance (json) (Fixed Error Capture and Flag)
       - name: BSI-V2 compliance (json) (Fixed Error Capture)
         run: |
           set -euo pipefail
@@ -742,17 +740,15 @@ jobs:
             exit 0
           fi
           
-          # Run command, capturing both stdout and stderr (2>&1) to the temp file
+          # FIX: Replaced --format json with --json
           set +e
-          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > "$TEMP_OUT" 2>&1
+          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --json /sbom/merged-sbom.json > "$TEMP_OUT" 2>&1
           EXIT_CODE=$?
           set -e
           
-          # If tool crashed completely and produced no output
           if [ $EXIT_CODE -ne 0 ] && [ ! -s "$TEMP_OUT" ]; then
             echo '{"error":true, "reason":"sbomqs command failed or produced no output"}' > "$FINAL_OUT"
           else
-            # Move the output (either compliance report or crash error message) to the final file
             mv "$TEMP_OUT" "$FINAL_OUT"
           fi
           echo "BSI Compliance Report written."
