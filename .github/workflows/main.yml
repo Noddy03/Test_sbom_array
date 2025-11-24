@@ -458,7 +458,7 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix: Dict Validation)
+      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix Dict Validation)
         # FIX: Reverting to the most stable and backward-compatible method: validating a Python dictionary using 'validate_dict'.
         run: |
           set -euo pipefail
