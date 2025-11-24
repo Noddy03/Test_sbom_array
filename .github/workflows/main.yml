@@ -1,4 +1,4 @@
-name: IoT Full SBOM Pipeline (Model 2 - Cdxgen-first, Build-before-scan, CycloneDX 1.5)
+name: IoT Full SBOM Pipeline (Patched - NTIA & BSI V2 compliant)
 
 on:
   workflow_dispatch:
@@ -52,6 +52,7 @@ jobs:
           fi
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
   sbom_scan:
     needs: fetch_top_repos
     continue-on-error: true
@@ -65,30 +66,32 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas || true
+
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
           sudo usermod -aG docker $USER || true
           sudo systemctl restart docker || true
           sudo docker --version || true
+
       - name: Install Syft (local)
         run: |
           mkdir -p $HOME/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b $HOME/bin || true
           echo "$HOME/bin" >> $GITHUB_PATH || true
+
       - name: Install Trivy (deb)
         run: |
           set -euo pipefail
-          curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg || true
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" \
-            | sudo tee /etc/apt/sources.list.d/trivy.list || true
+          curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg || true
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/trivy.list || true
           sudo apt-get update -y || true
           sudo apt-get install -y trivy || true
           sudo trivy --download-db-only || true
+
       - name: Checkout target repository (reliable clone)
         run: |
           set -euo pipefail
@@ -99,16 +102,19 @@ jobs:
             exit 1
           fi
           ls -la project-src | sed -n '1,200p'
+
       - name: GitHub license metadata
         env:
           REPO: ${{ matrix.repo }}
           GH_TOKEN: ${{ github.token }}
         run: |
           gh api "/repos/$REPO/license" > project-src/gh-license.json 2>/dev/null || echo '{"license":{"spdx_id":"NOASSERTION"}}' > project-src/gh-license.json || true
+
       - name: Local SPDX detection
         run: |
           FILE=$(find project-src -maxdepth=6 -type f -iregex ".*(LICENSE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1 || true)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
+
       - name: Determine final repository license
         run: |
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
@@ -116,6 +122,7 @@ jobs:
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
+
       - name: Best-effort package manager prep (npm/pip/conan)
         run: |
           set -euo pipefail
@@ -129,6 +136,7 @@ jobs:
           if ls project-src/conanfile.* >/dev/null 2>&1 || [ -f project-src/conanfile.txt ] 2>/dev/null; then
             (cd project-src && conan profile detect --force || true; conan install . --build=missing) || true
           fi
+
       - name: Build project (C/C++ best-effort)
         run: |
           set -euo pipefail
@@ -144,38 +152,37 @@ jobs:
           else
             echo "No CMakeLists.txt, skipping build" >&2
           fi
+
       - name: Cdxgen SBOM (C/C++ enhanced, prefer npx, docker fallback)
         run: |
           set -euo pipefail
-          # prefer npx (no global install)
           if command -v npx >/dev/null 2>&1; then
-            (cd project-src && npx --yes @cyclonedx/cdxgen \
-              -t cpp --deep --recurse --no-binaries --resolve-licence \
-              --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
+            (cd project-src && npx --yes @cyclonedx/cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
           fi
           if command -v cdxgen >/dev/null 2>&1; then
             (cd project-src && cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
           fi
           if [ ! -f project-src/cdxgen-sbom.json ] || [ ! -s project-src/cdxgen-sbom.json ]; then
-            sudo docker run --rm -v "$PWD/project-src":/src ghcr.io/cyclonedx/cdxgen:latest \
-              cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o /src/cdxgen-sbom.json /src || true
+            sudo docker run --rm -v "$PWD/project-src":/src ghcr.io/cyclonedx/cdxgen:latest cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o /src/cdxgen-sbom.json /src || true
           fi
-          # ensure minimal CycloneDX structure if not produced
           if [ ! -s project-src/cdxgen-sbom.json ]; then
             cat > project-src/cdxgen-sbom.json <<'JSON'
           {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}
           JSON
           fi
+
       - name: Trivy FS SBOM (CycloneDX) + filesystem vulnerability scan
         run: |
           set -euo pipefail
           trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
           trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
+
       - name: Syft FS SBOM (optional enrichment)
         run: |
           set -euo pipefail
           export PATH="$HOME/bin:$PATH"
           syft packages dir:project-src -o cyclonedx-json > project-src/syft-sbom.json || echo '{"components":[]}' > project-src/syft-sbom.json
+
       - name: Normalize SBOM arrays
         run: |
           for f in project-src/trivy-fs.json project-src/syft-sbom.json project-src/cdxgen-sbom.json project-src/conan-sbom.json; do
@@ -185,9 +192,10 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
+
       - name: Merge SBOMs (preserve component licenses, write repo_license, add metadata)
         run: |
-          python3 <<'PY'
+          python3 - <<'PY'
           import json, os, uuid, time
           def load(p):
               try:
@@ -246,30 +254,158 @@ jobs:
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
           PY
-      - name: Validate merged SBOM (cyclonedx-python-lib)
+
+      - name: Enrich SBOM with file-level components & static analysis (cppcheck + flawfinder)
+        run: |
+          set -euo pipefail
+          cat > project-src/enrich_and_scan.py <<'PY'
+          import os, json, hashlib, uuid, time, subprocess
+
+          ROOT='project-src'
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda: f.read(8192), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          # collect source files to include as components
+          files=[]
+          for dirpath,dirnames,filenames in os.walk(ROOT):
+              # ignore some dirs
+              if '/.git' in dirpath or '/.sbom_deps' in dirpath or 'node_modules' in dirpath:
+                  continue
+              for fn in filenames:
+                  if fn.endswith(('.c','.cpp','.h','.hpp','.ino','.S','.asm')):
+                      full=os.path.join(dirpath,fn)
+                      rel=os.path.relpath(full, ROOT)
+                      files.append({'path':rel, 'sha256': sha256_file(full)})
+
+          # load merged sbom
+          try:
+              data=json.load(open(os.path.join(ROOT,'merged-sbom.json')))
+          except Exception:
+              data={'components':[]}
+
+          # determine repo name & commit sha where possible
+          try:
+                sha = subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT).decode().strip()
+          except Exception:
+                sha = '0'
+          # try to infer owner/repo from git remote or env
+          owner_repo = os.environ.get('GITHUB_REPOSITORY','')
+          if not owner_repo:
+              try:
+                  remote = subprocess.check_output(['git','config','--get','remote.origin.url'], cwd=ROOT).decode().strip()
+                  if remote.endswith('.git'):
+                      remote=remote[:-4]
+                  if remote.startswith('git@github.com:'):
+                      owner_repo = remote.split(':',1)[1]
+                  elif remote.startswith('https://github.com/'):
+                      owner_repo = remote.split('https://github.com/',1)[1]
+              except Exception:
+                  owner_repo = ''
+          name = owner_repo.split('/')[-1] if owner_repo else os.path.basename(os.getcwd())
+          version = sha
+
+          # add file-level components (if not present)
+          existing = {(c.get('name'), c.get('version')) for c in data.get('components',[])}
+          for f in files:
+              nm = f['path']
+              ver = version
+              key=(nm, ver)
+              if key in existing:
+                  continue
+              comp={
+                  'type':'file',
+                  'name': nm,
+                  'version': ver,
+                  'hashes':[{'alg':'SHA-256','content':f['sha256']}],
+                  'purl': 'pkg:github/'+(owner_repo if owner_repo else name)+'@'+ver,
+                  'externalReferences':[{'type':'vcs','url': 'https://github.com/'+(owner_repo if owner_repo else name)}]
+              }
+              data.setdefault('components',[]).append(comp)
+
+          # enrich metadata for NTIA/BSI needs
+          data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
+          data['metadata'] = data.get('metadata') or {}
+          data['metadata']['timestamp'] = int(time.time())
+          data['metadata']['tools'] = data['metadata'].get('tools',[])
+          data['metadata']['component'] = data['metadata'].get('component',{})
+          data['metadata']['component']['name'] = name
+          data['metadata']['component']['version'] = version
+          data['repo_license'] = data.get('repo_license','NOASSERTION')
+
+          # write back
+          json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'),'w'), indent=2)
+          print('enriched merged-sbom.json with', len(files), 'file components')
+
+          # run cppcheck and write simple JSON output (best-effort)
+          try:
+              cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
+              out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
+              findings = []
+              try:
+                  import xml.etree.ElementTree as ET
+                  root = ET.fromstring(out.stderr.decode(errors='ignore'))
+                  for error in root.findall('.//error'):
+                      fn=error.get('file') or 'unknown'
+                      msg=error.get('msg') or ''
+                      severity=error.get('severity') or 'info'
+                      findings.append({'id':'cppcheck-'+str(abs(hash(fn+msg)))[:12],'file':fn,'message':msg,'severity':severity})
+              except Exception:
+                  pass
+              json.dump(findings, open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+          except Exception as e:
+              print('cppcheck failed', e)
+
+          # run flawfinder if available
+          try:
+              out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              findings = []
+              for line in out.stdout.decode().splitlines():
+                  parts=line.split(':',3)
+                  if len(parts)>=4:
+                      fn,ln,level,msg = parts[0],parts[1],parts[2],parts[3]
+                      findings.append({'id':'flawfinder-'+str(abs(hash(fn+ln+msg)))[:12],'file':fn,'line':ln,'level':level,'message':msg})
+              json.dump(findings, open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+          except Exception as e:
+              print('flawfinder failed', e)
+
+          PY
+          python3 project-src/enrich_and_scan.py 
+          || true
+
+      - name: Validate merged SBOM (cyclonedx-python-lib friendly)
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import json, sys
           try:
-              import json
-              import json,sys
-              data=json.load(open("project-src/merged-sbom.json"))
-              # quick sanity checks
+              data = json.load(open("project-src/merged-sbom.json"))
               if "bomFormat" not in data or "components" not in data:
                   print("INVALID_SBOM", file=sys.stderr); sys.exit(1)
+              # quick check: ensure metadata.component.name and version exist
+              meta = data.get("metadata",{})
+              comp = meta.get("component",{})
+              if not comp.get("name"):
+                  comp["name"] = "unknown"
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
           PY
+
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
           trivy sbom --format json --vuln-type library,os -o project-src/vulnerabilities_sbom.json project-src/merged-sbom.json || echo '{"Results":[]}' > project-src/vulnerabilities_sbom.json
+
       - name: Create unified vulnerabilities list (json + csv)
         run: |
           python3 <<'PY'
-          import json, csv
-          def extract(path, source):
+          import json, csv, os
+          def extract_trivy(path, source):
               try:
                   data=json.load(open(path))
               except:
@@ -287,9 +423,43 @@ jobs:
                           "source": source
                       })
               return vulns
-          fs = extract("project-src/vulnerabilities_fs.json","filesystem")
-          sb = extract("project-src/vulnerabilities_sbom.json","sbom")
+
+          fs = extract_trivy("project-src/vulnerabilities_fs.json","filesystem")
+          sb = extract_trivy("project-src/vulnerabilities_sbom.json","sbom")
           allv = fs + sb
+
+          # include cppcheck findings if present
+          try:
+              cpp = json.load(open("project-src/cppcheck.json"))
+              for f in cpp:
+                  allv.append({
+                      "id": f.get("id"),
+                      "package": f.get("file"),
+                      "version": "",
+                      "severity": f.get("severity","INFO").upper(),
+                      "cvss": {},
+                      "description": f.get("message",""),
+                      "source": "cppcheck"
+                  })
+          except:
+              pass
+
+          # include flawfinder findings if present
+          try:
+              ff = json.load(open("project-src/flawfinder.json"))
+              for f in ff:
+                  allv.append({
+                      "id": f.get("id"),
+                      "package": f.get("file"),
+                      "version": "",
+                      "severity": (f.get("level") or "LOW").upper(),
+                      "cvss": {},
+                      "description": f.get("message",""),
+                      "source": "flawfinder"
+                  })
+          except:
+              pass
+
           json.dump(allv, open("project-src/vulnerabilities.json","w"), indent=2)
           with open("project-src/vulnerabilities.csv","w", newline='') as f:
               w = csv.writer(f)
@@ -297,6 +467,7 @@ jobs:
               for v in allv:
                   w.writerow([v.get("id"), v.get("package"), v.get("version"), v.get("severity"), v.get("source"), v.get("description")])
           PY
+
       - name: Create libraries list (json + csv)
         run: |
           python3 <<'PY'
@@ -326,18 +497,22 @@ jobs:
               for l in libs:
                   w.writerow([l.get("name"), l.get("version"), l.get("purl"), l.get("supplier")])
           PY
+
       - name: NTIA compliance (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json) || (echo '{"error":true}' > project-src/compliance_NTIA.json)
+
       - name: BSI-V2 compliance (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json) || (echo '{"error":true}' > project-src/compliance_BSI.json)
+
       - name: SBOM Score (json)
         run: |
           set -euo pipefail
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json) || (echo '{"error":true}' > project-src/score.json)
+
       - name: Debug list project-src contents (before upload)
         run: |
           echo "---- project-src tree (max depth 3) ----"
@@ -352,10 +527,11 @@ jobs:
                   echo ">>> $f MISSING"
               fi
           done
+
       - name: Create per-repo summary.csv (before upload)
         run: |
           python3 <<'PY'
-          import json, csv, os
+          import json, csv, os, subprocess, sys
           repo = "${{ matrix.repo }}"
           try:
               sbom = json.load(open("project-src/merged-sbom.json"))
@@ -374,14 +550,29 @@ jobs:
               vsb_count = sum(len(r.get("Vulnerabilities", []) or []) for r in vsb.get("Results", []))
           except:
               vsb_count = 0
+          try:
+              vstatic = json.load(open("project-src/vulnerabilities.json"))
+              vstatic_count = len(vstatic)
+          except:
+              vstatic_count = 0
           high = 0
           critical = 0
-          for src in ("vulnerabilities_fs.json", "vulnerabilities_sbom.json"):
+          for src in ("vulnerabilities_fs.json", "vulnerabilities_sbom.json", "vulnerabilities.json"):
               try:
                   d = json.load(open(f"project-src/{src}"))
-                  for r in d.get("Results", []):
-                      for v in r.get("Vulnerabilities", []) or []:
-                          sev = (v.get("Severity") or "").upper()
+                  if isinstance(d, list):
+                      items = d
+                  else:
+                      items = d.get("Results", []) if isinstance(d, dict) else []
+                  for r in items:
+                      if isinstance(r, dict) and r.get("Vulnerabilities"):
+                          for v in r.get("Vulnerabilities", []) or []:
+                              sev = (v.get("Severity") or "").upper()
+                              if sev == "HIGH": high += 1
+                              if sev == "CRITICAL": critical += 1
+                      else:
+                          # static entries have 'severity' at top-level
+                          sev = (r.get("severity") or "").upper()
                           if sev == "HIGH": high += 1
                           if sev == "CRITICAL": critical += 1
               except:
@@ -402,24 +593,27 @@ jobs:
           with open("project-src/summary.csv", "w", newline='') as f:
               w = csv.writer(f)
               w.writerow([
-                  "repo","repo_license","component_count","vuln_fs_total","vuln_sbom_total","vuln_total","vuln_high","vuln_critical","score_value","ntia_pass","bsi_pass"
+                  "repo","repo_license","component_count","vuln_fs_total","vuln_sbom_total","vuln_static_total","vuln_total","vuln_high","vuln_critical","score_value","ntia_pass","bsi_pass"
               ])
               w.writerow([
-                  repo,repo_license,comp_count,vfs_count,vsb_count,vfs_count+vsb_count,high,critical,score,str(ntia_pass),str(bsi_pass)
+                  repo,repo_license,comp_count,vfs_count,vsb_count,vstatic_count,vfs_count+vsb_count+vstatic_count,high,critical,score,str(ntia_pass),str(bsi_pass)
               ])
           PY
+
       - name: Ensure summary.csv exists (fallback)
         run: |
           if [ ! -f project-src/summary.csv ]; then
-            echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > project-src/summary.csv
+            echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_static_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > project-src/summary.csv
             echo "${{ matrix.repo }},NOASSERTION,0,0,0,0,0,0,,false,false" >> project-src/summary.csv
           fi
+
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE="${{ matrix.repo }}"
           SAFE="${SAFE//\//_}"
           echo "name=$SAFE" >> $GITHUB_OUTPUT
+
       - name: Upload project-src as artifact (preserve structure)
         uses: actions/upload-artifact@v4
         with:
@@ -439,7 +633,7 @@ jobs:
 
       - name: Combine all summary.csv files into master_summary.csv
         run: |
-          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
+          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_static_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
           found=0
           for f in $(find all_summaries -name "summary.csv"); do
             tail -n +2 "$f" >> master_summary.csv
@@ -450,9 +644,9 @@ jobs:
           if [ $found -eq 0 ]; then
             echo "WARNING: No per-repo summary.csv files found" >&2
           fi
+
       - name: Upload master_summary.csv
         uses: actions/upload-artifact@v4
         with:
           name: master_summary
           path: master_summary.csv
-
