@@ -194,7 +194,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > project-src/enrich_and_scan.py <<'PY'
-# -*- coding: utf-8 -*-
+          # -*- coding: utf-8 -*-
           import os, json, hashlib, uuid, time, subprocess
           
           ROOT='project-src'
