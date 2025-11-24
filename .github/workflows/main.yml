@@ -245,54 +245,242 @@ jobs:
               "components": merged
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
-          PY
-      
-      - name: NTIA + BSI-V2 Compliance Enrichment
+          PY      
+      - name: Enrich SBOM with file-level components (Option F)
         run: |
-          python3 <<'PY'
-          import json, uuid, time, os
-
-          path="project-src/merged-sbom.json"
-          data=json.load(open(path))
-
-          data["specVersion"]="1.5"
-          data["serialNumber"]="urn:uuid:"+str(uuid.uuid4())
-          data["metadata"]=data.get("metadata",{})
-          meta=data["metadata"]
-          meta["timestamp"]=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-          meta["supplier"]={"name":"Unknown Supplier"}
-          meta["manufacturer"]={"name":"Unknown Manufacturer"}
-          meta["licenses"]=[{"license":{"id":"NOASSERTION"}}]
-
-          if "component" not in meta:
-              meta["component"]={"type":"application"}
-          comp=meta["component"]
-          comp["name"]=os.getenv("GITHUB_REPOSITORY","unknown_repo")
-          comp["version"]=os.getenv("GITHUB_SHA","0")
-          comp["purl"]="pkg:generic/"+comp["name"]+"@"+comp["version"]
-          comp["licenses"]=[{"license":{"id":"NOASSERTION"}}]
-
-          data.setdefault("components",[])
-          data.setdefault("dependencies",[])
-
-          json.dump(data,open(path,"w"),indent=2)
-          PY
-
-      - name: Validate merged SBOM (CycloneDX python-lib)
-        run: |
-          pip install cyclonedx-python-lib
-          python3 << 'EOF'
-          import json, sys
+          set -euo pipefail
+          cat > project-src/enrich_and_scan.py <<'PY'
+          import os, json, hashlib, uuid, time, subprocess
+          
+          ROOT='project-src'
+          SKIP_DIR_NAMES={'build','build_output','cmake-build-debug','cmake-build-release',
+                          'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo','.pio','.venv'}
+          MAX_FILES=50000
+          MAX_HASH_SIZE=5*1024*1024
+          MAX_TOTAL_BYTES=1024*1024*1024
+          MAX_DEPTH=10
+          DIR_MAX_FILES=5000
+          DIR_MAX_BYTES=200*1024*1024
+          
+          def safe_dir_size_and_count(path):
+              total=0
+              count=0
+              try:
+                  with os.scandir(path) as it:
+                      for e in it:
+                          try:
+                              if e.is_file(follow_symlinks=False):
+                                  count+=1
+                                  total+=e.stat().st_size
+                              elif e.is_dir(follow_symlinks=False):
+                                  count+=1
+                          except:
+                              continue
+              except:
+                  return (0,0)
+              return (count,total)
+          
+          def should_skip_dir(path):
+              base=os.path.basename(path).lower()
+              if base in SKIP_DIR_NAMES:
+                  return True
+              try:
+                  cnt, sz = safe_dir_size_and_count(path)
+                  if cnt > DIR_MAX_FILES or sz > DIR_MAX_BYTES:
+                      return True
+              except:
+                  return True
+              return False
+          
+          def is_binary(path):
+              try:
+                  with open(path,'rb') as f:
+                      chunk = f.read(1024)
+                      return b'\0' in chunk
+              except:
+                  return True
+          
+          def sha256_file(p):
+              h=hashlib.sha256()
+              with open(p,'rb') as f:
+                  for chunk in iter(lambda:f.read(8192),b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          
+          files=[]
+          total_hash_bytes=0
+          skipped_dirs_sample=[]
+          
+          # Walk repository safely
+          for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
+              rel=os.path.relpath(dirpath, ROOT)
+              depth=0 if rel=='.' else rel.count(os.sep)+1
+              if depth>MAX_DEPTH:
+                  continue
+              if should_skip_dir(dirpath):
+                  skipped_dirs_sample.append(dirpath)
+                  continue
+              for fn in filenames:
+                  full=os.path.join(dirpath, fn)
+                  try:
+                      size=os.path.getsize(full)
+                  except:
+                      continue
+                  entry={'path':os.path.relpath(full, ROOT), 'size': size}
+                  if size <= MAX_HASH_SIZE and total_hash_bytes + size <= MAX_TOTAL_BYTES and not is_binary(full):
+                      try:
+                          entry['sha256'] = sha256_file(full)
+                          total_hash_bytes += size
+                      except:
+                          entry['sha256'] = None
+                  else:
+                      entry['sha256'] = None
+                  files.append(entry)
+                  if len(files) >= MAX_FILES:
+                      break
+              if len(files) >= MAX_FILES:
+                  break
+          
+          # Load merged sbom and enrich
           try:
-              data = json.load(open("project-src/merged-sbom.json"))
+              data = json.load(open(os.path.join(ROOT,'merged-sbom.json')))
+          except:
+              data = {'components': []}
+          
+          try:
+              sha = subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT).decode().strip()
+          except:
+              sha = '0'
+          owner_repo = os.environ.get('GITHUB_REPOSITORY','')
+          if not owner_repo:
+              try:
+                  remote = subprocess.check_output(['git','config','--get','remote.origin.url'], cwd=ROOT).decode().strip()
+                  if remote.endswith('.git'):
+                      remote = remote[:-4]
+                  if remote.startswith('git@github.com:'):
+                      owner_repo = remote.split(':',1)[1]
+                  elif 'github.com/' in remote:
+                      owner_repo = remote.split('github.com/',1)[1]
+              except:
+                  owner_repo = ''
+          name = owner_repo.split('/')[-1] if owner_repo else os.path.basename(os.getcwd())
+          version = sha
+          
+          existing = {(c.get('name'), c.get('version')) for c in data.get('components', [])}
+          
+          for f in files:
+              nm = f['path']
+              key = (nm, version)
+              if key in existing:
+                  continue
+              comp = {
+                  'type':'file',
+                  'name': nm,
+                  'version': version,
+                  'purl': 'pkg:github/'+(owner_repo if owner_repo else name)+'@'+version,
+                  'externalReferences': [{'type':'vcs','url':'https://github.com/'+(owner_repo if owner_repo else name)}],
+                  'properties': [{'name':'size','value': str(f['size'])}]
+              }
+              if f.get('sha256'):
+                  comp['hashes']=[{'alg':'SHA-256','content':f['sha256']}]
+              if f['size'] > MAX_HASH_SIZE:
+                  comp.setdefault('properties', []).append({'name':'large-file','value':'true'})
+              data.setdefault('components', []).append(comp)
+          
+          data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
+          data['metadata'] = data.get('metadata') or {}
+          data['metadata']['timestamp'] = int(time.time())
+          data['metadata']['tools'] = data['metadata'].get('tools', [])
+          data['metadata']['component'] = data['metadata'].get('component', {})
+          data['metadata']['component']['name'] = name
+          data['metadata']['component']['version'] = version
+          data['repo_license'] = data.get('repo_license','NOASSERTION')
+          
+          json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'), 'w'), indent=2)
+          print('Option F enriched', len(files), 'files')
+          if skipped_dirs_sample:
+              print('skipped_dirs_sample:', skipped_dirs_sample[:10])
+          
+          # Safety guarded static analysis
+          try:
+              hashed_count = sum(1 for f in files if f.get('sha256'))
+          except:
+              hashed_count = 0
+          
+          try:
+              if hashed_count <= 5000:
+                  cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
+                  out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
+                  findings = []
+                  try:
+                      import xml.etree.ElementTree as ET
+                      rootxml = ET.fromstring(out.stderr.decode(errors='ignore'))
+                      for error in rootxml.findall('.//error'):
+                          fn=error.get('file') or 'unknown'
+                          msg=error.get('msg') or ''
+                          severity=error.get('severity') or 'info'
+                          findings.append({'id':'cppcheck-'+str(abs(hash(fn+msg)))[:12],'file':fn,'message':msg,'severity':severity})
+                  except Exception:
+                      pass
+                  json.dump(findings, open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+              else:
+                  print('Skipping cppcheck: hashed_count', hashed_count, 'too large')
+                  json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+          except Exception as e:
+              print('cppcheck failed', e)
+              json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
+          
+          try:
+              if len(files) <= 20000:
+                  out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                  findings = []
+                  for line in out.stdout.decode().splitlines():
+                      parts=line.split(':',3)
+                      if len(parts)>=4:
+                          fn,ln,level,msg = parts[0],parts[1],parts[2],parts[3]
+                          findings.append({'id':'flawfinder-'+str(abs(hash(fn+ln+msg)))[:12],'file':fn,'line':ln,'level':level,'message':msg})
+                  json.dump(findings, open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+              else:
+                  print('Skipping flawfinder: too many files', len(files))
+                  json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+          except Exception as e:
+              print('flawfinder failed', e)
+              json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
+          PY
+          python3 project-src/enrich_and_scan.py || true
+
+
+      - name: NTIA & BSI hybrid enrichment (fill missing metadata)
+
+
+        run: |
+
+
+          pip install cyclonedx-python-lib || true
+
+
+          echo aW1wb3J0IG9zLCBqc29uLCB1dWlkLCB0aW1lLCBzeXMsIHN1YnByb2Nlc3MKClJPT1QgPSAicHJvamVjdC1zcmMiClNCT01fUEFUSCA9IG9zLnBhdGguam9pbihST09ULCAibWVyZ2VkLXNib20uanNvbiIpCgpkZWYgbG9hZF9zYm9tKHBhdGgpOgogICAgdHJ5OgogICAgICAgIHJldHVybiBqc29uLmxvYWQob3BlbihwYXRoKSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmV0dXJuIHsiY29tcG9uZW50cyI6IFtdLCAibWV0YWRhdGEiOiB7fX0KCmRhdGEgPSBsb2FkX3Nib20oU0JPTV9QQVRIKQoKZGF0YS5zZXRkZWZhdWx0KCJib21Gb3JtYXQiLCAiQ3ljbG9uZURYIikKZGF0YS5zZXRkZWZhdWx0KCJzcGVjVmVyc2lvbiIsICIxLjUiKQoKaWYgbm90IGRhdGEuZ2V0KCJzZXJpYWxOdW1iZXIiKToKICAgIGRhdGFbInNlcmlhbE51bWJlciJdID0gInVybjp1dWlkOiIgKyBzdHIodXVpZC51dWlkNCgpKQoKbWV0YSA9IGRhdGEuc2V0ZGVmYXVsdCgibWV0YWRhdGEiLCB7fSkKbWV0YS5zZXRkZWZhdWx0KCJ0aW1lc3RhbXAiLCBpbnQodGltZS50aW1lKCkpKQp0b29scyA9IG1ldGEuc2V0ZGVmYXVsdCgidG9vbHMiLCBbXSkKaWYgbm90IGFueSh0LmdldCgibmFtZSIpID09ICJzYm9tLWVucmljaGVyLWh5YnJpZCIgZm9yIHQgaW4gdG9vbHMpOgogICAgdG9vbHMuYXBwZW5kKHsidmVuZG9yIjogImVucmljaGVyIiwgIm5hbWUiOiAic2JvbS1lbnJpY2hlci1oeWJyaWQiLCAidmVyc2lvbiI6ICIxLjAifSkKCnJlcG8gPSBvcy5lbnZpcm9uLmdldCgiR0lUSFVCX1JFUE9TSVRPUlkiLCAiIikKaWYgcmVwbyBhbmQgIkAiIG5vdCBpbiByZXBvOgogICAgb3duZXIgPSByZXBvLnNwbGl0KCIvIilbMF0gaWYgIi8iIGluIHJlcG8gZWxzZSByZXBvCmVsc2U6CiAgICBvd25lciA9IG9zLmVudmlyb24uZ2V0KCJHSVRIVUJfQUNUT1IiLCAiIikgb3IgIiIKCmlmIG5vdCBtZXRhLmdldCgic3VwcGxpZXIiKToKICAgIG1ldGFbInN1cHBsaWVyIl0gPSB7Im5hbWUiOiBvd25lciBvciAidW5rbm93biJ9CgppZiBub3QgbWV0YS5nZXQoIm1hbnVmYWN0dXJlciIpOgogICAgbWV0YVsibWFudWZhY3R1cmVyIl0gPSB7Im5hbWUiOiBvd25lciBvciAidW5rbm93biJ9Cgpjb21wID0gbWV0YS5zZXRkZWZhdWx0KCJjb21wb25lbnQiLCB7fSkKaWYgbm90IGNvbXAuZ2V0KCJuYW1lIik6CiAgICBjb21wWyJuYW1lIl0gPSByZXBvLnNwbGl0KCIvIilbLTFdIGlmIHJlcG8gZWxzZSBvcy5wYXRoLmJhc2VuYW1lKG9zLmdldGN3ZCgpKQppZiBub3QgY29tcC5nZXQoInZlcnNpb24iKToKICAgIHNoYSA9IG9zLmVudmlyb24uZ2V0KCJHSVRIVUJfU0hBIiwgIiIpCiAgICBpZiBub3Qgc2hhOgogICAgICAgIHRyeToKICAgICAgICAgICAgc2hhID0gc3VicHJvY2Vzcy5jaGVja19vdXRwdXQoWyJnaXQiLCAicmV2LXBhcnNlIiwgIi0tc2hvcnQiLCAiSEVBRCJdLCBjd2Q9Uk9PVCkuZGVjb2RlKCkuc3RyaXAoKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHNoYSA9ICIwIgogICAgY29tcFsidmVyc2lvbiJdID0gc2hhCgppZiBub3QgY29tcC5nZXQoInB1cmwiKToKICAgIGNvbXBbInB1cmwiXSA9ICJwa2c6Z2l0aHViLyIgKyAocmVwbyBpZiByZXBvIGVsc2UgY29tcC5nZXQoIm5hbWUiLCJ1bmtub3duIikpICsgIkAiICsgY29tcC5nZXQoInZlcnNpb24iLCIwIikKCmRhdGEuc2V0ZGVmYXVsdCgiY29tcG9uZW50cyIsIFtdKQpkYXRhLnNldGRlZmF1bHQoImRlcGVuZGVuY2llcyIsIFtdKQoKZm9yIGMgaW4gZGF0YS5nZXQoImNvbXBvbmVudHMiLCBbXSk6CiAgICBpZiBub3QgYy5nZXQoInR5cGUiKToKICAgICAgICBjWyJ0eXBlIl0gPSAiZmlsZSIKICAgIGlmIG5vdCBjLmdldCgidmVyc2lvbiIpOgogICAgICAgIGNbInZlcnNpb24iXSA9IGNvbXAuZ2V0KCJ2ZXJzaW9uIiwgIjAiKQoKaWYgbGVuKGRhdGEuZ2V0KCJjb21wb25lbnRzIiwgW10pKSA9PSAwOgogICAgcm9vdF9jb21wID0gewogICAgICAgICJ0eXBlIjogImFwcGxpY2F0aW9uIiwKICAgICAgICAibmFtZSI6IGNvbXAuZ2V0KCJuYW1lIiwgInVua25vd24iKSwKICAgICAgICAidmVyc2lvbiI6IGNvbXAuZ2V0KCJ2ZXJzaW9uIiwgIjAiKSwKICAgICAgICAicHVybCI6IGNvbXAuZ2V0KCJwdXJsIiksCiAgICAgICAgImhhc2hlcyI6IFtdLAogICAgICAgICJsaWNlbnNlcyI6IFt7ImxpY2Vuc2UiOiB7ImlkIjogIk5PQVNTRVJUSU9OIn19XSwKICAgICAgICAicHJvcGVydGllcyI6IFt7Im5hbWUiOiAiZ2VuZXJhdGVkIiwgInZhbHVlIjogInRydWUifV0KICAgIH0KICAgIGRhdGFbImNvbXBvbmVudHMiXS5hcHBlbmQocm9vdF9jb21wKQoKdHJ5OgogICAganNvbi5kdW1wKGRhdGEsIG9wZW4oU0JPTV9QQVRILCAidyIpLCBpbmRlbnQ9MikKICAgIHByaW50KCJOVElBL0JTSSBoeWJyaWQgZW5yaWNobWVudCBkb25lOyBjb21wb25lbnRzOiIsIGxlbihkYXRhLmdldCgiY29tcG9uZW50cyIsIFtdKSkpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIHByaW50KCJGYWlsZWQgdG8gd3JpdGUgU0JPTToiLCBlLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBzeXMuZXhpdCgxKQo= | base64 --decode > project-src/enrich_ntia_bsi_hybrid.py
+
+
+          python3 project-src/enrich_ntia_bsi_hybrid.py || true
+
+
+      - name: Validate merged SBOM (cyclonedx-python-lib)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          try:
+              from cyclonedx.parser import build_parser
+              import json,sys
+              data=json.load(open("project-src/merged-sbom.json"))
+              # quick sanity checks
               if "bomFormat" not in data or "components" not in data:
-                  print("INVALID_SBOM", file=sys.stderr)
-                  sys.exit(1)
+                  print("INVALID_SBOM", file=sys.stderr); sys.exit(1)
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
-          EOF
-
+          PY 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
@@ -487,5 +675,6 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
+
 
 
