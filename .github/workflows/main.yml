@@ -68,8 +68,8 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          # Added 'timeout' utility installation
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder timeout
+          # FIX: Removed 'timeout' from this list as it's part of coreutils and pre-installed, preventing the E: Unable to locate package error.
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
           # Ensure the latest available version is installed
