@@ -1,4 +1,4 @@
-name: IoT Full SBOM Pipeline (Model 3 - Final Fix)
+name: Universal SBOM Pipeline (High Quality)
 
 on:
   workflow_dispatch:
@@ -58,17 +58,19 @@ jobs:
     needs: fetch_top_repos
     continue-on-error: true
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # --- Timeout applied here: Max 15 minutes per repo ---
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Install base deps
+      - name: Install base deps (Multi-Language)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
+          # Add default-jdk for Java support (Maven/Gradle)
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config default-jdk cppcheck flawfinder maven gradle
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
@@ -113,24 +115,41 @@ jobs:
           FILE=$(find project-src -maxdepth=6 -type f -iregex ".*(LICENSE|COPYING|COPYRIGHT|LICENSE.md|LICENSE.txt)" | head -1 || true)
           if [ -n "$FILE" ]; then cp "$FILE" project-src/local-license.txt; else echo "" > project-src/local-license.txt; fi
           GH=$(jq -r '.license.spdx_id // empty' project-src/gh-license.json)
-          FILE=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z0-9.\-+]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}' || true)
+          FILE=$(grep -Eo "SPDX-License-Identifier:\s*[A-Za-z04-9.\-+]+" project-src/local-license.txt | head -1 | awk -F': ' '{print $2}' || true)
           FINAL="${GH:-$FILE}"
           [ -z "$FINAL" ] && FINAL="NOASSERTION"
           echo "$FINAL" > project-src/final_license.txt
           
-      - name: Best-effort package manager prep (npm/pip/conan)
+      - name: Best-effort package manager prep (Python/Java/Node/C++)
         run: |
-          set -euo pipefail
-          if [ -f project-src/package-lock.json ] || [ -f project-src/pnpm-lock.yaml ] || [ -f project-src/yarn.lock ]; then
-            (cd project-src && if command -v npm >/dev/null 2>&1; then npm ci --silent || npm install --silent || true; fi) || true
+          set +e
+          cd project-src || exit 1
+          
+          echo "-> Attempting Node.js dependency installation..."
+          if [ -f package-lock.json ] || [ -f pnpm-lock.yaml ] || [ -f yarn.lock ]; then
+            if command -v npm >/dev/null 2>&1; then npm ci --silent || npm install --silent || true; fi
           fi
-          if [ -f project-src/requirements.txt ]; then
+
+          echo "-> Attempting Python dependency installation..."
+          if [ -f requirements.txt ]; then
             python3 -m pip install --upgrade pip || true
-            python3 -m pip install -r project-src/requirements.txt --no-deps --target project-src/.sbom_deps || true
+            python3 -m pip install -r requirements.txt --no-deps --target .sbom_deps || true
           fi
-          if ls project-src/conanfile.* >/dev/null 2>&1 || [ -f project-src/conanfile.txt ] 2>/dev/null; then
-            (cd project-src && conan profile detect --force || true; conan install . --build=missing) || true
+          
+          echo "-> Attempting Java dependency installation..."
+          if [ -f pom.xml ]; then
+            if command -v mvn >/dev/null 2>&1; then mvn dependency:resolve || true; fi
           fi
+          if [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            if command -v gradle >/dev/null 2>&1; then gradle dependencies || true; fi
+          fi
+          
+          echo "-> Attempting C/C++ dependency installation..."
+          if ls conanfile.* >/dev/null 2>&1 || [ -f conanfile.txt ] 2>/dev/null; then
+            conan profile detect --force || true; conan install . --build=missing || true
+          fi
+          
+          set -e
           
       - name: Build project (C/C++ best-effort)
         run: |
@@ -148,17 +167,18 @@ jobs:
             echo "No CMakeLists.txt, skipping build" >&2
           fi
           
-      - name: Cdxgen SBOM (Primary Generator)
+      - name: Cdxgen SBOM (Primary Generator - Universal)
         run: |
           set -euo pipefail
+          # cdxgen auto-detects language, no need for -t cpp flag
           if command -v npx >/dev/null 2>&1; then
             (cd project-src && npx --yes @cyclonedx/cdxgen \
-              -t cpp --deep --recurse --no-binaries --resolve-licence \
+              --deep --recurse --no-binaries --resolve-licence \
               --spec-version $CYCLONEDX_SPEC -o cdxgen-sbom.json .) || true
           fi
           if [ ! -s project-src/cdxgen-sbom.json ]; then
             sudo docker run --rm -v "$PWD/project-src":/src ghcr.io/cyclonedx/cdxgen:latest \
-              cdxgen -t cpp --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o /src/cdxgen-sbom.json /src || true
+              cdxgen --deep --recurse --no-binaries --resolve-licence --spec-version $CYCLONEDX_SPEC -o /src/cdxgen-sbom.json /src || true
           fi
           if [ ! -s project-src/cdxgen-sbom.json ]; then
             cat > project-src/cdxgen-sbom.json <<'JSON'
@@ -188,7 +208,7 @@ jobs:
             fi
           done
 
-      - name: Create & Run SBOM Merge Script (Timestamp Fix) ⏰
+      - name: Create & Run SBOM Merge Script (Supplier/Timestamp Fix) ⏰
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
           import os, json, uuid, time, hashlib, datetime
@@ -213,8 +233,46 @@ jobs:
               version = c.get("version") or "0"
               c["name"] = name
               c["version"] = version
-              if "supplier" not in c or not c["supplier"]:
+              
+              # --- CRITICAL FIX: SMART SUPPLIER INFERENCE ---
+              purl = c.get("purl", "")
+              supplier_name = None
+
+              # Check for existing valid supplier that is NOT the default repo name
+              existing_supplier = c.get("supplier", {}).get("name")
+              if existing_supplier and existing_supplier.lower() != default_supplier.lower():
+                  # A valid third-party supplier is already set by the tool, keep it.
+                  return c
+
+              # Infer supplier based on PURL type (highest confidence)
+              if purl.startswith("pkg:github/"):
+                  # Use the namespace part of the PURL if available, otherwise default to GitHub
+                  parts = purl.split('/')
+                  if len(parts) > 2:
+                      supplier_name = parts[1].split('@')[0]
+                      if supplier_name.lower() in ['actions', 'microsoft']:
+                           supplier_name = "GitHub, Inc."
+                      elif supplier_name:
+                           supplier_name = supplier_name + " (via GitHub)"
+                  else:
+                      supplier_name = "GitHub, Inc."
+              elif purl.startswith("pkg:maven/"):
+                  supplier_name = "Maven Central Repository"
+              elif purl.startswith("pkg:pypi/"):
+                  supplier_name = "Python Software Foundation"
+              elif purl.startswith("pkg:npm/"):
+                  supplier_name = "npm, Inc."
+              elif purl.startswith("pkg:nuget/"):
+                  supplier_name = "Microsoft Corporation"
+              
+              # Set the inferred or default supplier
+              if supplier_name:
+                  c["supplier"] = {"name": supplier_name}
+              elif not c.get("supplier"):
                   c["supplier"] = {"name": default_supplier}
+
+              # --- END SUPPLIER FIX ---
+
               if "bom-ref" not in c or not c["bom-ref"]:
                   h = hashlib.sha1((name + version).encode()).hexdigest()
                   c["bom-ref"] = f"pkg:{h}" 
@@ -240,6 +298,16 @@ jobs:
               repo = "unknown"
 
           root_ref = f"pkg:github/{repo}@root"
+          
+          repo_license = "NOASSERTION"
+          license_path = os.path.join(ROOT, "final_license.txt")
+          if os.path.exists(license_path):
+              try:
+                  with open(license_path, "r") as f:
+                      repo_license = f.read().strip() or "NOASSERTION"
+              except:
+                  pass
+                  
           root_component = {
               "type": "application",
               "name": repo,
@@ -247,7 +315,7 @@ jobs:
               "purl": f"pkg:github/{repo}",
               "supplier": {"name": repo},
               "bom-ref": root_ref,
-              "licenses": [{"license": {"id": "NOASSERTION"}}]
+              "licenses": [{"license": {"id": repo_license}}] # Set correct root license here
           }
 
           final_components = []
@@ -276,17 +344,6 @@ jobs:
               "dependencies": dependencies
           }
 
-          repo_license = "NOASSERTION"
-          license_path = os.path.join(ROOT, "final_license.txt")
-          if os.path.exists(license_path):
-              try:
-                  with open(license_path, "r") as f:
-                      repo_license = f.read().strip() or "NOASSERTION"
-              except:
-                  pass
-          
-          root_component.setdefault('licenses', [{"license": {"id": repo_license}}])[0]['license']['id'] = repo_license
-
           if not any(c.get('bom-ref') == root_ref for c in final_components):
               final_components.insert(0, root_component)
 
@@ -300,7 +357,8 @@ jobs:
           import sys, os, json, hashlib, uuid, time, subprocess
           
           ROOT='project-src'
-          FILE_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.ino', '.py', '.go', '.rs'}
+          # Universal file extensions for code analysis
+          FILE_EXTENSIONS = {'.c', '.cpp', '.h', '.hpp', '.ino', '.py', '.java', '.go', '.rs', '.js', '.ts', '.cs', '.php'}
           SKIP_DIR_NAMES={'build','build_output','cmake-build-debug','cmake-build-release',
                           'sdk','toolchain','tools','espressif','esp-idf','components','.arduino','.cargo','.pio','.venv',
                           'deps','downloads','vcpkg_installed','node_modules','vendor','out','target'}
@@ -411,12 +469,12 @@ jobs:
           
           data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
           data['metadata'] = data.get('metadata') or {}
-          # FIX: Do not overwrite the timestamp here. It was set correctly in the previous step.
           
           json.dump(data, open(os.path.join(ROOT,'merged-sbom.json'), 'w'), indent=2)
           print('File enrichment added', len(files), 'files')
           
           # --- STATIC ANALYSIS (WITH PYTHON-NATIVE TIMEOUT) ---
+          # Note: Cppcheck and Flawfinder are only for C/C++ but run best-effort on all repos
           
           # Cppcheck
           try:
@@ -481,7 +539,7 @@ jobs:
           data.setdefault("bomFormat", "CycloneDX"); data.setdefault("specVersion", "1.5"); data.setdefault("serialNumber", "urn:uuid:" + str(uuid.uuid4())); data.setdefault("version", 1)
           meta = data.setdefault("metadata", {}); 
           
-          # CRITICAL FIX: Ensure timestamp is a valid ISO 8601 string if missing or malformed
+          # Ensure timestamp is a valid ISO 8601 string if missing or malformed
           if not meta.get("timestamp") or not isinstance(meta.get("timestamp"), str):
               meta["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
               
@@ -492,7 +550,8 @@ jobs:
           if "supplier" not in root: root["supplier"] = {"name": root["name"]}
           if "type" not in root: root["type"] = "application"
           if "bom-ref" not in root: root["bom-ref"] = "pkg:auto-root-" + str(uuid.uuid4())
-
+          
+          # NTIA/BSI enrichment logic (ensuring license is at least NOASSERTION and bom-ref is present)
           for c in data.get("components", []):
               if "supplier" not in c: c["supplier"] = {"name": root["name"]}
               if "licenses" not in c: c["licenses"] = [{"license": {"id": "NOASSERTION"}}]
@@ -502,7 +561,10 @@ jobs:
                   else:
                       c["bom-ref"] = "pkg:auto-" + str(uuid.uuid4())
               if c.get('type') == 'file':
-                 c['bom-ref'] = 'file-' + c['name'].replace("/", "_").replace(" ", "_").replace(".", "_")
+                 # Use a deterministic ref for files to avoid conflicts if merging again
+                 file_name_only = os.path.basename(c.get('name', ''))
+                 if file_name_only:
+                    c['bom-ref'] = 'file-' + file_name_only.replace("/", "_").replace(" ", "_").replace(".", "_")
 
           root_ref = root.get("bom-ref")
           component_refs = {c["bom-ref"] for c in data.get("components", []) if c.get("bom-ref") != root_ref and c.get("bom-ref")}
@@ -663,25 +725,22 @@ jobs:
         run: |
           set +e 
           INPUT_SBOM="project-src/sbomqs-input.json"
-          TIMEOUT_SECONDS=300
+          TIMEOUT_SECONDS=300 # Keep this timeout separate for the docker commands
 
           echo "Running sbomqs NTIA check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # FIX 1: Removed '--format json' and replaced with the correct flag '--json'
           timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --json /sbom/sbomqs-input.json > project-src/compliance_NTIA.json
           
           echo "Running sbomqs BSI V2 check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # FIX 1: Removed '--format json' and replaced with the correct flag '--json'
           timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --json /sbom/sbomqs-input.json > project-src/compliance_BSI.json
           
           echo "Running sbomqs Score calculation with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
-          # Score calculation command was correct
           timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/sbomqs-input.json --json > project-src/score.json
           
           set -e
           
           for f in project-src/compliance_NTIA.json project-src/compliance_BSI.json project-src/score.json; do
               if [ ! -s "$f" ]; then
-                  # Fallback structure updated to match the original expected error for consistency
+                  # Fallback structure updated to report crash/timeout
                   echo '{"error":true, "reason":"sbomqs command failed to produce non-empty output or was blocked (timeout/crash)"}' > "$f"
               fi
           done
@@ -715,8 +774,13 @@ jobs:
           vsb_count, h2, c2 = count_vulns("project-src/vulnerabilities_sbom.json")
           high = h1 + h2; critical = c1 + c2
           
-          try: score_data = json.load(open("project-src/score.json")); score = score_data.get("score")
-          except: score = None
+          # Score Logic
+          score = None
+          try: 
+              score_data = json.load(open("project-src/score.json"))
+              if not score_data.get("error"):
+                 score = score_data.get("files", [{}])[0].get("sbom_quality_score")
+          except: pass
           
           def passcheck(fname):
               try:
@@ -725,7 +789,6 @@ jobs:
                   if d.get("error") == True:
                       return 'error'
                   # Check for compliance pass status in a normal sbomqs report structure
-                  # The compliance reports have a top-level 'pass' boolean
                   return 'true' if d.get('pass') == True else 'false'
               except:
                   return 'false'
