@@ -65,9 +65,9 @@ jobs:
       - name: Install base deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config
+          sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
           pip3 install --upgrade pip
-          pip3 install cyclonedx-bom cyclonedx-python-lib pandas || true
+          pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
         run: |
           sudo groupadd docker || true
@@ -186,8 +186,8 @@ jobs:
             fi
           done
       
-      # FIX: Simplified: This step uses the final, correct Python logic for merging/enrichment, 
-      # replacing the complex and redundant base64 step that came before it.
+      # FIX: This is the large script that caused the error. It must be present, but the fix is to use the heredoc directly, 
+      # and remove the prior complex base64 steps (which were already removed).
       - name: Create & Run SBOM Merge Script (NTIA/BSI-compliant)
         run: |
           cat > project-src/merged_and_enrich.py <<'PY'
@@ -438,17 +438,24 @@ jobs:
                   'version': version,
                   'purl': 'pkg:github/'+(owner_repo if owner_repo else name)+'@'+version,
                   'externalReferences': [{'type':'vcs','url':'https://github.com/'+(owner_repo if owner_repo else name)}],
-                  'properties': [{'name':'size','value': str(f['size'])}]
+                  'properties': [{'name':'size','value': str(f['size'])}],
+                  'bom-ref': 'file-'+nm, # Generate a unique reference for the file
+                  'supplier': {'name': 'Test_sbom_array'}, # Default supplier
+                  'licenses': [{"license": {"id": "NOASSERTION"}}] # Default license
               }
               if f.get('sha256'):
                   comp['hashes']=[{'alg':'SHA-256','content':f['sha256']}]
-                  # Add file component to the dependencies of the root component
-                  root_ref = root_comp.get('bom-ref')
-                  if root_ref:
-                      for dep in data.get('dependencies', []):
-                          if dep['ref'] == root_ref:
-                              dep.setdefault('dependsOn', []).append(comp.get('bom-ref', 'file-'+comp['name']))
-
+              
+              # Add file component to the dependencies of the root component
+              root_ref = root_comp.get('bom-ref')
+              if root_ref:
+                  for dep in data.get('dependencies', []):
+                      if dep['ref'] == root_ref:
+                          # Check if file-component is already in dependencies (e.g. from file-hashing step)
+                          file_ref = comp.get('bom-ref')
+                          if file_ref and file_ref not in dep.setdefault('dependsOn', []):
+                              dep['dependsOn'].append(file_ref)
+                              
               if f['size'] > MAX_HASH_SIZE:
                   comp.setdefault('properties', []).append({'name':'large-file','value':'true'})
               data.setdefault('components', []).append(comp)
