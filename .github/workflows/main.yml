@@ -245,7 +245,7 @@ jobs:
               "components": merged
           }
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
-          PY      
+          PY
       - name: Enrich SBOM with file-level components (Option F)
         run: |
           set -euo pipefail
