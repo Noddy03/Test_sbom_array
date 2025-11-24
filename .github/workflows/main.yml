@@ -458,25 +458,25 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED - Using Factory)
-        # FIX: Use the 'get_schema_validator' factory method, which is the most stable API for validation.
+      - name: Validate merged SBOM against CycloneDX Schema ✅ (Final Fix: String Validation)
         run: |
           set -euo pipefail
           python3 <<'PY'
           import sys, json, os
-          from cyclonedx.schema import SchemaVersion, get_schema_validator
-
+          from cyclonedx.schema import SchemaVersion
+          from cyclonedx.validation.json import JsonStrictValidator 
+          
           try:
               sbom_path = os.path.join("project-src", "merged-sbom.json")
               with open(sbom_path, 'r') as f:
-                  # Load the data as a Python dictionary
-                  bom_data = json.load(f)
-
-              # Use the factory method to get a validator instance
-              validator = get_schema_validator(SchemaVersion.V1_5)
+                  # Read the content as a raw JSON string
+                  bom_data_str = f.read()
               
-              # Use the universal 'validate' method on the returned validator
-              validation_errors = list(validator.validate(bom_data))
+              schema_version = SchemaVersion.V1_5
+              validator = JsonStrictValidator(schema_version)
+              
+              # Use the 'validate' method and pass the raw JSON string.
+              validation_errors = list(validator.validate(bom_data_str))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
@@ -488,24 +488,8 @@ jobs:
                   sys.exit(0)
           
           except Exception as e:
-              # This will catch errors related to the validation method itself not existing
-              print(f"FATAL VALIDATION ERROR: {e}", file=sys.stderr)
-              # If we get here, the API for get_schema_validator or validate() is also broken
-              # As a final fallback, try falling back to validate_dict one last time
-              print("Attempting final fallback to validate_dict...", file=sys.stderr)
-              try:
-                  from cyclonedx.validation.json import JsonStrictValidator
-                  validator_fb = JsonStrictValidator(SchemaVersion.V1_5)
-                  validation_errors_fb = list(validator_fb.validate_dict(bom_data))
-                  if validation_errors_fb:
-                      print("Fallback validation failed with errors.", file=sys.stderr)
-                      sys.exit(1)
-                  else:
-                      print("Fallback validation PASSED (this should not happen, something is deeply wrong).", file=sys.stderr)
-                      sys.exit(0)
-              except Exception as e_fb:
-                  print(f"FINAL FATAL VALIDATION ERROR: The installed cyclonedx-python-lib API is fundamentally broken or mismatched: {e_fb}", file=sys.stderr)
-                  sys.exit(1)
+              print(f"FATAL VALIDATION ERROR (Final Fallback): {e}", file=sys.stderr)
+              sys.exit(1)
           PY
 
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
