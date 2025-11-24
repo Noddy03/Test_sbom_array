@@ -166,7 +166,11 @@ jobs:
           {"bomFormat":"CycloneDX","specVersion":"1.5","version":1,"components":[]}
           JSON
           fi
-
+      - name: Trivy FS SBOM (CycloneDX) + filesystem vulnerability scan
+        run: |
+          set -euo pipefail
+          trivy fs --format cyclonedx -o project-src/trivy-fs.json project-src || echo '{"components":[]}' > project-src/trivy-fs.json
+          trivy fs --format json --vuln-type library,os --security-checks vuln -o project-src/vulnerabilities_fs.json project-src || echo '{"Results":[]}' > project-src/vulnerabilities_fs.json
       - name: Syft FS SBOM (optional enrichment)
         run: |
           set -euo pipefail
@@ -181,181 +185,12 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-      - name: Merge SBOMs (NTIA/BSI enriched)
+      - name: Merge SBOMs correctly (NTIA+BSI merged)
         run: |
           set -euo pipefail
-          cat > project-src/merged_and_enrich.py <<'PY'
-          import os, json, uuid, time, hashlib, subprocess
-          
-          ROOT = "project-src"
-          OUT = os.path.join(ROOT, "merged-sbom.json")
-          
-          def load(p):
-              try:
-                  return json.load(open(p))
-              except Exception:
-                  return {"components": []}
-          
-          cdx = load(os.path.join(ROOT, "cdxgen-sbom.json"))
-          trivy = load(os.path.join(ROOT, "trivy-fs.json"))
-          syft = load(os.path.join(ROOT, "syft-sbom.json"))
-          conan = load(os.path.join(ROOT, "conan-sbom.json"))
-          extra_files = ["cyclonedx-sbom.json", "bom.json"]
-          extra = []
-          for ef in extra_files:
-              p = os.path.join(ROOT, ef)
-              if os.path.exists(p):
-                  tmp = load(p)
-                  if tmp.get("components"):
-                      extra.extend(tmp.get("components", []))
-          
-          merged = []
-          seen = set()
-          
-          def key_of(c):
-              purl = c.get("purl")
-              if purl:
-                  return ("purl", purl)
-              return (c.get("name"), c.get("version"))
-          
-          def add_component(c):
-              if not c.get("name"):
-                  c["name"] = c.get("purl", "unknown").split("/")[-1]
-              if not c.get("version"):
-                  c["version"] = os.environ.get("GITHUB_SHA", "0")
-              if not c.get("type"):
-                  c["type"] = "file" if c.get("name", "").endswith(('.c','.h','.cpp','.py')) else "library"
-              if not c.get("purl"):
-                  safe_name = c["name"].replace(" ", "_")
-                  c["purl"] = f"pkg:generic/{safe_name}@{c['version']}"
-              if not c.get("bom-ref"):
-                  c["bom-ref"] = c.get("purl") or f"urn:uuid:{uuid.uuid4()}"
-              if c.get("licenses"):
-                  if all(isinstance(x, str) for x in c["licenses"]):
-                      c["licenses"] = [{"license": {"id": x}} for x in c["licenses"]]
-              else:
-                  c["licenses"] = [{"license": {"id": "NOASSERTION"}}]
-              if not c.get("hashes"):
-                  name = c.get("name","")
-                  filepaths = [os.path.join(ROOT, name), os.path.join(ROOT, name.lstrip("./"))]
-                  found = False
-                  for fp in filepaths:
-                      if os.path.exists(fp) and os.path.isfile(fp):
-                          try:
-                              h = hashlib.sha256()
-                              with open(fp, "rb") as fh:
-                                  for chunk in iter(lambda: fh.read(8192), b""):
-                                      h.update(chunk)
-                              c["hashes"] = [{"alg":"SHA-256","content": h.hexdigest()}]
-                              found = True
-                              break
-                          except Exception:
-                              found = False
-                  if not found:
-                      c["hashes"] = [{"alg":"NOASSERTION","content":"NOASSERTION"}]
-              return c
-          
-          for comp in cdx.get("components", []) or []:
-              k = key_of(comp)
-              merged.append(add_component(dict(comp)))
-              seen.add(k)
-          
-          def add_if_new_or_enrich(src_list):
-              for c in src_list or []:
-                  k = key_of(c)
-                  if k in seen:
-                      for m in merged:
-                          if key_of(m) == k:
-                              for fld in ("supplier","purl","hashes","externalReferences","evidence","type","properties","copyright","licenses","bom-ref"):
-                                  if not m.get(fld) and c.get(fld):
-                                      m[fld] = c.get(fld)
-                              m = add_component(m)
-                              break
-                  else:
-                      merged.append(add_component(dict(c)))
-                      seen.add(k)
-          
-          add_if_new_or_enrich(trivy.get("components", []))
-          add_if_new_or_enrich(syft.get("components", []))
-          add_if_new_or_enrich(conan.get("components", []))
-          if extra:
-              add_if_new_or_enrich(extra)
-          
-          repo_license = ""
-          if os.path.exists(os.path.join(ROOT, "final_license.txt")):
-              repo_license = open(os.path.join(ROOT, "final_license.txt")).read().strip()
-          if not repo_license:
-              try:
-                  gh = load(os.path.join(ROOT, "gh-license.json"))
-                  repo_license = gh.get("license", {}).get("spdx_id", "") or "NOASSERTION"
-              except Exception:
-                  repo_license = "NOASSERTION"
-          
-          metadata = {
-              "timestamp": int(time.time()),
-              "tools": [{"vendor":"custom","name":"iot-sbom-pipeline","version":"1.0"}]
-          }
-          
-          root_component = metadata.setdefault("component", {"type":"application","name": os.path.basename(os.getcwd())})
-          if not root_component.get("name"):
-              root_component["name"] = os.path.basename(os.getcwd())
-          if not root_component.get("version"):
-              root_component["version"] = os.environ.get("GITHUB_SHA", "0")
-          if not root_component.get("purl"):
-              root_component["purl"] = f"pkg:github/{os.environ.get('GITHUB_REPOSITORY', root_component['name'])}@{root_component['version']}"
-          
-          merged_root_present = False
-          for c in merged:
-              if c.get("purl") == root_component.get("purl") or c.get("name") == root_component.get("name"):
-                  merged_root_present = True
-                  break
-          
-          if not merged_root_present:
-              root_bom_ref = root_component.get("purl") or f"urn:uuid:{uuid.uuid4()}"
-              root_c = {
-                  "type": "application",
-                  "name": root_component.get("name"),
-                  "version": root_component.get("version"),
-                  "purl": root_component.get("purl"),
-                  "bom-ref": root_bom_ref,
-                  "licenses": [{"license": {"id": repo_license or "NOASSERTION"}}],
-                  "hashes": [{"alg":"NOASSERTION","content":"NOASSERTION"}],
-                  "properties": [{"name":"generated","value":"true"}]
-              }
-              merged.insert(0, root_c)
-          
-          dependencies = []
-          dep_entry = {"ref": merged[0].get("bom-ref"), "dependsOn": []}
-          for c in merged[1:]:
-              dep_entry["dependsOn"].append(c.get("bom-ref"))
-          dependencies.append(dep_entry)
-          
-          out = {
-              "bomFormat":"CycloneDX",
-              "specVersion":"1.5",
-              "serialNumber":"urn:uuid:"+str(uuid.uuid4()),
-              "version":1,
-              "metadata": {
-                  "timestamp": metadata["timestamp"],
-                  "tools": metadata["tools"],
-                  "component": root_component
-              },
-              "repo_license": repo_license or "NOASSERTION",
-              "components": merged,
-              "dependencies": dependencies
-          }
-          
-          try:
-              json.dump(out, open(OUT, "w"), indent=2)
-              print("merged-sbom.json written with", len(merged), "components")
-          except Exception as e:
-              print("failed to write merged-sbom.json:", e)
-          PY
+          echo aW1wb3J0IG9zLCBqc29uLCB1dWlkLCB0aW1lLCBoYXNobGliLCBzdWJwcm9jZXNzCgpST09UID0gInByb2plY3Qtc3JjIgpPVVQgPSBvcy5wYXRoLmpvaW4oUk9PVCwgIm1lcmdlZC1zYm9tLmpzb24iKQoKZGVmIGxvYWQocCk6CiAgICB0cnk6CiAgICAgICAgcmV0dXJuIGpzb24ubG9hZChvcGVuKHApKQogICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICByZXR1cm4geyJjb21wb25lbnRzIjogW119CgpjZHggPSBsb2FkKG9zLnBhdGguam9pbihST09ULCAiY2R4Z2VuLXNib20uanNvbiIpKQp0cml2eSA9IGxvYWQob3MucGF0aC5qb2luKFJPT1QsICJ0cml2eS1mcy5qc29uIikpCnN5ZnQgPSBsb2FkKG9zLnBhdGguam9pbihST09ULCAic3lmdC1zYm9tLmpzb24iKSkKY29uYW4gPSBsb2FkKG9zLnBhdGguam9pbihST09ULCAiY29uYW4tc2JvbS5qc29uIikpCmV4dHJhX2ZpbGVzID0gWyJjeWNsb25lZHgtc2JvbS5qc29uIiwgImJvbS5qc29uIl0KZXh0cmEgPSBbXQpmb3IgZWYgaW4gZXh0cmFfZmlsZXM6CiAgICBwID0gb3MucGF0aC5qb2luKFJPT1QsIGVmKQogICAgaWYgb3MucGF0aC5leGlzdHMocCk6CiAgICAgICAgdG1wID0gbG9hZChwKQogICAgICAgIGlmIHRtcC5nZXQoImNvbXBvbmVudHMiKToKICAgICAgICAgICAgZXh0cmEuZXh0ZW5kKHRtcC5nZXQoImNvbXBvbmVudHMiLCBbXSkpCgptZXJnZWQgPSBbXQpzZWVuID0gc2V0KCkKCmRlZiBrZXlfb2YoYyk6CiAgICBwdXJsID0gYy5nZXQoInB1cmwiKQogICAgaWYgcHVybDoKICAgICAgICByZXR1cm4gKCJwdXJsIiwgcHVybCkKICAgIHJldHVybiAoYy5nZXQoIm5hbWUiKSwgYy5nZXQoInZlcnNpb24iKSkKCmRlZiBhZGRfY29tcG9uZW50KGMpOgogICAgaWYgbm90IGMuZ2V0KCJuYW1lIik6CiAgICAgICAgY1sibmFtZSJdID0gYy5nZXQoInB1cmwiLCAidW5rbm93biIpLnNwbGl0KCIvIilbLTFdCiAgICBpZiBub3QgYy5nZXQoInZlcnNpb24iKToKICAgICAgICBjWyJ2ZXJzaW9uIl0gPSBvcy5lbnZpcm9uLmdldCgiR0lUSFVCX1NIQSIsICIwIikKICAgIGlmIG5vdCBjLmdldCgidHlwZSIpOgogICAgICAgIGNbInR5cGUiXSA9ICJmaWxlIiBpZiBjLmdldCgibmFtZSIsICIiKS5lbmRzd2l0aCgoJy5jJywnLmgnLCcuY3BwJywnLnB5JykpIGVsc2UgImxpYnJhcnkiCiAgICBpZiBub3QgYy5nZXQoInB1cmwiKToKICAgICAgICBzYWZlX25hbWUgPSBjWyJuYW1lIl0ucmVwbGFjZSgiICIsICJfIikKICAgICAgICBjWyJwdXJsIl0gPSBmInBrZzpnZW5lcmljL3tzYWZlX25hbWV9QHtjWyd2ZXJzaW9uJ119IgogICAgaWYgbm90IGMuZ2V0KCJib20tcmVmIik6CiAgICAgICAgY1siYm9tLXJlZiJdID0gYy5nZXQoInB1cmwiKSBvciBmInVybjp1dWlkOnt1dWlkLnV1aWQ0KCl9IgogICAgaWYgYy5nZXQoImxpY2Vuc2VzIik6CiAgICAgICAgaWYgYWxsKGlzaW5zdGFuY2UoeCwgc3RyKSBmb3IgeCBpbiBjWyJsaWNlbnNlcyJdKToKICAgICAgICAgICAgY1sibGljZW5zZXMiXSA9IFt7ImxpY2Vuc2UiOiB7ImlkIjogeH19IGZvciB4IGluIGNbImxpY2Vuc2VzIl1dCiAgICBlbHNlOgogICAgICAgIGNbImxpY2Vuc2VzIl0gPSBbeyJsaWNlbnNlIjogeyJpZCI6ICJOT0FTU0VSVElPTiJ9fV0KICAgIGlmIG5vdCBjLmdldCgiaGFzaGVzIik6CiAgICAgICAgbmFtZSA9IGMuZ2V0KCJuYW1lIiwiIikKICAgICAgICBmaWxlcGF0aHMgPSBbb3MucGF0aC5qb2luKFJPT1QsIG5hbWUpLCBvcy5wYXRoLmpvaW4oUk9PVCwgbmFtZS5sc3RyaXAoIi4vIikpXQogICAgICAgIGZvdW5kID0gRmFsc2UKICAgICAgICBmb3IgZnAgaW4gZmlsZXBhdGhzOgogICAgICAgICAgICBpZiBvcy5wYXRoLmV4aXN0cyhmcCkgYW5kIG9zLnBhdGguaXNmaWxlKGZwKToKICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAgICAgICAgICBoID0gaGFzaGxpYi5zaGEyNTYoKQogICAgICAgICAgICAgICAgICAgIHdpdGggb3BlbihmcCwgInJiIikgYXMgZmg6CiAgICAgICAgICAgICAgICAgICAgICAgIGZvciBjaHVuayBpbiBpdGVyKGxhbWJkYTogZmgucmVhZCg4MTkyKSwgYiIiKToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGgudXBkYXRlKGNodW5rKQogICAgICAgICAgICAgICAgICAgIGNbImhhc2hlcyJdID0gW3siYWxnIjoiU0hBLTI1NiIsImNvbnRlbnQiOiBoLmhleGRpZ2VzdCgpfV0KICAgICAgICAgICAgICAgICAgICBmb3VuZCA9IFRydWUKICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjoKICAgICAgICAgICAgICAgICAgICBmb3VuZCA9IEZhbHNlCiAgICAgICAgaWYgbm90IGZvdW5kOgogICAgICAgICAgICBjWyJoYXNoZXMiXSA9IFt7ImFsZyI6Ik5PQVNTRVJUSU9OIiwiY29udGVudCI6Ik5PQVNTRVJUSU9OIn1dCiAgICByZXR1cm4gYwoKZm9yIGNvbXAgaW4gY2R4LmdldCgiY29tcG9uZW50cyIsIFtdKSBvciBbXToKICAgIGsgPSBrZXlfb2YoY29tcCkKICAgIG1lcmdlZC5hcHBlbmQoYWRkX2NvbXBvbmVudChkaWN0KGNvbXApKSkKICAgIHNlZW4uYWRkKGspCgpkZWYgYWRkX2lmX25ld19vcl9lbnJpY2goc3JjX2xpc3QpOgogICAgZm9yIGMgaW4gc3JjX2xpc3Qgb3IgW106CiAgICAgICAgayA9IGtleV9vZihjKQogICAgICAgIGlmIGsgaW4gc2VlbjoKICAgICAgICAgICAgZm9yIG0gaW4gbWVyZ2VkOgogICAgICAgICAgICAgICAgaWYga2V5X29mKG0pID09IGs6CiAgICAgICAgICAgICAgICAgICAgZm9yIGZsZCBpbiAoInN1cHBsaWVyIiwicHVybCIsImhhc2hlcyIsImV4dGVybmFsUmVmZXJlbmNlcyIsImV2aWRlbmNlIiwidHlwZSIsInByb3BlcnRpZXMiLCJjb3B5cmlnaHQiLCJsaWNlbnNlcyIsImJvbS1yZWYiKToKICAgICAgICAgICAgICAgICAgICAgICAgaWYgbm90IG0uZ2V0KGZsZCkgYW5kIGMuZ2V0KGZsZCk6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBtW2ZsZF0gPSBjLmdldChmbGQpCiAgICAgICAgICAgICAgICAgICAgbSA9IGFkZF9jb21wb25lbnQobSkKICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgIGVsc2U6CiAgICAgICAgICAgIG1lcmdlZC5hcHBlbmQoYWRkX2NvbXBvbmVudChkaWN0KGMpKSkKICAgICAgICAgICAgc2Vlbi5hZGQoaykKCmFkZF9pZl9uZXdfb3JfZW5yaWNoKHRyaXZ5LmdldCgiY29tcG9uZW50cyIsIFtdKSkKYWRkX2lmX25ld19vcl9lbnJpY2goc3lmdC5nZXQoImNvbXBvbmVudHMiLCBbXSkpCmFkZF9pZl9uZXdfb3JfZW5yaWNoKGNvbmFuLmdldCgiY29tcG9uZW50cyIsIFtdKSkKaWYgZXh0cmE6CiAgICBhZGRfaWZfbmV3X29yX2VucmljaChleHRyYSkKCnJlcG9fbGljZW5zZSA9ICIiCmlmIG9zLnBhdGguZXhpc3RzKG9zLnBhdGguam9pbihST09ULCAiZmluYWxfbGljZW5zZS50eHQiKSk6CiAgICByZXBvX2xpY2Vuc2UgPSBvcGVuKG9zLnBhdGguam9pbihST09ULCAiZmluYWxfbGljZW5zZS50eHQiKSkucmVhZCgpLnN0cmlwKCkKaWYgbm90IHJlcG9fbGljZW5zZToKICAgIHRyeToKICAgICAgICBnaCA9IGxvYWQob3MucGF0aC5qb2luKFJPT1QsICJnaC1saWNlbnNlLmpzb24iKSkKICAgICAgICByZXBvX2xpY2Vuc2UgPSBnaC5nZXQoImxpY2Vuc2UiLCB7fSkuZ2V0KCJzcGR4X2lkIiwgIiIpIG9yICJOT0FTU0VSVElPTiIKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmVwb19saWNlbnNlID0gIk5PQVNTRVJUSU9OIgoKbWV0YWRhdGEgPSB7CiAgICAidGltZXN0YW1wIjogaW50KHRpbWUudGltZSgpKSwKICAgICJ0b29scyI6IFt7InZlbmRvciI6ImN1c3RvbSIsIm5hbWUiOiJpb3Qtc2JvbS1waXBlbGluZSIsInZlcnNpb24iOiIxLjAifV0KfQoKcm9vdF9jb21wb25lbnQgPSBtZXRhZGF0YS5zZXRkZWZhdWx0KCJjb21wb25lbnQiLCB7InR5cGUiOiJhcHBsaWNhdGlvbiIsIm5hbWUiOiBvcy5wYXRoLmJhc2VuYW1lKG9zLmdldGN3ZCgpKX0pCmlmIG5vdCByb290X2NvbXBvbmVudC5nZXQoIm5hbWUiKToKICAgIHJvb3RfY29tcG9uZW50WyJuYW1lIl0gPSBvcy5wYXRoLmJhc2VuYW1lKG9zLmdldGN3ZCgpKQppZiBub3Qgcm9vdF9jb21wb25lbnQuZ2V0KCJ2ZXJzaW9uIik6CiAgICByb290X2NvbXBvbmVudFsidmVyc2lvbiJdID0gb3MuZW52aXJvbi5nZXQoIkdJVEhVQl9TSEEiLCAiMCIpCmlmIG5vdCByb290X2NvbXBvbmVudC5nZXQoInB1cmwiKToKICAgIHJvb3RfY29tcG9uZW50WyJwdXJsIl0gPSBmInBrZzpnaXRodWIve29zLmVudmlyb24uZ2V0KCdHSVRIVUJfUkVQT1NJVE9SWScsIHJvb3RfY29tcG9uZW50WyduYW1lJ10pfUB7cm9vdF9jb21wb25lbnRbJ3ZlcnNpb24nXX0iCgpyb290X3ByZXNlbnQgPSBGYWxzZQpmb3IgYyBpbiBtZXJnZWQ6CiAgICBpZiBjLmdldCgicHVybCIpID09IHJvb3RfY29tcG9uZW50LmdldCgicHVybCIpIG9yIGMuZ2V0KCJuYW1lIikgPT0gcm9vdF9jb21wb25lbnQuZ2V0KCJuYW1lIik6CiAgICAgICAgcm9vdF9wcmVzZW50ID0gVHJ1ZQogICAgICAgIGJyZWFrCgppZiBub3Qgcm9vdF9wcmVzZW50OgogICAgcm9vdF9ib21fcmVmID0gcm9vdF9jb21wb25lbnQuZ2V0KCJwdXJsIikgb3IgZiJ1cm46dXVpZDp7dXVpZC51dWlkNCgpfSIKICAgIHJvb3RfYyA9IHsKICAgICAgICAidHlwZSI6ICJhcHBsaWNhdGlvbiIsCiAgICAgICAgIm5hbWUiOiByb290X2NvbXBvbmVudC5nZXQoIm5hbWUiKSwKICAgICAgICAidmVyc2lvbiI6IHJvb3RfY29tcG9uZW50LmdldCgidmVyc2lvbiIpLAogICAgICAgICJwdXJsIjogcm9vdF9jb21wb25lbnQuZ2V0KCJwdXJsIiksCiAgICAgICAgImJvbS1yZWYiOiByb290X2JvbV9yZWYsCiAgICAgICAgImxpY2Vuc2VzIjogW3sibGljZW5zZSI6IHsiaWQiOiByZXBvX2xpY2Vuc2Ugb3IgIk5PQVNTRVJUSU9OIn19XSwKICAgICAgICAiaGFzaGVzIjogW3siYWxnIjoiTk9BU1NFUlRJT04iLCJjb250ZW50IjoiTk9BU1NFUlRJT04ifV0sCiAgICAgICAgInByb3BlcnRpZXMiOiBbeyJuYW1lIjoiZ2VuZXJhdGVkIiwidmFsdWUiOiJ0cnVlIn1dCiAgICB9CiAgICBtZXJnZWQuaW5zZXJ0KDAsIHJvb3RfYykKCmRlcGVuZGVuY2llcyA9IFtdCmRlcF9lbnRyeSA9IHsicmVmIjogbWVyZ2VkWzBdLmdldCgiYm9tLXJlZiIpLCAiZGVwZW5kc09uIjogW119CmZvciBjIGluIG1lcmdlZFsxOl06CiAgICBkZXBfZW50cnlbImRlcGVuZHNPbiJdLmFwcGVuZChjLmdldCgiYm9tLXJlZiIpKQpkZXBlbmRlbmNpZXMuYXBwZW5kKGRlcF9lbnRyeSkKCm91dCA9IHsKICAgICJib21Gb3JtYXQiOiJDeWNsb25lRFgiLAogICAgInNwZWNWZXJzaW9uIjoiMS41IiwKICAgICJzZXJpYWxOdW1iZXIiOiJ1cm46dXVpZDoiK3N0cih1dWlkLnV1aWQ0KCkpLAogICAgInZlcnNpb24iOjEsCiAgICAibWV0YWRhdGEiOiB7CiAgICAgICAgInRpbWVzdGFtcCI6IG1ldGFkYXRhWyJ0aW1lc3RhbXAiXSwKICAgICAgICAidG9vbHMiOiBtZXRhZGF0YVsidG9vbHMiXSwKICAgICAgICAiY29tcG9uZW50Ijogcm9vdF9jb21wb25lbnQKICAgIH0sCiAgICAicmVwb19saWNlbnNlIjogcmVwb19saWNlbnNlIG9yICJOT0FTU0VSVElPTiIsCiAgICAiY29tcG9uZW50cyI6IG1lcmdlZCwKICAgICJkZXBlbmRlbmNpZXMiOiBkZXBlbmRlbmNpZXMKfQoKdHJ5OgogICAganNvbi5kdW1wKG91dCwgb3BlbihPVVQsICJ3IiksIGluZGVudD0yKQogICAgcHJpbnQoIm1lcmdlZC1zYm9tLmpzb24gd3JpdHRlbiB3aXRoIiwgbGVuKG1lcmdlZCksICJjb21wb25lbnRzIikKZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgcHJpbnQoImZhaWxlZCB0byB3cml0ZSBtZXJnZWQtc2JvbS5qc29uOiIsIGUpCg== | base64 --decode > project-src/merged_and_enrich.py
           python3 project-src/merged_and_enrich.py
 
-
-
-    
       - name: Enrich SBOM with file-level components (Option F)
         run: |
           set -euo pipefail
@@ -559,22 +394,42 @@ jobs:
               json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
           PY
           python3 project-src/enrich_and_scan.py || true
-
-
       - name: NTIA & BSI hybrid enrichment (fill missing metadata)
 
 
         run: |
-
-
+          pip install cyclonedx-python-lib || true
           echo aW1wb3J0IG9zLCBqc29uLCB1dWlkLCB0aW1lLCBzeXMsIHN1YnByb2Nlc3MKClJPT1QgPSAicHJvamVjdC1zcmMiClNCT01fUEFUSCA9IG9zLnBhdGguam9pbihST09ULCAibWVyZ2VkLXNib20uanNvbiIpCgpkZWYgbG9hZF9zYm9tKHBhdGgpOgogICAgdHJ5OgogICAgICAgIHJldHVybiBqc29uLmxvYWQob3BlbihwYXRoKSkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmV0dXJuIHsiY29tcG9uZW50cyI6IFtdLCAibWV0YWRhdGEiOiB7fX0KCmRhdGEgPSBsb2FkX3Nib20oU0JPTV9QQVRIKQoKZGF0YS5zZXRkZWZhdWx0KCJib21Gb3JtYXQiLCAiQ3ljbG9uZURYIikKZGF0YS5zZXRkZWZhdWx0KCJzcGVjVmVyc2lvbiIsICIxLjUiKQoKaWYgbm90IGRhdGEuZ2V0KCJzZXJpYWxOdW1iZXIiKToKICAgIGRhdGFbInNlcmlhbE51bWJlciJdID0gInVybjp1dWlkOiIgKyBzdHIodXVpZC51dWlkNCgpKQoKbWV0YSA9IGRhdGEuc2V0ZGVmYXVsdCgibWV0YWRhdGEiLCB7fSkKbWV0YS5zZXRkZWZhdWx0KCJ0aW1lc3RhbXAiLCBpbnQodGltZS50aW1lKCkpKQp0b29scyA9IG1ldGEuc2V0ZGVmYXVsdCgidG9vbHMiLCBbXSkKaWYgbm90IGFueSh0LmdldCgibmFtZSIpID09ICJzYm9tLWVucmljaGVyLWh5YnJpZCIgZm9yIHQgaW4gdG9vbHMpOgogICAgdG9vbHMuYXBwZW5kKHsidmVuZG9yIjogImVucmljaGVyIiwgIm5hbWUiOiAic2JvbS1lbnJpY2hlci1oeWJyaWQiLCAidmVyc2lvbiI6ICIxLjAifSkKCnJlcG8gPSBvcy5lbnZpcm9uLmdldCgiR0lUSFVCX1JFUE9TSVRPUlkiLCAiIikKaWYgcmVwbyBhbmQgIkAiIG5vdCBpbiByZXBvOgogICAgb3duZXIgPSByZXBvLnNwbGl0KCIvIilbMF0gaWYgIi8iIGluIHJlcG8gZWxzZSByZXBvCmVsc2U6CiAgICBvd25lciA9IG9zLmVudmlyb24uZ2V0KCJHSVRIVUJfQUNUT1IiLCAiIikgb3IgIiIKCmlmIG5vdCBtZXRhLmdldCgic3VwcGxpZXIiKToKICAgIG1ldGFbInN1cHBsaWVyIl0gPSB7Im5hbWUiOiBvd25lciBvciAidW5rbm93biJ9CgppZiBub3QgbWV0YS5nZXQoIm1hbnVmYWN0dXJlciIpOgogICAgbWV0YVsibWFudWZhY3R1cmVyIl0gPSB7Im5hbWUiOiBvd25lciBvciAidW5rbm93biJ9Cgpjb21wID0gbWV0YS5zZXRkZWZhdWx0KCJjb21wb25lbnQiLCB7fSkKaWYgbm90IGNvbXAuZ2V0KCJuYW1lIik6CiAgICBjb21wWyJuYW1lIl0gPSByZXBvLnNwbGl0KCIvIilbLTFdIGlmIHJlcG8gZWxzZSBvcy5wYXRoLmJhc2VuYW1lKG9zLmdldGN3ZCgpKQppZiBub3QgY29tcC5nZXQoInZlcnNpb24iKToKICAgIHNoYSA9IG9zLmVudmlyb24uZ2V0KCJHSVRIVUJfU0hBIiwgIiIpCiAgICBpZiBub3Qgc2hhOgogICAgICAgIHRyeToKICAgICAgICAgICAgc2hhID0gc3VicHJvY2Vzcy5jaGVja19vdXRwdXQoWyJnaXQiLCAicmV2LXBhcnNlIiwgIi0tc2hvcnQiLCAiSEVBRCJdLCBjd2Q9Uk9PVCkuZGVjb2RlKCkuc3RyaXAoKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgICAgIHNoYSA9ICIwIgogICAgY29tcFsidmVyc2lvbiJdID0gc2hhCgppZiBub3QgY29tcC5nZXQoInB1cmwiKToKICAgIGNvbXBbInB1cmwiXSA9ICJwa2c6Z2l0aHViLyIgKyAocmVwbyBpZiByZXBvIGVsc2UgY29tcC5nZXQoIm5hbWUiLCJ1bmtub3duIikpICsgIkAiICsgY29tcC5nZXQoInZlcnNpb24iLCIwIikKCmRhdGEuc2V0ZGVmYXVsdCgiY29tcG9uZW50cyIsIFtdKQpkYXRhLnNldGRlZmF1bHQoImRlcGVuZGVuY2llcyIsIFtdKQoKZm9yIGMgaW4gZGF0YS5nZXQoImNvbXBvbmVudHMiLCBbXSk6CiAgICBpZiBub3QgYy5nZXQoInR5cGUiKToKICAgICAgICBjWyJ0eXBlIl0gPSAiZmlsZSIKICAgIGlmIG5vdCBjLmdldCgidmVyc2lvbiIpOgogICAgICAgIGNbInZlcnNpb24iXSA9IGNvbXAuZ2V0KCJ2ZXJzaW9uIiwgIjAiKQoKaWYgbGVuKGRhdGEuZ2V0KCJjb21wb25lbnRzIiwgW10pKSA9PSAwOgogICAgcm9vdF9jb21wID0gewogICAgICAgICJ0eXBlIjogImFwcGxpY2F0aW9uIiwKICAgICAgICAibmFtZSI6IGNvbXAuZ2V0KCJuYW1lIiwgInVua25vd24iKSwKICAgICAgICAidmVyc2lvbiI6IGNvbXAuZ2V0KCJ2ZXJzaW9uIiwgIjAiKSwKICAgICAgICAicHVybCI6IGNvbXAuZ2V0KCJwdXJsIiksCiAgICAgICAgImhhc2hlcyI6IFtdLAogICAgICAgICJsaWNlbnNlcyI6IFt7ImxpY2Vuc2UiOiB7ImlkIjogIk5PQVNTRVJUSU9OIn19XSwKICAgICAgICAicHJvcGVydGllcyI6IFt7Im5hbWUiOiAiZ2VuZXJhdGVkIiwgInZhbHVlIjogInRydWUifV0KICAgIH0KICAgIGRhdGFbImNvbXBvbmVudHMiXS5hcHBlbmQocm9vdF9jb21wKQoKdHJ5OgogICAganNvbi5kdW1wKGRhdGEsIG9wZW4oU0JPTV9QQVRILCAidyIpLCBpbmRlbnQ9MikKICAgIHByaW50KCJOVElBL0JTSSBoeWJyaWQgZW5yaWNobWVudCBkb25lOyBjb21wb25lbnRzOiIsIGxlbihkYXRhLmdldCgiY29tcG9uZW50cyIsIFtdKSkpCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIHByaW50KCJGYWlsZWQgdG8gd3JpdGUgU0JPTToiLCBlLCBmaWxlPXN5cy5zdGRlcnIpCiAgICBzeXMuZXhpdCgxKQo= | base64 --decode > project-src/enrich_ntia_bsi_hybrid.py
-
-
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
+    
 
-
-
-
+      
+      - name: Validate merged SBOM (universal CycloneDX 1.5 validator)
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import sys, json  
+          try:
+              with open("project-src/merged-sbom.json") as f:
+                  data = json.load(f)
+              # Minimal CycloneDX validity checks
+              required_fields = ["bomFormat", "specVersion", "components"]
+              missing = [f for f in required_fields if f not in data]
+              if missing:
+                  print("INVALID_SBOM: Missing fields:", missing, file=sys.stderr)
+                  sys.exit(1)
+              if not isinstance(data.get("components"), list):
+                  print("INVALID_SBOM: components must be an array", file=sys.stderr)
+                  sys.exit(1)
+              # Very basic semantic checks
+              if data["bomFormat"] not in ["CycloneDX"]:
+                  print("INVALID_SBOM: wrong bomFormat", file=sys.stderr)
+                  sys.exit(1)
+              print("SBOM_VALID")
+          except Exception as e:
+              print("SBOM_VALIDATION_ERROR", e)
+              sys.exit(1)
+          PY
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
@@ -769,6 +624,4 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
-
-
 
