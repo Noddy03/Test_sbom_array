@@ -374,8 +374,7 @@ jobs:
               print('flawfinder failed', e)
 
           PY
-          python3 project-src/enrich_and_scan.py 
-          || true
+          python3 project-src/enrich_and_scan.py  || true
 
       - name: Validate merged SBOM (cyclonedx-python-lib friendly)
         run: |
