@@ -258,189 +258,131 @@ jobs:
       - name: Enrich SBOM with file-level components & static analysis (cppcheck + flawfinder)
         run: |
           set -euo pipefail
-          # Create an enrichment script that includes ALL files but avoids hashing huge files
           cat > project-src/enrich_and_scan.py <<'PY'
           import os, json, hashlib, uuid, time, subprocess
 
           ROOT='project-src'
           MAX_FILES=50000
-          MAX_HASH_SIZE=5*1024*1024   
-          MAX_TOTAL_BYTES=1024*1024*1024  # 1 GB total hash budget
+          MAX_HASH_SIZE=5*1024*1024
+          MAX_TOTAL_BYTES=1024*1024*1024
           MAX_DEPTH=10
+          DIR_MAX_FILES=20000
+          DIR_MAX_BYTES=500*1024*1024
+
+          def safe_dir_size_and_count(path):
+              total=0
+              count=0
+              try:
+                  for entry in os.scandir(path):
+                      try:
+                          if entry.is_file(follow_symlinks=False):
+                              count+=1
+                              total+=entry.stat().st_size
+                          elif entry.is_dir(follow_symlinks=False):
+                              count+=1
+                      except:
+                          continue
+              except:
+                  return (0,0)
+              return (count,total)
 
           def is_binary(path):
               try:
-                  with open(path, 'rb') as f:
-                      chunk = f.read(1024)
-                      if b'\0' in chunk:
-                          return True
+                  with open(path,'rb') as f:
+                      chunk=f.read(1024)
+                      return b'\0' in chunk
               except:
                   return False
-              return False
 
           def sha256_file(p):
               h=hashlib.sha256()
               with open(p,'rb') as f:
-                  for chunk in iter(lambda: f.read(8192), b''):
+                  for chunk in iter(lambda:f.read(8192),b''):
                       h.update(chunk)
               return h.hexdigest()
 
-          files = []
-          total_hashed = 0
-          total_hash_bytes = 0
-          skipped_reasons = []
+          files=[]
+          total_hash_bytes=0
 
-          skip_dirs = {'node_modules','vendor','third_party','build','dist','out','data','models','assets','.git','.pio','.cache','.venv'}
-          for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
-              # enforce max depth
-              rel = os.path.relpath(dirpath, ROOT)
-              if rel == '.':
-                  depth = 0
-              else:
-                  depth = rel.count(os.sep) + 1
-              if depth > MAX_DEPTH:
+          for dirpath,dirnames,filenames in os.walk(ROOT,followlinks=False):
+              rel=os.path.relpath(dirpath,ROOT)
+              depth=0 if rel=="." else rel.count(os.sep)+1
+              if depth>MAX_DEPTH:
                   continue
-              # skip known heavy dirs by name
-              if any(part in skip_dirs for part in dirpath.split(os.sep)):
+              cnt,sz=safe_dir_size_and_count(dirpath)
+              if cnt>DIR_MAX_FILES or sz>DIR_MAX_BYTES:
                   continue
               for fn in filenames:
-                  full = os.path.join(dirpath, fn)
+                  full=os.path.join(dirpath,fn)
                   try:
-                      size = os.path.getsize(full)
-                  except Exception:
+                      size=os.path.getsize(full)
+                  except:
                       continue
-                  entry = {'path': os.path.relpath(full, ROOT), 'size': size}
-                  # decide whether to hash
-                  if size <= MAX_HASH_SIZE and not is_binary(full):
-                      if total_hash_bytes + size <= MAX_TOTAL_BYTES and len([f for f in files if 'sha256' in f]) < MAX_FILES:
-                          try:
-                              entry['sha256'] = sha256_file(full)
-                              total_hash_bytes += size
-                              total_hashed += 1
-                          except Exception:
-                              entry['sha256'] = None
-                      else:
-                          entry['sha256'] = None
-                          skipped_reasons.append(('budget', entry['path']))
+                  entry={'path':os.path.relpath(full,ROOT),'size':size}
+                  if size<=MAX_HASH_SIZE and total_hash_bytes+size<=MAX_TOTAL_BYTES and not is_binary(full):
+                      try:
+                          entry['sha256']=sha256_file(full)
+                          total_hash_bytes+=size
+                      except:
+                          entry['sha256']=None
                   else:
-                      entry['sha256'] = None
-                      skipped_reasons.append(('large_or_binary', entry['path']))
+                      entry['sha256']=None
                   files.append(entry)
-                  if len(files) >= MAX_FILES:
+                  if len(files)>=MAX_FILES:
                       break
-              if len(files) >= MAX_FILES:
+              if len(files)>=MAX_FILES:
                   break
 
-          # load existing merged sbom
           try:
-              data = json.load(open(os.path.join(ROOT, 'merged-sbom.json')))
-          except Exception:
-              data = {'components': []}
+              data=json.load(open(os.path.join(ROOT,'merged-sbom.json')))
+          except:
+              data={'components':[]}
 
-          # determine repo metadata
           try:
-              sha = subprocess.check_output(['git','rev-parse','--short','HEAD'], cwd=ROOT).decode().strip()
-          except Exception:
-              sha = '0'
-          owner_repo = os.environ.get('GITHUB_REPOSITORY','')
-          if not owner_repo:
-              try:
-                  remote = subprocess.check_output(['git','config','--get','remote.origin.url'], cwd=ROOT).decode().strip()
-                  if remote.endswith('.git'):
-                      remote = remote[:-4]
-                  if remote.startswith('git@github.com:'):
-                      owner_repo = remote.split(':',1)[1]
-                  elif 'github.com/' in remote:
-                      owner_repo = remote.split('github.com/',1)[1]
-              except Exception:
-                  owner_repo = ''
-          name = owner_repo.split('/')[-1] if owner_repo else os.path.basename(os.getcwd())
-          version = sha
+              sha=subprocess.check_output(['git','rev-parse','--short','HEAD'],cwd=ROOT).decode().strip()
+          except:
+              sha='0'
+          owner_repo=os.environ.get('GITHUB_REPOSITORY','')
+          name=owner_repo.split('/')[-1] if owner_repo else 'repo'
+          version=sha
 
-          existing = {(c.get('name'), c.get('version')) for c in data.get('components', [])}
+          existing={(c.get('name'),c.get('version')) for c in data.get('components',[])}
 
           for f in files:
-              nm = f['path']
-              key = (nm, version)
+              key=(f['path'],version)
               if key in existing:
                   continue
-              comp = {
-                'type': 'file',
-                'name': nm,
-                'version': version,
-                'purl': 'pkg:github/' + (owner_repo if owner_repo else name) + '@' + version,
-                'externalReferences': [{'type': 'vcs', 'url': 'https://github.com/' + (owner_repo if owner_repo else name)}],
-                'properties': [{'name': 'size', 'value': str(f['size'])}]
-              }
+              comp={'type':'file','name':f['path'],'version':version,
+                    'purl':'pkg:github/'+(owner_repo if owner_repo else name)+'@'+version,
+                    'properties':[{'name':'size','value':str(f['size'])}]}
               if f.get('sha256'):
-                  comp['hashes'] = [{'alg': 'SHA-256', 'content': f['sha256']}]
-              # mark large files
-              if f['size'] > MAX_HASH_SIZE:
-                  comp.setdefault('properties', []).append({'name':'large-file','value':'true'})
-              data.setdefault('components', []).append(comp)
+                  comp['hashes']=[{'alg':'SHA-256','content':f['sha256']}]
+              data.setdefault('components',[]).append(comp)
 
-          data['serialNumber'] = data.get('serialNumber') or 'urn:uuid:' + str(uuid.uuid4())
-          data['metadata'] = data.get('metadata') or {}
-          data['metadata']['timestamp'] = int(time.time())
-          data['metadata']['tools'] = data['metadata'].get('tools', [])
-          data['metadata']['component'] = data['metadata'].get('component', {})
-          data['metadata']['component']['name'] = name
-          data['metadata']['component']['version'] = version
-          data['repo_license'] = data.get('repo_license','NOASSERTION')
+          data['serialNumber']=data.get('serialNumber') or 'urn:uuid:'+str(uuid.uuid4())
+          data['metadata']=data.get('metadata') or {}
+          data['metadata']['timestamp']=int(time.time())
+          data['metadata']['component']={'name':name,'version':version}
 
-          json.dump(data, open(os.path.join(ROOT, 'merged-sbom.json'),'w'), indent=2)
-          print('enriched merged-sbom.json with', len(files), 'file components (Option D)')
-          if skipped_reasons:
-              print('skipped_reasons_sample:', skipped_reasons[:10])
+          json.dump(data,open(os.path.join(ROOT,'merged-sbom.json'),'w'),indent=2)
+          print("Option E enriched", len(files), "files")
 
-          # Safety-guarded static analysis
-          # Only run cppcheck if hashed files count is reasonable
-          try:
-              hashed_count = sum(1 for f in files if f.get('sha256'))
-          except:
-              hashed_count = 0
-          try:
-              if hashed_count <= 5000:
-                  cmd = ['cppcheck','--enable=warning,style,performance,portability,information,missingInclude','--inline-suppr','--xml-version=2', ROOT]
-                  out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+          # static analysis safety guard
+          if len(files)<15000:
+              try:
+                  out=subprocess.run(['cppcheck','--enable=warning,style,performance,portability,information,missingInclude',
+                                      '--inline-suppr','--xml-version=2',ROOT],
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                   open(os.path.join(ROOT,'cppcheck_raw.xml'),'wb').write(out.stderr)
-                  findings = []
-                  try:
-                      import xml.etree.ElementTree as ET
-                      root = ET.fromstring(out.stderr.decode(errors='ignore'))
-                      for error in root.findall('.//error'):
-                          fn = error.get('file') or 'unknown'
-                          msg = error.get('msg') or ''
-                          severity = error.get('severity') or 'info'
-                          findings.append({'id':'cppcheck-'+str(abs(hash(fn+msg)))[:12],'file':fn,'message':msg,'severity':severity})
-                  except Exception:
-                      pass
-                  json.dump(findings, open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
-              else:
-                  print('Skipping cppcheck: hashed_count', hashed_count, 'too large')
-                  json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
-          except Exception as e:
-              print('cppcheck failed', e)
-              json.dump([], open(os.path.join(ROOT,'cppcheck.json'),'w'), indent=2)
-
-          # Run flawfinder (lighter) but guard against huge file lists
-          try:
-              if len(files) <= 20000:
-                  out = subprocess.run(['flawfinder','--quiet','--dataonly', ROOT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-                  findings = []
-                  for line in out.stdout.decode().splitlines():
-                      parts=line.split(':',3)
-                      if len(parts)>=4:
-                          fn,ln,level,msg = parts[0],parts[1],parts[2],parts[3]
-                          findings.append({'id':'flawfinder-'+str(abs(hash(fn+ln+msg)))[:12],'file':fn,'line':ln,'level':level,'message':msg})
-                  json.dump(findings, open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
-              else:
-                  print('Skipping flawfinder: too many files', len(files))
-                  json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
-          except Exception as e:
-              print('flawfinder failed', e)
-              json.dump([], open(os.path.join(ROOT,'flawfinder.json'),'w'), indent=2)
-
+              except Exception as e:
+                  print("cppcheck failed",e)
+              try:
+                  out=subprocess.run(['flawfinder','--quiet','--dataonly',ROOT],stdout=subprocess.PIPE)
+                  open(os.path.join(ROOT,'flawfinder.json'),'w').write(out.stdout.decode())
+              except Exception as e:
+                  print("flawfinder failed",e)
+          else:
+              print("Static analysis skipped due to large repo")
           PY
           python3 project-src/enrich_and_scan.py || true
 
@@ -717,4 +659,5 @@ jobs:
         with:
           name: master_summary
           path: master_summary.csv
+
 
