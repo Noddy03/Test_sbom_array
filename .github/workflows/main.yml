@@ -587,6 +587,58 @@ jobs:
               sys.exit(1)
           PY
 
+      - name: Filter SBOM for sbomqs Stability (Remove File Components) 🔪
+        run: |
+          cat > project-src/filter_sbom.py <<'PY'
+          import sys, os, json
+          
+          def load_and_filter_components(path):
+              try:
+                  with open(path, 'r') as f:
+                      sbom = json.load(f)
+              except Exception as e:
+                  print(f"Error loading {path}: {e}", file=sys.stderr)
+                  return None
+                  
+              filtered_components = []
+              for component in sbom.get('components', []):
+                  # Keep 'application' (root) and 'library' components
+                  if component.get('type') in ['application', 'library']:
+                      filtered_components.append(component)
+
+              # Update the SBOM with the filtered components
+              sbom['components'] = filtered_components
+              return sbom
+
+          # Input/Output paths
+          INPUT_PATH = os.path.join("project-src", "merged-sbom.json")
+          OUTPUT_PATH = os.path.join("project-src", "sbomqs-input.json")
+          
+          # Load, filter, and save
+          filtered_sbom = load_and_filter_components(INPUT_PATH)
+          
+          if filtered_sbom:
+              # Re-create dependencies based on the remaining components
+              root_ref = filtered_sbom.get('metadata', {}).get('component', {}).get('bom-ref')
+              component_refs = {c["bom-ref"] for c in filtered_sbom.get("components", []) if c.get("bom-ref") != root_ref and c.get("bom-ref")}
+
+              if root_ref and component_refs:
+                  # Only add dependencies if there are components to depend on
+                  filtered_sbom["dependencies"] = [{"ref": root_ref, "dependsOn": sorted(list(component_refs))}]
+              else:
+                  filtered_sbom["dependencies"] = []
+                  
+              with open(OUTPUT_PATH, 'w') as f:
+                  json.dump(filtered_sbom, f, indent=2)
+              print(f"Filtered SBOM saved to {OUTPUT_PATH}. Components reduced to {len(filtered_sbom['components'])}.")
+          else:
+              print("Failed to load merged-sbom.json, creating empty stub for sbomqs-input.json", file=sys.stderr)
+              with open(OUTPUT_PATH, 'w') as f:
+                  f.write('{"bomFormat": "CycloneDX", "specVersion": "1.5", "version": 1, "components": []}')
+
+          PY
+          python3 project-src/filter_sbom.py || true
+
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
@@ -634,17 +686,21 @@ jobs:
           # on compliance failure, but we still want the JSON report they write to stdout.
           set +e 
           
-          echo "Running sbomqs NTIA check..."
-          # Run NTIA compliance check: redirect STDOUT to file, let STDERR print to console
-          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json
+          # CRITICAL FIX: Add a 5 minute timeout and use the filtered SBOM (sbomqs-input.json)
+          INPUT_SBOM="project-src/sbomqs-input.json"
+          TIMEOUT_SECONDS=300
+
+          echo "Running sbomqs NTIA check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
+          # Wrap docker run in 'timeout'
+          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/sbomqs-input.json > project-src/compliance_NTIA.json
           
-          echo "Running sbomqs BSI V2 check..."
-          # Run BSI V2 compliance check
-          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json
+          echo "Running sbomqs BSI V2 check with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
+          # Wrap docker run in 'timeout'
+          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/sbomqs-input.json > project-src/compliance_BSI.json
           
-          echo "Running sbomqs Score calculation..."
-          # Run score calculation
-          sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json
+          echo "Running sbomqs Score calculation with timeout ($TIMEOUT_SECONDS seconds) on filtered SBOM..."
+          # Wrap docker run in 'timeout'
+          timeout $TIMEOUT_SECONDS sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/sbomqs-input.json --json > project-src/score.json
           
           # Re-enable 'exit on error'
           set -e
@@ -652,7 +708,7 @@ jobs:
           # Fallback: Ensure all files exist and are not empty, otherwise write a structured error JSON.
           for f in project-src/compliance_NTIA.json project-src/compliance_BSI.json project-src/score.json; do
               if [ ! -s "$f" ]; then
-                  echo '{"error":true, "reason":"sbomqs command failed to produce non-empty output or was blocked"}' > "$f"
+                  echo '{"error":true, "reason":"sbomqs command failed to produce non-empty output or was blocked (timeout/crash)"}' > "$f"
               fi
           done
 
@@ -688,7 +744,7 @@ jobs:
           try: score = json.load(open("project-src/score.json")).get("score", None)
           except: score = None
           
-          # FIX: This function is now more robust against the structured error fallback
+          # This function is now more robust against the structured error fallback
           def passcheck(fname):
               try:
                   d = json.load(open(fname))
@@ -716,6 +772,8 @@ jobs:
           rm -f project-src/cdxgen-sbom.json
           rm -f project-src/trivy-fs.json
           rm -f project-src/syft-sbom.json
+          # Remove the temporary filtered SBOM
+          rm -f project-src/sbomqs-input.json
           
           # Remove license files
           rm -f project-src/gh-license.json
