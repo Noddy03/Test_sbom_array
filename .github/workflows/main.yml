@@ -69,6 +69,7 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl wget python3-pip gnupg lsb-release rpm nodejs npm git ca-certificates build-essential cmake pkg-config cppcheck flawfinder
+          # Ensure cyclonedx-python-lib is installed for validation
           pip3 install --upgrade pip
           pip3 install cyclonedx-bom cyclonedx-python-lib pandas sbomqs || true
       - name: Ensure Docker usable (best-effort)
@@ -456,8 +457,8 @@ jobs:
           PY
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
-      - name: Validate merged SBOM against CycloneDX Schema ⚠️
-        # CRITICAL FIX: Explicit schema validation to diagnose why 'sbomqs' fails with {"error":true}.
+      - name: Validate merged SBOM against CycloneDX Schema ⚠️ (FIXED)
+        # CRITICAL FIX: Changed 'validate_string' to 'validate_json' to resolve method not found error.
         run: |
           set -euo pipefail
           python3 <<'PY'
@@ -466,18 +467,20 @@ jobs:
           from cyclonedx.validation.json import JsonStrictValidator
 
           try:
-              with open(os.path.join("project-src", "merged-sbom.json"), 'r') as f:
+              sbom_path = os.path.join("project-src", "merged-sbom.json")
+              with open(sbom_path, 'r') as f:
                   bom_data = json.load(f)
 
               schema_version = SchemaVersion.V1_5
               validator = JsonStrictValidator(schema_version)
-              validation_errors = list(validator.validate_string(json.dumps(bom_data)))
+              
+              # FIX: Use validate_json instead of validate_string
+              validation_errors = list(validator.validate_json(bom_data))
 
               if validation_errors:
                   print("\nSBOM FAILED SCHEMA VALIDATION ❌", file=sys.stderr)
                   for error in validation_errors:
                       print(f"  - {error.message} (Path: {error.json_path})", file=sys.stderr)
-                  # Fail the step if validation fails
                   sys.exit(1)
               else:
                   print("\nSBOM PASSED SCHEMA VALIDATION ✅")
@@ -485,6 +488,7 @@ jobs:
           
           except Exception as e:
               print(f"FATAL VALIDATION ERROR: {e}", file=sys.stderr)
+              # If the validation step itself fails, it's a critical error.
               sys.exit(1)
           PY
 
@@ -531,6 +535,7 @@ jobs:
 
       - name: NTIA/BSI Compliance Checks
         run: |
+          # The SBOM should now pass schema validation, allowing sbomqs to proceed beyond the initial error check.
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --ntia --format json /sbom/merged-sbom.json > project-src/compliance_NTIA.json) || echo '{"error":true}' > project-src/compliance_NTIA.json
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs compliance --bsi-v2 --format json /sbom/merged-sbom.json > project-src/compliance_BSI.json) || echo '{"error":true}' > project-src/compliance_BSI.json
           (sudo docker run --rm -v "$PWD"/project-src:/sbom ghcr.io/interlynk-io/sbomqs score /sbom/merged-sbom.json --json > project-src/score.json) || echo '{"error":true}' > project-src/score.json
@@ -570,6 +575,7 @@ jobs:
           def passcheck(fname):
               try:
                   d = json.load(open(fname))
+                  # Check if the result array exists and pass is explicitly true
                   return 'true' if 'results' in d and isinstance(d['results'], list) and any(res.get('pass') == True for res in d['results']) else 'false'
               except:
                   return 'false'
