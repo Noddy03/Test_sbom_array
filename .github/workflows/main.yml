@@ -479,21 +479,23 @@ jobs:
           python3 project-src/enrich_ntia_bsi_hybrid.py || true
 
 
-      - name: Validate merged SBOM (cyclonedx-python-lib)
+      - name: Validate merged SBOM (cyclonedx-python-lib friendly)
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python3 <<'PY'
+          import json, sys
+          from cyclonedx.parser import build_parser
+
           try:
-              from cyclonedx.parser import build_parser
-              import json,sys
-              data=json.load(open("project-src/merged-sbom.json"))
-              # quick sanity checks
+              data = json.load(open("project-src/merged-sbom.json"))
               if "bomFormat" not in data or "components" not in data:
-                  print("INVALID_SBOM", file=sys.stderr); sys.exit(1)
+                  print("INVALID_SBOM", file=sys.stderr)
+                  sys.exit(1)
               print("SBOM_VALID")
           except Exception as e:
               print("SBOM_VALIDATION_ERROR", e)
-          PY 
+          PY
+
       - name: Trivy SBOM vulnerability scan (full check libraries + os)
         run: |
           set -euo pipefail
