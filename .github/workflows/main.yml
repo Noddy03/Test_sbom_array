@@ -185,67 +185,80 @@ jobs:
               echo '{"components":[]}' > "$f"
             fi
           done
-      - name: Merge SBOMs (preserve component licenses, write repo_license, add metadata)
+      - name: Merge SBOMs correctly
         run: |
           python3 <<'PY'
           import json, os, uuid, time
+
           def load(p):
               try:
                   return json.load(open(p))
               except:
                   return {"components": []}
+
           cdx = load("project-src/cdxgen-sbom.json")
           trivy = load("project-src/trivy-fs.json")
           syft = load("project-src/syft-sbom.json")
           conan = load("project-src/conan-sbom.json")
+
           merged = []
           seen = set()
+
           def key_of(c):
               return (c.get("name"), c.get("version"))
+
           for comp in cdx.get("components", []) or []:
               k = key_of(comp)
               merged.append(comp)
               seen.add(k)
+
           def add_if_new_or_enrich(src_list):
               for c in src_list or []:
                   k = key_of(c)
                   if k in seen:
                       for m in merged:
                           if key_of(m) == k:
-                              for kf in ["supplier","purl","hashes","externalReferences","evidence","type","properties","copyright","licenses"]:
+                              for kf in ["supplier","purl","hashes","externalReferences",
+                                         "evidence","type","properties","copyright","licenses"]:
                                   if not m.get(kf) and c.get(kf):
-                                      m[kf] = c.get(kf)
+                                      m[kf] = c[kf]
                               break
                   else:
                       merged.append(c)
                       seen.add(k)
+
           add_if_new_or_enrich(trivy.get("components", []))
           add_if_new_or_enrich(syft.get("components", []))
           add_if_new_or_enrich(conan.get("components", []))
+
           repo_license = ""
           if os.path.exists("project-src/final_license.txt"):
               repo_license = open("project-src/final_license.txt").read().strip()
+
           if not repo_license:
               try:
                   gh = json.load(open("project-src/gh-license.json"))
                   repo_license = gh.get("license", {}).get("spdx_id", "") or "NOASSERTION"
               except:
                   repo_license = "NOASSERTION"
-          metadata = {
-              "timestamp": int(time.time()),
-              "tools": [{"vendor":"custom","name":"iot-sbom-pipeline","version":"1.0"}]
-          }
+
           out = {
               "bomFormat":"CycloneDX",
               "specVersion":"1.5",
               "serialNumber":"urn:uuid:"+str(uuid.uuid4()),
               "version":1,
-              "metadata":{"tools": metadata["tools"], "component": {"type":"application","name": os.path.basename(os.getcwd())}},
+              "metadata":{
+                  "tools":[{"vendor":"custom","name":"iot-sbom-pipeline","version":"1.0"}],
+                  "component":{"type":"application","name": os.path.basename(os.getcwd())}
+              },
               "repo_license": repo_license,
               "components": merged
           }
+
           json.dump(out, open("project-src/merged-sbom.json","w"), indent=2)
-          PY      
+          PY
+
+    
       - name: Enrich SBOM with file-level components (Option F)
         run: |
           set -euo pipefail
