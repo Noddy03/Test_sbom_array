@@ -84,7 +84,7 @@ jobs:
           echo "Discovered repositories: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
-<hr>
+          <hr>
 
   # ----------------------------------------------------
   # JOB 1: SBOM SCAN (Parallel Matrix)
