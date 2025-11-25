@@ -717,7 +717,7 @@ jobs:
             project-src/flawfinder_raw.txt
           retention-days: 7
 
-          <hr>
+            <hr>
 
   # ----------------------------------------------------
   # JOB 2: AGGREGATE RESULTS
