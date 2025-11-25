@@ -1,4 +1,4 @@
-name: 🐙 High-Quality Multi-Repository SBOM Harvester
+name: 🐙 High-Quality Multi-Repository SBOM Harvester (Corrected)
 
 on:
   workflow_dispatch:
@@ -14,14 +14,40 @@ on:
 
 jobs:
   # ----------------------------------------------------
+  # JOB 0: SETUP MATRIX (Fixes the 'replace' error)
+  # ----------------------------------------------------
+  setup_matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      repo_list: ${{ steps.prepare.outputs.repo_list }}
+    steps:
+      - name: 📝 Prepare Repository List JSON
+        id: prepare
+        run: |
+          # Use shell scripting to safely convert the comma-separated string into a JSON array string.
+          REPO_STRING="${{ github.event.inputs.target_repos }}"
+          
+          # 1. Remove whitespace
+          CLEAN_STRING=$(echo "$REPO_STRING" | tr -d '[:space:]')
+          
+          # 2. Convert to JSON array format: "repo1,repo2" -> ["repo1","repo2"]
+          JSON_ARRAY=$(echo "$CLEAN_STRING" | sed 's/,/","/g' | sed 's/^/["/' | sed 's/$/"]/')
+          
+          echo "Repository list prepared: $JSON_ARRAY"
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
+  # ----------------------------------------------------
   # JOB 1: HARVEST AND SCAN REPOSITORIES (Parallel Matrix)
   # ----------------------------------------------------
   harvest_repos:
     runs-on: ubuntu-latest
+    # DEPENDS on setup_matrix and uses its output to define the matrix
+    needs: setup_matrix
     strategy:
       fail-fast: false 
       matrix:
-        repository: ${{ fromJson(format('["{0}"]', replace(github.event.inputs.target_repos, ',', '","'))) }}
+        # Now safely consume the JSON array output from the previous job
+        repository: ${{ fromJson(needs.setup_matrix.outputs.repo_list) }}
     
     steps:
       - name: ⬇️ Checkout Target Repository (${{ matrix.repository }})
@@ -29,7 +55,7 @@ jobs:
         with:
           repository: ${{ matrix.repository }}
           token: ${{ secrets.GITHUB_TOKEN }} 
-          path: repo-source # Checkout into a dedicated sub-directory
+          path: repo-source
 
       - name: 🐍 Setup Python for Deep Scans & Merge Script
         uses: actions/setup-python@v5
@@ -44,7 +70,6 @@ jobs:
       # ----------------------------------------------------
       # 1. ENRICHMENT SCANNER (Syft)
       # ----------------------------------------------------
-      # Syft (Enrichment): Provides OS and filesystem components to enrich the final SBOM.
       - name: 📦 Generate SBOM with Syft (Enrichment)
         uses: anchore/syft-action/source@v0.19.0
         with:
@@ -55,8 +80,7 @@ jobs:
       # ----------------------------------------------------
       # 2. PRIMARY SBOM MAKERS (CDXGen Primary, Conan Optional)
       # ----------------------------------------------------
-      # CDXGen (Primary SBOM Maker)
-      - name: ⚙️ Conditional Deep Scan (CDXGen)
+      - name: ⚙️ Conditional Deep Scan (CDXGen Primary)
         id: cdxgen_scan
         if: |
           github.event.inputs.language != '' && 
@@ -72,15 +96,14 @@ jobs:
           echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
         continue-on-error: true
 
-      # Conan (Optional SBOM Maker for C/C++)
-      - name: ⚙️ Conditional C/C++ Deep Scan (Conan)
+      - name: ⚙️ Conditional C/C++ Deep Scan (Conan Optional)
         id: conan_scan
         if: |
           startsWith(github.event.inputs.language, 'C') ||
           startsWith(github.event.inputs.language, 'c')
         run: |
           CONAN_FILE="conan-sbom.json"
-          pip install conan # Install Conan only when needed
+          pip install conan 
           cdxgen -o "$CONAN_FILE" --type cpp ./repo-source
           echo "CONAN_OUTPUT_FILE=$CONAN_FILE" >> $GITHUB_ENV
           echo "sbom_file_exists=true" >> $GITHUB_OUTPUT
@@ -97,83 +120,86 @@ jobs:
           CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }}
         run: |
           cat << 'EOF' > merged_and_enrich.py
-          import json
-          import re
-          import os
-          from datetime import datetime
+import json
+import re
+import os
+from datetime import datetime
 
-          def normalize_component(component, default_supplier):
-              # CRITICAL: Ensures NTIA compliance by setting a Supplier if missing
-              purl = component.get("purl", "")
-              supplier_name = ""
-              existing_supplier = component.get("supplier", {}).get("name", "")    
-              # 1. Infer supplier from PURL if needed
-              if not existing_supplier and purl:
-                  purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
-                  if purl_match:
-                      pkg_type = purl_match.group(1)
-                      namespace = purl_match.group(2)
+def normalize_component(component, default_supplier):
+    # CRITICAL: Ensures NTIA compliance by setting a Supplier if missing
+    purl = component.get("purl", "")
+    supplier_name = ""
+    existing_supplier = component.get("supplier", {}).get("name", "")
+    
+    if not existing_supplier and purl:
+        purl_match = re.match(r"pkg:(\w+)/([\w\-\.]+)/?([^@\?#]*)", purl)
+        if purl_match:
+            pkg_type = purl_match.group(1)
+            namespace = purl_match.group(2)
             
-                      supplier_map = {
-                          "maven": "Maven Central Repository",
-                          "pypi": "Python Software Foundation",
-                          "npm": "npm, Inc.",
-                      }
-                      supplier_name = supplier_map.get(pkg_type, namespace)
+            supplier_map = {
+                "maven": "Maven Central Repository",
+                "pypi": "Python Software Foundation",
+                "npm": "npm, Inc.",
+            }
+            supplier_name = supplier_map.get(pkg_type, namespace)
             
-              if supplier_name:
-                  component["supplier"] = {"name": supplier_name}
-              elif not component.get("supplier"):
-                  component["supplier"] = {"name": default_supplier}        
-              return component
+    if supplier_name:
+        component["supplier"] = {"name": supplier_name}
+    elif not component.get("supplier"):
+        component["supplier"] = {"name": default_supplier}
+        
+    return component
 
-          def merge_and_enrich(files, default_supplier):
-              sboms = []
-              for f in files:
-                  if os.path.exists(f):
-                      with open(f, 'r') as fp:
-                          try:
-                              sboms.append(json.load(fp))
-                          except:
-                              print(f"Warning: Failed to load {f}")   
-              if not sboms: return None
-              merged_sbom = sboms[0]    
-              # CRITICAL: Set timestamp and root component supplier
-              merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
-              merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}    
-              component_map = {}
-              for sbom in sboms:
-                  if 'components' in sbom:
-                      for c in sbom['components']:
-                          # Deduplication logic (name/version/purl)
-                          ref = c.get("purl", c.get("name") + c.get("version", ""))
-                          if ref and ref not in component_map:
-                              component_map[ref] = c
+def merge_and_enrich(files, default_supplier):
+    sboms = []
+    for f in files:
+        if os.path.exists(f):
+            with open(f, 'r') as fp:
+                try:
+                    sboms.append(json.load(fp))
+                except:
+                    print(f"Warning: Failed to load {f}")
+    
+    if not sboms: return None
+    merged_sbom = sboms[0]
+    
+    merged_sbom['metadata']['timestamp'] = datetime.now().isoformat() + 'Z'
+    merged_sbom['metadata']['component']['supplier'] = {"name": default_supplier}
+    
+    component_map = {}
+    for sbom in sboms:
+        if 'components' in sbom:
+            for c in sbom['components']:
+                ref = c.get("purl", c.get("name") + c.get("version", ""))
+                if ref and ref not in component_map:
+                    component_map[ref] = c
 
-              final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
-              merged_sbom['components'] = final_components    
-              return merged_sbom
+    final_components = [normalize_component(c, default_supplier) for c in component_map.values()]
+    merged_sbom['components'] = final_components
+    
+    return merged_sbom
 
-          if __name__ == "__main__":
-              # Collect Syft (Enrichment) and CDXGen/Conan (Primary Makers)
-              SBOM_FILES = ["syft-sbom.json"]
-              if os.environ.get("CDXGEN_FILE"): SBOM_FILES.append(os.environ["CDXGEN_FILE"])
-              if os.environ.get("CONAN_FILE"): SBOM_FILES.append(os.environ["CONAN_FILE"])        
-              merged_data = merge_and_enrich(SBOM_FILES, os.environ.get("REPO_NAME"))
+if __name__ == "__main__":
+    SBOM_FILES = ["syft-sbom.json"]
+    if os.environ.get("CDXGEN_FILE"): SBOM_FILES.append(os.environ["CDXGEN_FILE"])
+    if os.environ.get("CONAN_FILE"): SBOM_FILES.append(os.environ["CONAN_FILE"])
+        
+    merged_data = merge_and_enrich(SBOM_FILES, os.environ.get("REPO_NAME"))
 
-              if merged_data:
-                  with open('merged-sbom.json', 'w') as f:
-                      json.dump(merged_data, f, indent=2)
-                  print("✅ Successfully generated merged-sbom.json")
-              else:
-                  exit(1)        
-          EOF
-                  python merged_and_enrich.py
+    if merged_data:
+        with open('merged-sbom.json', 'w') as f:
+            json.dump(merged_data, f, indent=2)
+        print("✅ Successfully generated merged-sbom.json")
+    else:
+        exit(1)
+        
+EOF
+        python merged_and_enrich.py
 
       # ----------------------------------------------------
       # 4. PRIMARY ANALYSER (Trivy)
       # ----------------------------------------------------
-      # Trivy (Analysis): Scans the complete, highly enriched merged SBOM.
       - name: 🪱 Scan for Vulnerabilities in Merged SBOM (Trivy Analysis)
         uses: aquasecurity/trivy-action@master
         with:
