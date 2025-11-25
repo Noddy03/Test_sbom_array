@@ -53,7 +53,7 @@ jobs:
         npm install -g @cyclonedx/cdxgen
 
     # CDXGen (Main Deep Scanner)
-    - name: ⚙️ Optional Deep Scan (CDXGen ${{ github.event.inputs.language }})
+    - name: ⚙️ Optional Deep Scan (CDXGen: ${{ github.event.inputs.language }})
       id: cdxgen_scan
       # Run if the input is a standard language (not C/C++ or none)
       if: |
@@ -90,9 +90,7 @@ jobs:
         # Install necessary tools
         pip install conan
         
-        # Run cdxgen against the source directory, which uses Conan's native support 
-        # for generating SBOMs from conanfile.txt or conan.lock files.
-        # This is the most reliable way to integrate Conan and CDXGen outputs.
+        # Run cdxgen against the source directory, leveraging its native support for Conan lockfiles
         # NOTE: This assumes a conanfile or lockfile exists in the root.
         cdxgen -o "$CONAN_FILE" --type cpp
 
@@ -107,14 +105,14 @@ jobs:
     - name: ⚙️ Install Python Dependencies for Merge
       run: pip install jsonpath-ng
 
-    - name: 📝 Create & Run SBOM Merge Script (Supplier/Timestamp Fix)
-      id: merge_and_enrich
-      env:
-        REPO_NAME: ${{ github.repository }}
-        CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
-        CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }} # Collect Conan output
-      run: |
-        cat << 'EOF' > merged_and_enrich.py
+   - name: 📝 Create & Run SBOM Merge Script (Supplier/Timestamp Fix)
+  id: merge_and_enrich
+  env:
+    REPO_NAME: ${{ github.repository }}
+    CDXGEN_FILE: ${{ steps.cdxgen_scan.outputs.sbom_file_exists && env.CDXGEN_OUTPUT_FILE || '' }}
+    CONAN_FILE: ${{ steps.conan_scan.outputs.sbom_file_exists && env.CONAN_OUTPUT_FILE || '' }} # Collect Conan output
+  run: |
+    cat << 'EOF' > merged_and_enrich.py
 import json
 import re
 import os
@@ -233,7 +231,7 @@ if __name__ == "__main__":
         exit(1)
         
 EOF
-        python merged_and_enrich.py
+    python merged_and_enrich.py
 
     # ----------------------------------------------------
     # 4. COMPLIANCE, SCORING, AND VULNERABILITY CHECKS (Trivy as Main Analyser)
