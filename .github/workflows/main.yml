@@ -1,4 +1,4 @@
-name:  Universal SBOM Pipeline (High Quality & Optimized)
+name:  Universal SBOM Pipeline 
 
 on:
   workflow_dispatch:
