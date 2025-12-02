@@ -1,0 +1,100 @@
+name: IoT Fortify Multi-Repo Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      language:
+        description: "Language filter (e.g. C++, Python, Java)"
+        required: true
+        default: "C++"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  fetch_top_repos:
+    runs-on: ubuntu-latest
+    outputs:
+      repo_list: ${{ steps.fetch.outputs.repo_list }}
+    steps:
+      - name: Install jq & gh
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq gh
+      - name: Fetch repositories
+        id: fetch
+        env:
+          LANG: ${{ github.event.inputs.language }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RAW_Q="topic:iot language:$LANG fork:false archived:false"
+          REPOS=$(gh api -X GET /search/repositories \
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=100 \
+              --jq '.items[].full_name' || true)
+          if [ -z "$REPOS" ]; then
+            RAW_Q="language:$LANG fork:false archived:false"
+            REPOS=$(gh api -X GET /search/repositories \
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=100 \
+              --jq '.items[].full_name' || true)
+          fi
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
+  fortify_scan:
+    needs: fetch_top_repos
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
+    steps:
+      - name: Checkout repo
+        run: |
+          git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
+
+      - name: Setup Fortify Environment
+        uses: fortify/github-action@v1
+        with:
+          sast-scan: true
+          debricked-sca-scan: true
+        env:
+          FOD_URL: https://ams.fortify.com
+          FOD_TENANT: ${{ secrets.FOD_TENANT }}
+          FOD_USER: ${{ secrets.FOD_USER }}
+          FOD_PASSWORD: ${{ secrets.FOD_PAT }}
+          # SSC and Debricked tokens (optional)
+          SSC_URL: ${{ vars.SSC_URL }}
+          SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
+          SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
+          DEBRICKED_TOKEN: ${{ secrets.DEBRICKED_TOKEN }}
+          SC_SAST_SENSOR_VERSION: 24.4.0
+
+      - name: Upload repo folder as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.repo }}
+          path: project-src/**
+
+  aggregate_results:
+    needs: fortify_scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_repos
+
+      - name: List scanned repos
+        run: |
+          echo "Repositories scanned:"
+          find all_repos -maxdepth 1 -mindepth 1 -type d
