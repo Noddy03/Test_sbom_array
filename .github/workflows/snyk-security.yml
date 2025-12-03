@@ -1,4 +1,4 @@
-name: IoT Snyk Multi-Repo Scan
+name: IoT Multi-Repo Snyk Scan
 
 on:
   workflow_dispatch:
@@ -14,7 +14,6 @@ permissions:
   actions: read
 
 jobs:
-
   fetch_top_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -33,7 +32,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
@@ -41,7 +39,6 @@ jobs:
             --raw-field order=desc \
             --raw-field per_page=100 \
             --jq '.items[].full_name' || true)
-
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -51,16 +48,13 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
-          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' |
-            jq -R -s -c 'split("\n") | map(select(length > 0))')
-
+          JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
@@ -70,10 +64,8 @@ jobs:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      - name: Checkout repository into workspace
-        run: |
-          rm -rf ./*
-          git clone --depth 1 https://github.com/${{ matrix.repo }} .
+      - name: Checkout repository
+        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
       - name: Set sanitized artifact name
         run: |
@@ -81,21 +73,13 @@ jobs:
           ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
 
-      # ---------------------------
-      # Correct setup + authentication
-      # ---------------------------
       - name: Install Snyk CLI
         uses: snyk/actions/setup@v1
-
-      - name: Authenticate Snyk CLI
-        run: snyk auth "$SNYK_TOKEN"
 
       - name: Create output directory
         run: mkdir -p snyk_reports
 
-      # ---------------------------
       # Snyk Code (SAST)
-      # ---------------------------
       - name: Run Snyk Code (SAST) and generate SARIF
         run: snyk code test --sarif-file-output=snyk_reports/snyk-code.sarif || true
 
@@ -103,48 +87,37 @@ jobs:
         run: |
           FILE="snyk_reports/snyk-code.sarif"
           if [ ! -s "$FILE" ]; then
-            echo "SARIF empty — writing placeholder"
             echo '{"version":"2.1.0","runs":[]}' > "$FILE"
           fi
 
-      # ---------------------------
       # Snyk Open Source (SCA)
-      # ---------------------------
       - name: Run Snyk Open Source (SCA)
         run: snyk monitor --all-projects || true
 
-      # ---------------------------
-      # Snyk IaC
-      # ---------------------------
+      # Snyk IaC scans
       - name: Run Snyk IaC test
         run: snyk iac test --json-file-output=snyk_reports/iac-results.json || true
 
-      # ---------------------------
-      # Snyk Container Scan
-      # ---------------------------
+      # Docker container scan
       - name: Build Docker image (if Dockerfile exists)
         run: |
-          if [ -f Dockerfile ]; then
-            docker build -t project-image .
+          if [ -f project-src/Dockerfile ]; then
+            docker build -t project-image project-src || echo "Docker build skipped/failure"
           fi
 
       - name: Run Snyk Container scan
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
-            snyk container monitor project-image --file=Dockerfile || true
+            snyk container monitor project-image --file=project-src/Dockerfile || true
           fi
 
-      # ---------------------------
       # Upload SARIF to GitHub Security
-      # ---------------------------
       - name: Upload Snyk SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: snyk_reports/snyk-code.sarif
 
-      # ---------------------------
-      # Upload all repo-specific results
-      # ---------------------------
+      # Upload all scan artifacts
       - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -167,4 +140,7 @@ jobs:
       - name: Print list of scanned repositories
         run: |
           echo "Repositories scanned:"
-          find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
+          if [ -d all_repos ]; then
+            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
+          else
+            echo "No artifacts folder found."
