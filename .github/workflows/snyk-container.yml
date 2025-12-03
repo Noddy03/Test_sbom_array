@@ -57,6 +57,8 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
     steps:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
@@ -65,11 +67,8 @@ jobs:
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-      - name: Authenticate Snyk CLI
-        run: snyk auth "$SNYK_TOKEN"
+      # ❌ Remove snyk auth step; token is already in environment
 
       - name: Run Snyk Code (SAST) and generate SARIF
         id: snyk_code
@@ -83,7 +82,7 @@ jobs:
 
       - name: Build Docker image (if Dockerfile + files exist)
         run: |
-          if [ -f project-src/Dockerfile ] && [ -f project-src/apache-bifromq-${BIFROMQ_VERSION}.tar.gz ] && [ -f project-src/apache-bifromq-${BIFROMQ_VERSION}.tar.gz.sha512 ]; then
+          if [ -f project-src/Dockerfile ]; then
               docker build -t project-image project-src
           else
               echo "Skipping Docker build: required files missing"
