@@ -2,19 +2,65 @@ name: Multi-Repo SonarQube
 
 on:
   workflow_dispatch:
+    inputs:
+      language:
+        description: "Language filter (e.g., C++, Python, Java)"
+        required: true
+        default: "C++"
 
 permissions:
   pull-requests: read
   contents: read
 
 jobs:
+
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repos: ${{ steps.out.outputs.repos }}
+      repos: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - id: out
-        run: echo 'repos=["apache/iotdb","eclipse/paho.mqtt.c"]' >> $GITHUB_OUTPUT
+      - name: Install jq & gh
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq gh
+
+      - name: Fetch top repositories by language
+        id: fetch
+        env:
+          LANG: ${{ github.event.inputs.language }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          echo "Searching GitHub for top IoT repos in language: $LANG"
+
+          RAW_Q="topic:iot language:$LANG fork:false archived:false"
+
+          REPOS=$(gh api -X GET /search/repositories \
+              --raw-field q="$RAW_Q" \
+              --raw-field sort=stars \
+              --raw-field order=desc \
+              --raw-field per_page=50 \
+              --jq '.items[].full_name' || true)
+
+          # Fallback: if no IoT repos found, search by language only
+          if [ -z "$REPOS" ]; then
+            RAW_Q="language:$LANG fork:false archived:false"
+
+            REPOS=$(gh api -X GET /search/repositories \
+                --raw-field q="$RAW_Q" \
+                --raw-field sort=stars \
+                --raw-field order=desc \
+                --raw-field per_page=50 \
+                --jq '.items[].full_name' || true)
+          fi
+
+          # Convert to JSON array
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+
+          echo "Repo list: $JSON_ARRAY"
+          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
+
 
   sonar_scan:
     needs: fetch_repos
@@ -26,8 +72,10 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
     steps:
-      - name: Clone the repo
+
+      - name: Clone the repository
         run: |
+          echo "Cloning: ${{ matrix.repo }}"
           git clone https://github.com/${{ matrix.repo }} project
           ls -la project
 
