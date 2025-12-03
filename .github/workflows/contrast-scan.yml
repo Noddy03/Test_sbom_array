@@ -27,7 +27,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -51,8 +50,6 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
-          # Convert REPOS to JSON array safely
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
@@ -108,5 +105,5 @@ jobs:
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo }}-scan
+          name: ${{ matrix.repo.replace('/', '-') }}-scan
           path: project-src/**
