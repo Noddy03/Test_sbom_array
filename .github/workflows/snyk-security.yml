@@ -24,7 +24,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -32,7 +31,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
@@ -40,7 +38,6 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
-
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -50,10 +47,9 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
-          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
+          JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'map(select(length > 0))')
+          echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
 
   snyk_scan:
     needs: fetch_top_repos
@@ -68,51 +64,48 @@ jobs:
       - name: Clone the repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@v1
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
-
-      # --------------------------------------------------------
-      # FIXED: VALID JSON SARIF GENERATION
-      # --------------------------------------------------------
-      - name: Run Snyk Code (SAST)
+      # -------------------------------
+      # Run Snyk Code (SAST) and generate proper SARIF
+      # -------------------------------
+      - name: Run Snyk Code (SAST) and generate SARIF
         run: |
           snyk code test project-src --json > snyk-code.json || true
-          jq '.sarif' snyk-code.json > snyk-code.sarif
+          jq '{version: "2.1.0", runs: [.sarif[]?]}' snyk-code.json > snyk-code.sarif
 
-
+      # Run Snyk Open Source (SCA)
       - name: Run Snyk Open Source (SCA)
         run: snyk monitor project-src --all-projects || true
 
-
+      # Run Snyk IaC tests
       - name: Run Snyk IaC test
         run: snyk iac test project-src --json-file-output=iac-results.json || true
 
-
+      # Build Docker image (if Dockerfile exists)
       - name: Build Docker image (if Dockerfile exists)
         run: |
           if [ -f project-src/Dockerfile ]; then
             docker build -t project-image project-src
           fi
 
-
+      # Run Snyk Container scan
       - name: Run Snyk Container scan
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
             snyk container monitor project-image --file=project-src/Dockerfile || true
           fi
 
-
-      - name: Upload Snyk Code SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
+      # Upload Snyk Code SARIF to GitHub Security
+      - name: Upload Snyk SARIF
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: snyk-code.sarif
 
-
-      # Save all artifacts per repo (useful for auditing)
+      # Save all artifacts per repo
       - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -123,11 +116,13 @@ jobs:
             iac-results.json
             project-src/**
 
-
   aggregate_results:
     needs: snyk_scan
     runs-on: ubuntu-latest
     steps:
+      - name: Create folder for all artifacts
+        run: mkdir -p all_repos
+
       - name: Download all repo artifacts
         uses: actions/download-artifact@v4
         with:
@@ -136,4 +131,8 @@ jobs:
       - name: Print list of scanned repositories
         run: |
           echo "Repositories scanned:"
-          find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n"
+          if [ -d all_repos ]; then
+            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
+          else
+            echo "No artifacts folder found."
+          fi
