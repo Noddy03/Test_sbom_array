@@ -1,4 +1,4 @@
-name: IoT Multi-Repo Snyk Scan
+name: IoT Snyk Multi-Repo Scan
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
     steps:
-      - name: Install dependencies
+      - name: Install jq & gh
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
@@ -32,21 +32,23 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
             --raw-field sort=stars \
             --raw-field order=desc \
-            --raw-field per_page=50 \
+            --raw-field per_page=100 \
             --jq '.items[].full_name' || true)
 
+          # fallback search
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=10 \
+              --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
 
@@ -56,51 +58,74 @@ jobs:
   snyk_scan:
     needs: fetch_top_repos
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+
     env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}   # <- use token in CI
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
+      - name: Checkout repository into workspace
+        run: |
+          rm -rf *
+          git clone --depth 1 https://github.com/${{ matrix.repo }} .
+
+      - name: Set sanitized artifact name
+        run: |
+          ARTIFACT_NAME="${{ matrix.repo }}"
+          ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+
       - name: Install Snyk CLI
         run: npm install -g snyk
 
-      - name: Create reports folder
+      - name: Authenticate Snyk CLI
+        run: snyk auth "${SNYK_TOKEN}"
+
+      - name: Create output directory
         run: mkdir -p snyk_reports
 
-      - name: Clone and scan repositories
+      # ---- Snyk Code (SAST) ----
+      - name: Run Snyk Code (SAST) with SARIF output
         run: |
-          REPOS='${{ needs.fetch_top_repos.outputs.repo_list }}'
-          for repo in $(echo $REPOS | jq -r '.[]'); do
-            echo "Processing $repo..."
-            git clone --depth 1 https://github.com/$repo temp_repo || { echo "Failed to clone $repo"; continue; }
-            cd temp_repo || continue
+          snyk code test --sarif-file-output=snyk_reports/snyk-code.sarif || true
+          snyk code test --json > snyk_reports/snyk-code.json || true
 
-            SAFE_NAME=$(echo $repo | tr '/' '_')
+      # ---- Snyk SCA ----
+      - name: Run Snyk Open Source (SCA)
+        run: snyk monitor --all-projects || true
 
-            # Snyk Code (SAST)
-            snyk test --json > ../snyk_reports/${SAFE_NAME}-snyk.json || echo "SAST scan failed for $repo"
-            jq '{version: "2.1.0", runs: [.sarif[]?]}' ../snyk_reports/${SAFE_NAME}-snyk.json > ../snyk_reports/${SAFE_NAME}-snyk.sarif || true
+      # ---- Snyk IaC ----
+      - name: Run Snyk IaC test
+        run: snyk iac test . --json-file-output=snyk_reports/iac-results.json || true
 
-            # Snyk Open Source (SCA)
-            snyk monitor --all-projects || echo "SCA scan failed for $repo"
+      # ---- Container Scan ----
+      - name: Build Docker image if Dockerfile exists
+        run: |
+          if [ -f Dockerfile ]; then
+            docker build -t project-image .
+          fi
 
-            # Snyk IaC
-            snyk iac test --json-file-output=../snyk_reports/${SAFE_NAME}-iac.json || echo "IaC scan failed for $repo"
+      - name: Run Snyk Container scan
+        run: |
+          if docker image inspect project-image > /dev/null 2>&1; then
+            snyk container monitor project-image --file=Dockerfile || true
+          fi
 
-            # Docker scan if Dockerfile exists
-            if [ -f Dockerfile ]; then
-              docker build -t ${SAFE_NAME}-image . || echo "Docker build failed for $repo"
-              snyk container monitor ${SAFE_NAME}-image --file=Dockerfile || echo "Docker scan failed for $repo"
-            fi
+      # ---- Upload SARIF ----
+      - name: Upload SAST SARIF to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: snyk_reports/snyk-code.sarif
 
-            cd ..
-            rm -rf temp_repo
-          done
-
+      # ---- Upload All Repo Artifacts ----
       - name: Upload scan artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: snyk-scan-results
-          path: snyk_reports/**
+          name: ${{ env.ARTIFACT_NAME }}-scan-results
+          path: snyk_reports
 
   aggregate_results:
     needs: snyk_scan
@@ -114,11 +139,11 @@ jobs:
         with:
           path: all_repos
 
-      - name: List scanned repositories
+      - name: Print list of scanned repositories
         run: |
           echo "Repositories scanned:"
           if [ -d all_repos ]; then
-            find all_repos -maxdepth 1 -mindepth 1 -type f -printf "%f\n"
+            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
           else
-            echo "No artifacts found."
+            echo "No artifacts folder found."
           fi
