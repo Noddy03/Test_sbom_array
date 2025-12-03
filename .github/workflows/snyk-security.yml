@@ -39,7 +39,6 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
-
           # Fallback if none found
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
@@ -50,8 +49,7 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
-          # Build proper JSON array for matrix
+          # Build JSON array for matrix
           JSON_ARRAY=$(echo "$REPOS" | tr -d '"' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
@@ -65,8 +63,10 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-      - name: Clone the repository
-        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
+      - name: Checkout repository into workspace
+        run: |
+          rm -rf *
+          git clone --depth 1 https://github.com/${{ matrix.repo }} .
 
       - name: Set sanitized artifact name
         run: |
@@ -81,25 +81,25 @@ jobs:
 
       - name: Run Snyk Code (SAST) and generate SARIF
         run: |
-          snyk code test project-src --json > snyk-code.json || true
+          snyk code test . --json > snyk-code.json || true
           jq '{version: "2.1.0", runs: [.sarif[]?]}' snyk-code.json > snyk-code.sarif
 
       - name: Run Snyk Open Source (SCA)
-        run: snyk monitor project-src --all-projects || true
+        run: snyk monitor . --all-projects || true
 
       - name: Run Snyk IaC test
-        run: snyk iac test project-src --json-file-output=iac-results.json || true
+        run: snyk iac test . --json-file-output=iac-results.json || true
 
       - name: Build Docker image (if Dockerfile exists)
         run: |
-          if [ -f project-src/Dockerfile ]; then
-            docker build -t project-image project-src
+          if [ -f Dockerfile ]; then
+            docker build -t project-image .
           fi
 
       - name: Run Snyk Container scan
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
-            snyk container monitor project-image --file=project-src/Dockerfile || true
+            snyk container monitor project-image --file=Dockerfile || true
           fi
 
       - name: Upload Snyk SARIF to GitHub Security
@@ -115,7 +115,6 @@ jobs:
             snyk-code.json
             snyk-code.sarif
             iac-results.json
-            project-src/**
 
   aggregate_results:
     needs: snyk_scan
