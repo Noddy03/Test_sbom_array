@@ -58,19 +58,18 @@ jobs:
         run: |
           echo "Cloning repo: ${{ matrix.repo }}"
           git clone --depth 1 https://github.com/${{ matrix.repo }} project || true
-        continue-on-error: true
 
-      - name: List files in project folder
+      - name: Check if project folder exists
+        id: check_project
         run: |
           if [ -d project ]; then
-            ls -la project
+            echo "exists=true" >> $GITHUB_OUTPUT
           else
-            echo "Repo ${{ matrix.repo }} failed to clone, skipping..."
-            exit 0
+            echo "exists=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Run SonarQube Scan
-        if: ${{ always() && (steps.clone.outcome != 'failure') && (fromJSON(needs.fetch_repos.outputs.repos) != '[]') && ( -d 'project') }}
+        if: ${{ steps.check_project.outputs.exists == 'true' }}
         uses: SonarSource/sonarqube-scan-action@v1.1.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -83,7 +82,7 @@ jobs:
             -Dsonar.projectBaseDir=project
 
       - name: Upload scanned repo as artifact
-        if: ${{ always() && ( -d 'project') }}
+        if: ${{ steps.check_project.outputs.exists == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.repo }}
