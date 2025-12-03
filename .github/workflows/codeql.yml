@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Primary CodeQL language to scan (e.g., python, cpp, javascript)"
+        description: "Primary CodeQL language to scan (e.g., python, cpp, java)"
         required: true
         default: "python"
 
@@ -57,7 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -68,22 +67,36 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          # Use input language or scan multiple by default
           languages: ${{ github.event.inputs.language }}
 
-      - name: Build C/C++ project (if applicable)
+      # --------------------------
+      # Language-specific builds
+      # --------------------------
+      - name: Build C/C++ project
         if: ${{ github.event.inputs.language == 'cpp' }}
         run: |
           cd project-src
           if [ -f CMakeLists.txt ]; then
             mkdir -p build && cd build
             cmake .. || echo "CMake failed; skipping"
-            make || echo "Build failed; skipping"
+            make || echo "Make failed; skipping"
           elif [ -f Makefile ]; then
             make || echo "Make failed; skipping"
           else
-            echo "No recognized build system; skipping C/C++ build"
-          fi
+            echo "No C/C++ build system found; skipping"
+
+      - name: Build Java project
+        if: ${{ github.event.inputs.language == 'java' }}
+        run: |
+          cd project-src
+          if [ -f pom.xml ]; then
+            mvn -B package || echo "Maven build failed; skipping"
+          elif [ -f build.gradle ]; then
+            ./gradlew build || echo "Gradle build failed; skipping"
+          else
+            echo "No Java build system found; skipping"
+
+      # Python projects usually don't need a build
 
       - name: Analyze with CodeQL
         uses: github/codeql-action/analyze@v4
@@ -91,7 +104,7 @@ jobs:
       - name: Set sanitized artifact name
         run: |
           ARTIFACT_NAME="${{ matrix.repo }}"
-          ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"   # Replace '/' with '_'
+          ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"
           echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
 
       - name: Upload scanned repository artifacts
