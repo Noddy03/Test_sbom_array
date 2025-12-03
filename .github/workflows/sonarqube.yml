@@ -11,72 +11,50 @@ on:
 permissions:
   pull-requests: read
   contents: read
+  security-events: write
 
 jobs:
-
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repos: ${{ steps.fetch.outputs.repo_list }}
+      repos: ${{ steps.out.outputs.repos }}
     steps:
       - name: Install jq & gh
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
-      - name: Fetch top repositories by language
-        id: fetch
-        env:
-          LANG: ${{ github.event.inputs.language }}
-          GH_TOKEN: ${{ github.token }}
+      - id: out
         run: |
-          set -euo pipefail
-
-          echo "Searching GitHub for top IoT repos in language: $LANG"
-
-          RAW_Q="topic:iot language:$LANG fork:false archived:false"
-
+          LANG=${{ github.event.inputs.language }}
           REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
+            --raw-field q="topic:iot language:$LANG fork:false archived:false" \
+            --raw-field sort=stars \
+            --raw-field order=desc \
+            --raw-field per_page=100 \
+            --jq '.items[].full_name' || true)
+          if [ -z "$REPOS" ]; then
+            REPOS=$(gh api -X GET /search/repositories \
+              --raw-field q="language:$LANG fork:false archived:false" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=50 \
+              --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
-
-          # Fallback: if no IoT repos found, search by language only
-          if [ -z "$REPOS" ]; then
-            RAW_Q="language:$LANG fork:false archived:false"
-
-            REPOS=$(gh api -X GET /search/repositories \
-                --raw-field q="$RAW_Q" \
-                --raw-field sort=stars \
-                --raw-field order=desc \
-                --raw-field per_page=50 \
-                --jq '.items[].full_name' || true)
           fi
-
-          # Convert to JSON array
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-
-          echo "Repo list: $JSON_ARRAY"
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
+          echo "repos=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   sonar_scan:
     needs: fetch_repos
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
     steps:
-
       - name: Clone the repository
         run: |
-          echo "Cloning: ${{ matrix.repo }}"
-          git clone https://github.com/${{ matrix.repo }} project
+          git clone --depth 1 https://github.com/${{ matrix.repo }} project
           ls -la project
 
       - name: Run SonarQube Scan
@@ -90,3 +68,23 @@ jobs:
             -Dsonar.projectKey=${{ matrix.repo }}
             -Dsonar.sources=project
             -Dsonar.projectBaseDir=project
+
+      - name: Upload scanned repo as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.repo }}
+          path: project/**
+
+  aggregate_results:
+    needs: sonar_scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_repos
+
+      - name: List all scanned repositories
+        run: |
+          echo "Repositories scanned:"
+          find all_repos -maxdepth 1 -mindepth 1 -type d
