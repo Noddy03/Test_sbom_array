@@ -22,7 +22,7 @@ jobs:
       - name: Install jq & gh
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y jq gh
+          sudo apt-get install -y jq gh git
       - name: Fetch repositories
         id: fetch
         env:
@@ -35,7 +35,7 @@ jobs:
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=100 \
+              --raw-field per_page=50 \
               --jq '.items[].full_name' || true)
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
@@ -43,9 +43,10 @@ jobs:
               --raw-field q="$RAW_Q" \
               --raw-field sort=stars \
               --raw-field order=desc \
-              --raw-field per_page=100 \
+              --raw-field per_page=10 \
               --jq '.items[].full_name' || true)
           fi
+          # Convert to JSON array
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -62,17 +63,18 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Setup Fortify Environment
+      - name: Setup Fortify Environment and Scan
         uses: fortify/github-action@v1
         with:
           sast-scan: true
           debricked-sca-scan: true
         env:
-          FOD_URL: https://ams.fortify.com
+          # Use client credentials login (recommended)
+          FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
+          FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
           FOD_TENANT: ${{ secrets.FOD_TENANT }}
-          FOD_USER: ${{ secrets.FOD_USER }}
-          FOD_PASSWORD: ${{ secrets.FOD_PAT }}
-          # SSC and Debricked tokens (optional)
+
+          # Optional: SSC and Debricked tokens
           SSC_URL: ${{ vars.SSC_URL }}
           SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
           SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
