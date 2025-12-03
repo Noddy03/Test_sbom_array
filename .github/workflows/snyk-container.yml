@@ -23,7 +23,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -38,7 +37,6 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
-
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -48,7 +46,6 @@ jobs:
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
           fi
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "Repos fetched: $JSON_ARRAY"
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
@@ -60,7 +57,6 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
-
     steps:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
@@ -68,9 +64,12 @@ jobs:
       - name: Set up Snyk CLI
         uses: snyk/actions/setup@v1
         with:
-          version: "latest"
+          snyk-version: "latest"
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: Authenticate Snyk CLI
+        run: snyk auth "$SNYK_TOKEN"
 
       - name: Run Snyk Code (SAST) and generate SARIF
         id: snyk_code
@@ -82,16 +81,18 @@ jobs:
       - name: Run Snyk IaC scans
         run: snyk iac test project-src --report || true
 
-      - name: Build Docker image (if Dockerfile exists)
+      - name: Build Docker image (if Dockerfile + files exist)
         run: |
-          if [ -f project-src/Dockerfile ]; then
-            docker build -t project-image project-src
+          if [ -f project-src/Dockerfile ] && [ -f project-src/apache-bifromq-${BIFROMQ_VERSION}.tar.gz ] && [ -f project-src/apache-bifromq-${BIFROMQ_VERSION}.tar.gz.sha512 ]; then
+              docker build -t project-image project-src
+          else
+              echo "Skipping Docker build: required files missing"
           fi
 
       - name: Run Snyk Container scan
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
-            snyk container monitor project-image --file=project-src/Dockerfile || true
+              snyk container monitor project-image --file=project-src/Dockerfile || true
           fi
 
       - name: Check if SARIF exists
@@ -109,7 +110,6 @@ jobs:
         with:
           sarif_file: project-src/snyk-code.sarif
 
-      # FIX: Sanitize artifact name for repos like "apache/ignite"
       - name: Sanitize repo name
         id: sanitize
         run: |
