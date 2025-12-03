@@ -77,10 +77,16 @@ jobs:
         with:
           category: "/language:${{ github.event.inputs.language }}"
 
+      - name: Set sanitized artifact name
+        run: |
+          ARTIFACT_NAME="${{ matrix.repo }}"
+          ARTIFACT_NAME="${ARTIFACT_NAME//\//_}"  # Replace '/' with '_'
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> $GITHUB_ENV
+
       - name: Upload scanned repo as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo.replace('/', '_') }}
+          name: ${{ env.ARTIFACT_NAME }}
           path: project-src/**
 
   aggregate_results:
