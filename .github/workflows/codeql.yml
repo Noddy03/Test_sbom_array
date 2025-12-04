@@ -33,7 +33,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           RAW_Q="topic:iot language:$LANG fork:false archived:false"
           REPOS=$(gh api -X GET /search/repositories \
             --raw-field q="$RAW_Q" \
@@ -53,7 +52,6 @@ jobs:
           fi
 
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
   codeql_scan:
@@ -66,25 +64,17 @@ jobs:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
 
     steps:
-
-      # ----------------------------
-      # CHECKOUT REPO
-      # ----------------------------
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
           repository: ${{ matrix.repo }}
           path: project-src
 
-      # ----------------------------
-      # DETECT REPO LANGUAGE
-      # ----------------------------
       - name: Detect if repository contains selected language
         id: detect_lang
         run: |
           LANG="${{ github.event.inputs.language }}"
           cd project-src
-
           case "$LANG" in
             python)
               PATTERN="-name '*.py'"
@@ -103,9 +93,7 @@ jobs:
           esac
 
           FILE_COUNT=$(find . -type f \( $PATTERN \) | wc -l)
-
           if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "No matching language files found"
             echo "has_lang=false" >> $GITHUB_OUTPUT
           else
             echo "has_lang=true" >> $GITHUB_OUTPUT
@@ -115,18 +103,11 @@ jobs:
         if: steps.detect_lang.outputs.has_lang == 'false'
         run: echo "Skipping CodeQL repo does not contain selected language."
 
-      # ----------------------------
-      # INIT CODEQL
-      # ----------------------------
       - name: Initialize CodeQL
         if: steps.detect_lang.outputs.has_lang == 'true'
         uses: github/codeql-action/init@v4
         with:
           languages: ${{ github.event.inputs.language }}
-
-      # ----------------------------
-      # LANGUAGE-SPECIFIC BUILDS
-      # ----------------------------
 
       - name: Build C/C++ project
         if: steps.detect_lang.outputs.has_lang == 'true' && github.event.inputs.language == 'cpp'
@@ -154,19 +135,11 @@ jobs:
             echo "No Java build system found; skipping."
           fi
 
-      # Python has no build step
-
-      # ----------------------------
-      # ANALYZE WITH CODEQL
-      # ----------------------------
       - name: Analyze with CodeQL
         if: steps.detect_lang.outputs.has_lang == 'true'
         uses: github/codeql-action/analyze@v4
         continue-on-error: true
 
-      # ----------------------------
-      # UPLOAD ARTIFACTS
-      # ----------------------------
       - name: Set sanitized artifact name
         run: |
           ARTIFACT_NAME="${{ matrix.repo }}"
@@ -179,9 +152,6 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: project-src/**
 
-  # ----------------------------
-  # AGGREGATE RESULTS
-  # ----------------------------
   aggregate_results:
     needs: codeql_scan
     runs-on: ubuntu-latest
@@ -199,3 +169,4 @@ jobs:
             find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n"
           else
             echo "No artifacts found."
+          fi
