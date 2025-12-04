@@ -84,6 +84,7 @@ jobs:
             make || echo "Make failed; skipping"
           else
             echo "No C/C++ build system found; skipping"
+          fi
 
       - name: Build Java project
         if: ${{ github.event.inputs.language == 'java' }}
@@ -95,6 +96,7 @@ jobs:
             ./gradlew build || echo "Gradle build failed; skipping"
           else
             echo "No Java build system found; skipping"
+          fi
 
       # Python projects usually don't need a build
 
