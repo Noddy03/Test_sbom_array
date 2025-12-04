@@ -23,7 +23,6 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh
-
       - name: Fetch top IoT repositories
         id: fetch
         env:
@@ -38,7 +37,6 @@ jobs:
               --raw-field order=desc \
               --raw-field per_page=100 \
               --jq '.items[].full_name' || true)
-
           if [ -z "$REPOS" ]; then
             RAW_Q="language:$LANG fork:false archived:false"
             REPOS=$(gh api -X GET /search/repositories \
@@ -48,7 +46,6 @@ jobs:
                 --raw-field per_page=100 \
                 --jq '.items[].full_name' || true)
           fi
-
           JSON_ARRAY=$(printf "%s\n" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
           echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
 
@@ -71,13 +68,8 @@ jobs:
 
       - name: Run Semgrep scan
         run: |
-          mkdir -p project-src
           SEMGREP_SARIF="project-src/semgrep.sarif"
-
-          # Run semgrep (may fail or find nothing)
           semgrep --config auto -o "$SEMGREP_SARIF" --sarif project-src || true
-
-          # If SARIF does NOT exist, create empty valid SARIF
           if [ ! -f "$SEMGREP_SARIF" ]; then
             echo '{
               "version": "2.1.0",
@@ -85,23 +77,23 @@ jobs:
             }' > "$SEMGREP_SARIF"
           fi
 
-      - name: Upload SARIF to GitHub
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: project-src/semgrep.sarif
-
-      - name: Sanitize artifact name
+      - name: Convert SARIF to CSV summary
         run: |
-          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '_')
-          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          SUMMARY_CSV="project-src/summary.csv"
+          echo "repo,total_findings,high,severe" > "$SUMMARY_CSV"
+          TOTAL=$(jq '[.runs[].results[]] | length' project-src/semgrep.sarif)
+          HIGH=$(jq '[.runs[].results[] | select(.level=="WARNING" or .level=="ERROR") ] | length' project-src/semgrep.sarif)
+          SEVERE=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif)
+          echo "${{ matrix.repo }},$TOTAL,$HIGH,$SEVERE" >> "$SUMMARY_CSV"
 
-      - name: Upload repository & SARIF artifact
+      - name: Upload SARIF and summary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.SAFE_NAME }}-semgrep-scan
+          name: ${{ matrix.repo | replace('/', '_') }}-semgrep
           path: |
             project-src/**
             project-src/semgrep.sarif
+            project-src/summary.csv
 
   aggregate_summaries:
     name: Aggregate all summary.csv files
@@ -115,7 +107,7 @@ jobs:
 
       - name: Combine all summary.csv files into master_summary.csv
         run: |
-          echo "repo,repo_license,component_count,vuln_fs_total,vuln_sbom_total,vuln_total,vuln_high,vuln_critical,score_value,ntia_pass,bsi_pass" > master_summary.csv
+          echo "repo,total_findings,high,severe" > master_summary.csv
           found=0
           for f in $(find all_summaries -name "summary.csv"); do
             tail -n +2 "$f" >> master_summary.csv
@@ -125,7 +117,7 @@ jobs:
           if [ $found -eq 0 ]; then
             echo "WARNING: No per-repo summary.csv files found" >&2
           fi
-          
+
       - name: Upload Master Summary Report
         uses: actions/upload-artifact@v4
         with:
