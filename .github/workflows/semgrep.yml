@@ -86,10 +86,13 @@ jobs:
           SEVERE=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif)
           echo "${{ matrix.repo }},$TOTAL,$HIGH,$SEVERE" >> "$SUMMARY_CSV"
 
+      - name: Sanitize artifact name
+        run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '_')" >> $GITHUB_ENV
+
       - name: Upload SARIF and summary artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo | replace('/', '_') }}-semgrep
+          name: ${{ env.SAFE_NAME }}-semgrep
           path: |
             project-src/**
             project-src/semgrep.sarif
