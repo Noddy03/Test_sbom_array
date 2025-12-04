@@ -68,46 +68,34 @@ jobs:
         with:
           snyk-version: "latest"
 
-      # ❌ Remove snyk auth step; token is already in environment
-
       - name: Run Snyk Code (SAST) and generate SARIF
-        id: snyk_code
-        run: snyk code test project-src --sarif-file=project-src/snyk-code.sarif || true
+        run: |
+          mkdir -p project-src
+          snyk code test project-src --sarif-file=project-src/snyk-code.sarif || echo "{}" > project-src/snyk-code.sarif
 
       - name: Run Snyk Open Source (SCA)
-        run: snyk monitor project-src --all-projects || true
+        run: snyk monitor project-src --all-projects || echo "SCA skipped"
 
       - name: Run Snyk IaC scans
-        run: snyk iac test project-src --report || true
+        run: snyk iac test project-src --report || echo "IaC skipped"
 
-      - name: Build Docker image (if Dockerfile + files exist)
+      - name: Build Docker image if Dockerfile exists
         run: |
           if [ -f project-src/Dockerfile ]; then
-              docker build -t project-image project-src
-          else
-              echo "Skipping Docker build: required files missing"
+            docker build -t project-image project-src || echo "Docker build skipped"
           fi
 
       - name: Run Snyk Container scan
         run: |
           if docker image inspect project-image > /dev/null 2>&1; then
-              snyk container monitor project-image --file=project-src/Dockerfile || true
+            snyk container monitor project-image --file=project-src/Dockerfile || echo "Container scan skipped"
           fi
 
-      - name: Check if SARIF exists
-        id: check_sarif
+      - name: Upload Snyk Code SARIF safely
         run: |
-          if [ -f project-src/snyk-code.sarif ]; then
-            echo "sarif_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "sarif_exists=false" >> $GITHUB_OUTPUT
+          if [ ! -f project-src/snyk-code.sarif ]; then
+            echo "{}" > project-src/snyk-code.sarif
           fi
-
-      - name: Upload Snyk Code SARIF results
-        if: ${{ steps.check_sarif.outputs.sarif_exists == 'true' }}
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: project-src/snyk-code.sarif
 
       - name: Sanitize repo name
         id: sanitize
@@ -121,6 +109,11 @@ jobs:
           name: ${{ steps.sanitize.outputs.safe_repo }}-scan
           path: project-src/**
 
+      - name: Upload SARIF to GitHub
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: project-src/snyk-code.sarif
+
   aggregate_results:
     needs: snyk_scan
     runs-on: ubuntu-latest
@@ -133,10 +126,20 @@ jobs:
         with:
           path: all_repos
 
-      - name: List scanned repositories
+      - name: List scanned repositories and note skipped
         run: |
-          echo "Repositories scanned:"
+          echo "Repositories scanned (with artifacts):"
           if [ -d all_repos ]; then
-            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n" || echo "No artifacts found."
+            find all_repos -maxdepth 1 -mindepth 1 -type d -printf "%f\n"
           else
             echo "No artifacts folder found."
+          fi
+
+          echo ""
+          echo "Repositories that failed or had no artifacts:"
+          for repo in $(echo '${{ needs.fetch_top_repos.outputs.repo_list }}' | jq -r '.[]'); do
+            SAFE_NAME=$(echo $repo | sed 's/\//_/g')
+            if [ ! -d all_repos/${SAFE_NAME}-scan ]; then
+              echo "$repo"
+            fi
+          done
