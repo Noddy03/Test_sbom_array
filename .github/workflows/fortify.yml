@@ -1,4 +1,4 @@
-name: IoT Fortify Multi‑Repo Local Scan with FCLI Auto‑Download
+name: IoT Fortify Multi-Repo Local Scan
 
 on:
   workflow_dispatch:
@@ -13,85 +13,40 @@ permissions:
   actions: read
 
 jobs:
-  fetch_top_repos:
-    runs-on: ubuntu-latest
-    outputs:
-      repo_list: ${{ steps.fetch.outputs.repo_list }}
-
-    steps:
-      - name: Install jq, gh & git
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq gh git
-
-      - name: Fetch IoT repositories
-        id: fetch
-        env:
-          LANG: ${{ github.event.inputs.language }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          RAW_Q="topic:iot language:$LANG fork:false archived:false"
-          REPOS=$(gh api -X GET /search/repositories \
-            --raw-field q="$RAW_Q" \
-            --raw-field sort=stars \
-            --raw-field order=desc \
-            --raw-field per_page=50 \
-            --jq '.items[].full_name' || true)
-          if [ -z "$REPOS" ]; then
-            RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=10 \
-              --jq '.items[].full_name' || true)
-          fi
-          JSON_ARRAY=$(echo "$REPOS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
-  fortify_scan_fcli:
-    needs: fetch_top_repos
+  fortify_scan_local:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+        repo: ["eclipse-paho/paho.mqtt.java", "smartboot/smart-socket"] # example repos
 
     steps:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Download latest fcli release asset and extract
+      - name: Verify FCLI is installed
         run: |
-          # Query GitHub release API for latest fcli
-          API_URL="https://api.github.com/repos/fortify/fcli/releases/latest"
-          ASSET_URL=$(curl -s "$API_URL" | \
-            jq -r '.assets[] | select(.name | test("fcli_Linux_x64\\.tar\\.gz$")) | .browser_download_url')
-          if [ -z "$ASSET_URL" ]; then
-            echo "ERROR: Could not find fcli Linux x64 release asset" >&2
+          if ! command -v fcli &> /dev/null; then
+            echo "ERROR: fcli is not installed on this runner"
             exit 1
           fi
-          echo "Downloading fcli from $ASSET_URL"
-          curl -L -o fcli.tar.gz "$ASSET_URL"
-          tar -xzf fcli.tar.gz
-          chmod +x fcli
+          fcli --version
 
-      - name: Run Fortify SAST scan via fcli
+      - name: Run Fortify SAST scan locally
         run: |
           mkdir -p scan-output
-          ./fcli scan create-scan --source project-src --output scan-output/scan.fpr
-          ./fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
+          fcli scan create-scan --source project-src --output scan-output/scan.fpr
+          fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
 
-      - name: Generate per‑repo summary.csv
+      - name: Generate per-repo summary.csv
         run: |
           OUT="project-src/summary.csv"
           SARIF="scan-output/scan.sarif"
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > "$OUT"
           if [ -f "$SARIF" ] && [ -s "$SARIF" ]; then
             VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
-            VULN_HIGH=$(jq '[.runs[].results[] | select(.level==\"error\")] | length' "$SARIF")
-            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level==\"fatal\")] | length' "$SARIF")
+            VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
+            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
           else
             VULN_FS_TOTAL=0
             VULN_HIGH=0
@@ -105,14 +60,14 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload per‑repo artifacts
+      - name: Upload per-repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
           path: project-src/**
 
   aggregate_summaries:
-    needs: fortify_scan_fcli
+    needs: fortify_scan_local
     runs-on: ubuntu-latest
     steps:
       - name: Download all repo artifacts
