@@ -65,7 +65,6 @@ jobs:
         uses: fortify/github-action@v1
         with:
           sast-scan: true
-          export-sarif: true
         env:
           FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
           FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
