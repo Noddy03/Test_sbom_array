@@ -1,4 +1,4 @@
-name: IoT Fortify Multi-Repo Local Scan with FCLI
+name: IoT Fortify Multi‑Repo Local Scan with FCLI Auto‑Download
 
 on:
   workflow_dispatch:
@@ -17,12 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.fetch.outputs.repo_list }}
+
     steps:
-      - name: Install jq & gh
+      - name: Install jq, gh & git
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq gh git
-      - name: Fetch top IoT repositories
+
+      - name: Fetch IoT repositories
         id: fetch
         env:
           LANG: ${{ github.event.inputs.language }}
@@ -60,37 +62,41 @@ jobs:
       - name: Checkout repository
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
-      - name: Download and extract Fortify FCLI
+      - name: Download latest fcli release asset and extract
         run: |
-          FCLI_VERSION="24.4.0"
-          # Replace with the exact tar.gz URL from Fortify releases
-          FCLI_URL="https://github.com/fortify/fcli/releases/download/$FCLI_VERSION/fcli_Linux_x64.tar.gz"
-          curl -L -o fcli.tar.gz "$FCLI_URL"
+          # Query GitHub release API for latest fcli
+          API_URL="https://api.github.com/repos/fortify/fcli/releases/latest"
+          ASSET_URL=$(curl -s "$API_URL" | \
+            jq -r '.assets[] | select(.name | test("fcli_Linux_x64\\.tar\\.gz$")) | .browser_download_url')
+          if [ -z "$ASSET_URL" ]; then
+            echo "ERROR: Could not find fcli Linux x64 release asset" >&2
+            exit 1
+          fi
+          echo "Downloading fcli from $ASSET_URL"
+          curl -L -o fcli.tar.gz "$ASSET_URL"
           tar -xzf fcli.tar.gz
           chmod +x fcli
 
-      - name: Run Fortify SAST scan
+      - name: Run Fortify SAST scan via fcli
         run: |
           mkdir -p scan-output
           ./fcli scan create-scan --source project-src --output scan-output/scan.fpr
           ./fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
 
-      - name: Generate per-repo summary.csv
+      - name: Generate per‑repo summary.csv
         run: |
           OUT="project-src/summary.csv"
           SARIF="scan-output/scan.sarif"
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > "$OUT"
-
           if [ -f "$SARIF" ] && [ -s "$SARIF" ]; then
             VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
-            VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
-            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
+            VULN_HIGH=$(jq '[.runs[].results[] | select(.level==\"error\")] | length' "$SARIF")
+            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level==\"fatal\")] | length' "$SARIF")
           else
             VULN_FS_TOTAL=0
             VULN_HIGH=0
             VULN_CRITICAL=0
           fi
-
           echo "${{ matrix.repo }},$VULN_FS_TOTAL,$VULN_HIGH,$VULN_CRITICAL" >> "$OUT"
 
       - name: Sanitize artifact name
@@ -99,7 +105,7 @@ jobs:
           SAFE="${SAFE//\//_}"
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
-      - name: Upload per-repo artifacts
+      - name: Upload per‑repo artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
