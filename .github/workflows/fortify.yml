@@ -1,4 +1,4 @@
-name: IoT Fortify Multi‑Repo Scan with SSC summary
+name: IoT Fortify Multi-Repo Scan with SSC summary
 
 on:
   workflow_dispatch:
@@ -57,14 +57,12 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
     env:
-      # add SSC credentials & URLs
       FOD_CLIENT_ID: ${{ secrets.FOD_CLIENT_ID }}
       FOD_CLIENT_SECRET: ${{ secrets.FOD_CLIENT_SECRET }}
       FOD_TENANT: ${{ secrets.FOD_TENANT }}
       SSC_URL: ${{ vars.SSC_URL }}
       SSC_TOKEN: ${{ secrets.SSC_TOKEN }}
       SC_SAST_TOKEN: ${{ secrets.SC_CLIENT_AUTH_TOKEN }}
-      DEBRICKED_TOKEN: ${{ secrets.DEBRICKED_TOKEN }}
       SC_SAST_SENSOR_VERSION: 24.4.0
 
     steps:
@@ -78,23 +76,18 @@ jobs:
 
       - name: Install fcli
         run: |
-          # install fcli tool (assumes Linux)
           curl -L https://github.com/fortify/fcli/releases/latest/download/fcli_$(uname -s)_x64.tar.gz | tar xz
           chmod +x fcli
 
-      - name: Fetch issues count from SSC
+      - name: Fetch Fortify SSC findings
         run: |
           APPVER="${{ matrix.repo }}:main"
-          # login to SSC session
           ./fcli ssc session login --url "$SSC_URL" --token "$SSC_TOKEN"
-          # get issue count
           OUT_JSON=$(./fcli ssc issue count --appversion "$APPVER" -o json)
           TOTAL=$(echo "$OUT_JSON" | jq '.total' 2>/dev/null || echo 0)
           HIGH=$(echo "$OUT_JSON" | jq '.high' 2>/dev/null || echo 0)
           CRITICAL=$(echo "$OUT_JSON" | jq '.critical' 2>/dev/null || echo 0)
-          # logout session
           ./fcli ssc session logout || true
-          # write summary
           echo "repo,vuln_fs_total,vuln_high,vuln_critical" > project-src/summary.csv
           echo "${{ matrix.repo }},$TOTAL,$HIGH,$CRITICAL" >> project-src/summary.csv
 
@@ -105,7 +98,7 @@ jobs:
           echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
 
       - name: Upload repo artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ env.ARTIFACT_NAME }}-scan
           path: project-src/**
@@ -115,7 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions.download-artifact@v4
+        uses: actions/download-artifact@v3
         with:
           path: all_summaries
 
@@ -132,7 +125,7 @@ jobs:
           echo "Collected $FOUND summary files"
 
       - name: Upload master summary
-        uses: actions.upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: master_summary
           path: master_summary.csv
