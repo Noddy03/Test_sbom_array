@@ -62,9 +62,8 @@ jobs:
 
       - name: Download and extract Fortify FCLI
         run: |
-          # Pin the FCLI version
           FCLI_VERSION="24.4.0"
-          # Direct download URL from Fortify GitHub releases
+          # Replace with the exact tar.gz URL from Fortify releases
           FCLI_URL="https://github.com/fortify/fcli/releases/download/$FCLI_VERSION/fcli_Linux_x64.tar.gz"
           curl -L -o fcli.tar.gz "$FCLI_URL"
           tar -xzf fcli.tar.gz
@@ -73,9 +72,7 @@ jobs:
       - name: Run Fortify SAST scan
         run: |
           mkdir -p scan-output
-          # Run local scan without SSC
           ./fcli scan create-scan --source project-src --output scan-output/scan.fpr
-          # Export SARIF
           ./fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
 
       - name: Generate per-repo summary.csv
