@@ -113,7 +113,7 @@ jobs:
 
       - name: Skip message
         if: steps.detect_lang.outputs.has_lang == 'false'
-        run: echo "Skipping CodeQL: repo does not contain selected language."
+        run: echo "Skipping CodeQL repo does not contain selected language."
 
       # ----------------------------
       # INIT CODEQL
