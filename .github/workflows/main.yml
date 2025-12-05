@@ -733,7 +733,7 @@ jobs:
           PY
           
       - name: Cleanup Intermediate Files 
-        if: steps.checkout.outputs.SKIP_REPO == 'false'�
+        if: steps.checkout.outputs.SKIP_REPO == 'false'
         run: |
           set -euo pipefail
           rm -f project-src/cdxgen-sbom.json
