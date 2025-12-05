@@ -761,7 +761,7 @@ jobs:
           path: project-src/**
           if-no-files-found: warn
 
-aggregate_summaries:
+  aggregate_summaries:
     name: Aggregate all summary.csv files
     needs: sbom_scan
     runs-on: ubuntu-latest
