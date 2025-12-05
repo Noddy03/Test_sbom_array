@@ -1,94 +1,91 @@
-name: IoT Fortify Multi-Repo Local Scan
+name: IoT Repos SBOM + Dual SCA (Trivy) with Timeout & Summary
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter (e.g., Java, C++, Python)"
+        description: 'Programming language to filter IoT repos'
         required: true
-        default: "Java"
-
-permissions:
-  contents: read
-  actions: read
+        default: 'Python'
 
 jobs:
-  fortify_scan_local:
+  fetch-and-scan:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        repo: ["eclipse-paho/paho.mqtt.java", "smartboot/smart-socket"] # example repos
-
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAX_REPOS: 100
     steps:
-      - name: Checkout repository
-        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
-
-      - name: Verify FCLI is installed
+      - name: Install Dependencies
         run: |
-          if ! command -v fcli &> /dev/null; then
-            echo "ERROR: fcli is not installed on this runner"
-            exit 1
-          fi
-          fcli --version
+          sudo apt-get update
+          sudo apt-get install -y jq curl git coreutils
 
-      - name: Run Fortify SAST scan locally
+      - name: Install Trivy
         run: |
-          mkdir -p scan-output
-          fcli scan create-scan --source project-src --output scan-output/scan.fpr
-          fcli scan export --scan scan-output/scan.fpr --format sarif --output scan-output/scan.sarif
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
-      - name: Generate per-repo summary.csv
+      - name: Search Top IoT Repos
+        id: fetch_repos
         run: |
-          OUT="project-src/summary.csv"
-          SARIF="scan-output/scan.sarif"
-          echo "repo,vuln_fs_total,vuln_high,vuln_critical" > "$OUT"
-          if [ -f "$SARIF" ] && [ -s "$SARIF" ]; then
-            VULN_FS_TOTAL=$(jq '[.runs[].results[]] | length' "$SARIF")
-            VULN_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$SARIF")
-            VULN_CRITICAL=$(jq '[.runs[].results[] | select(.level=="fatal")] | length' "$SARIF")
-          else
-            VULN_FS_TOTAL=0
-            VULN_HIGH=0
-            VULN_CRITICAL=0
-          fi
-          echo "${{ matrix.repo }},$VULN_FS_TOTAL,$VULN_HIGH,$VULN_CRITICAL" >> "$OUT"
+          LANGUAGE="${{ github.event.inputs.language }}"
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
+          | jq -r '.items[].clone_url' > repos.txt
+          echo "Fetched $(wc -l < repos.txt) repos."
 
-      - name: Sanitize artifact name
+      - name: Loop over Repos and Generate SBOM + Dual SCA
         run: |
-          SAFE="${{ matrix.repo }}"
-          SAFE="${SAFE//\//_}"
-          echo "ARTIFACT_NAME=$SAFE" >> $GITHUB_ENV
+          mkdir -p output
+          echo "repo,dependencies,sca_direct,sca_from_sbom,status" > output/summary.csv
+          while read repo; do
+            echo "Processing $repo"
+            name=$(basename $repo .git)
 
-      - name: Upload per-repo artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ARTIFACT_NAME }}-scan
-          path: project-src/**
-
-  aggregate_summaries:
-    needs: fortify_scan_local
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all repo artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: all_summaries
-
-      - name: Create master_summary.csv
-        run: |
-          echo "repo,vuln_fs_total,vuln_high,vuln_critical" > master_summary.csv
-          FOUND=0
-          for f in $(find all_summaries -name summary.csv || true); do
-            if [ -s "$f" ]; then
-              tail -n +2 "$f" >> master_summary.csv
-              FOUND=$((FOUND+1))
+            # Clone repository (timeout 20 min)
+            if ! timeout 1200 git clone --depth 1 $repo $name; then
+              echo "Timeout cloning $repo. Skipping..."
+              echo "$name,0,0,0,clone_timeout" >> output/summary.csv
+              continue
             fi
-          done
-          echo "Collected $FOUND summary files"
 
-      - name: Upload master summary
+            cd $name
+
+            # Generate SBOM (timeout 20 min)
+            if ! timeout 1200 trivy sbom --format cyclonedx-json . > ../output/${name}_sbom.json; then
+              echo "Timeout generating SBOM for $repo. Skipping..."
+              echo "$name,0,0,0,sbom_timeout" >> ../output/summary.csv
+              cd ..
+              rm -rf $name
+              continue
+            fi
+
+            # Count dependencies from SBOM
+            deps=$(jq '.components | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
+
+            # Run SCA directly on repo (timeout 20 min)
+            if timeout 1200 trivy fs --security-checks vuln . --format json > ../output/${name}_sca_direct.json; then
+              direct=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
+            else
+              echo "Timeout SCA direct scan for $repo."
+              direct=0
+            fi
+
+            # Run SCA using SBOM only (timeout 20 min)
+            if timeout 1200 trivy sbom --input ../output/${name}_sbom.json --vuln-type os,library --format json > ../output/${name}_sca_from_sbom.json; then
+              from_sbom=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
+            else
+              echo "Timeout SCA from SBOM for $repo."
+              from_sbom=0
+            fi
+
+            echo "$name,$deps,$direct,$from_sbom,success" >> ../output/summary.csv
+
+            cd ..
+            rm -rf $name
+          done < repos.txt
+
+      - name: Upload SBOM + SCA artifacts and summary
         uses: actions/upload-artifact@v4
         with:
-          name: master_summary
-          path: master_summary.csv
+          name: iot-sbom-sca
+          path: output/
