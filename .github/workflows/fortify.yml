@@ -1,4 +1,4 @@
-name: IoT Repos SBOM + Dual SCA (Trivy) with Timeout & Summary
+name: IoT Repos SBOM + Dual SCA (Trivy) with Recursive Scan & Summary
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl git coreutils
+          sudo apt-get install -y jq curl git coreutils findutils
 
       - name: Install Trivy
         run: |
@@ -37,6 +37,7 @@ jobs:
         run: |
           mkdir -p output
           echo "repo,dependencies,sca_direct,sca_from_sbom,status" > output/summary.csv
+          
           while read repo; do
             echo "Processing $repo"
             name=$(basename $repo .git)
@@ -50,8 +51,8 @@ jobs:
 
             cd $name
 
-            # Generate SBOM (timeout 20 min)
-            if ! timeout 1200 trivy sbom --format cyclonedx-json . > ../output/${name}_sbom.json; then
+            # Generate SBOM recursively (timeout 20 min)
+            if ! timeout 1200 find . -type d -maxdepth 3 -exec trivy sbom --all-pkgs --format cyclonedx-json {} \; > ../output/${name}_sbom.json; then
               echo "Timeout generating SBOM for $repo. Skipping..."
               echo "$name,0,0,0,sbom_timeout" >> ../output/summary.csv
               cd ..
@@ -59,12 +60,12 @@ jobs:
               continue
             fi
 
-            # Count dependencies from SBOM
-            deps=$(jq '.components | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
+            # Count dependencies safely
+            deps=$(jq '[.components[]?] | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
 
-            # Run SCA directly on repo (timeout 20 min)
-            if timeout 1200 trivy fs --security-checks vuln . --format json > ../output/${name}_sca_direct.json; then
-              direct=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
+            # Run SCA directly on repo recursively (timeout 20 min)
+            if timeout 1200 find . -type d -maxdepth 3 -exec trivy fs --all-pkgs --security-checks vuln {} --format json \; > ../output/${name}_sca_direct.json; then
+              direct=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
             else
               echo "Timeout SCA direct scan for $repo."
               direct=0
@@ -72,7 +73,7 @@ jobs:
 
             # Run SCA using SBOM only (timeout 20 min)
             if timeout 1200 trivy sbom --input ../output/${name}_sbom.json --vuln-type os,library --format json > ../output/${name}_sca_from_sbom.json; then
-              from_sbom=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
+              from_sbom=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
             else
               echo "Timeout SCA from SBOM for $repo."
               from_sbom=0
