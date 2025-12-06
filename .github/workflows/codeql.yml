@@ -1,68 +1,62 @@
-name: IoT Repos SBOM + Dual SCA with Timeout & Summary
+name: IoT SBOM + SCA Consolidated Summary
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter IoT repos'
+        description: 'Programming language (e.g., Python, Java, C++)'
         required: true
-        default: 'Java'
+        default: 'Python'
+      max_repos:
+        description: 'Number of top-starred IoT repos to scan'
+        required: true
+        default: '20'
 
 jobs:
-  fetch-and-scan:
+  scan-all-repos:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      MAX_REPOS: 100
+    timeout-minutes: 180
     steps:
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl git coreutils
-
-      - name: Install Syft & Grype
-        run: |
+          sudo apt-get update && sudo apt-get install -y jq git curl
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Search Top IoT Repos
-        id: fetch_repos
+      - name: Fetch top IoT repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          curl -s -H "Authorization: token $GITHUB_TOKEN" \
-          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
-          | jq -r '.items[].clone_url' > repos.txt
+          MAX="${{ github.event.inputs.max_repos }}"
+          curl -s -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX" \
+            | jq -r '.items[].clone_url' > repos.txt
           echo "Fetched $(wc -l < repos.txt) repos."
 
-      - name: Loop over Repos and Generate SBOM + Dual SCA
+      - name: Loop over repos and generate SBOM + dual SCA
         run: |
           mkdir -p output
           echo "repo,dependencies,sca_direct,sca_from_sbom,status" > output/summary.csv
           while read repo; do
             echo "Processing $repo"
-            name=$(basename $repo .git)
-
+            name=$(basename "$repo" .git)
             # Clone repository (timeout 20 min)
-            if ! timeout 1200 git clone --depth 1 $repo $name; then
+            if ! timeout 1200 git clone --depth 1 "$repo" "$name"; then
               echo "Timeout cloning $repo. Skipping..."
               echo "$name,0,0,0,clone_timeout" >> output/summary.csv
               continue
             fi
-
-            cd $name
-
+            cd "$name"
             # Generate SBOM (timeout 20 min)
             if ! timeout 1200 syft . -o cyclonedx-json > ../output/${name}_sbom.json; then
               echo "Timeout generating SBOM for $repo. Skipping..."
               echo "$name,0,0,0,sbom_timeout" >> ../output/summary.csv
               cd ..
-              rm -rf $name
+              rm -rf "$name"
               continue
             fi
-
             # Count dependencies from SBOM
             deps=$(jq '.artifacts | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
-
             # Run SCA directly on repo (timeout 20 min)
             if timeout 1200 grype . -o json > ../output/${name}_sca_direct.json; then
               direct=$(jq '.matches | length' ../output/${name}_sca_direct.json 2>/dev/null || echo 0)
@@ -70,22 +64,19 @@ jobs:
               echo "Timeout SCA direct scan for $repo."
               direct=0
             fi
-
-            # Run SCA using SBOM only (timeout 20 min)
+            # Run SCA using SBOM (timeout 20 min)
             if timeout 1200 grype sbom:../output/${name}_sbom.json -o json > ../output/${name}_sca_from_sbom.json; then
               from_sbom=$(jq '.matches | length' ../output/${name}_sca_from_sbom.json 2>/dev/null || echo 0)
             else
               echo "Timeout SCA from SBOM for $repo."
               from_sbom=0
             fi
-
             echo "$name,$deps,$direct,$from_sbom,success" >> ../output/summary.csv
-
             cd ..
-            rm -rf $name
+            rm -rf "$name"
           done < repos.txt
 
-      - name: Upload SBOM + SCA artifacts and summary
+      - name: Upload all SBOM, SCA files and summary
         uses: actions/upload-artifact@v4
         with:
           name: iot-sbom-sca
