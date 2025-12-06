@@ -11,6 +11,8 @@ on:
 jobs:
   fetch-and-scan:
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - name: Install dependencies
         run: |
@@ -18,26 +20,34 @@ jobs:
           sudo apt-get install -y jq git curl
 
       - name: Fetch top 100 IoT repos
-        id: fetch_repos
+        id: set-matrix
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
           echo "Fetching top 100 IoT repos in $LANGUAGE..."
           REPOS=$(curl -s "https://api.github.com/search/repositories?q=iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
             | jq -r '.items[].clone_url')
-          # Convert to JSON array
-          MATRIX_REPOS=$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')
-          echo "Repos to scan: $MATRIX_REPOS"
-          echo "::set-output name=matrix::$MATRIX_REPOS"
+          # Remove empty lines
+          REPOS=$(echo "$REPOS" | sed '/^$/d')
+          
+          if [ -z "$REPOS" ]; then
+            echo "No repositories found. Exiting."
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MATRIX_REPOS=$(echo "$REPOS" | jq -R -s -c 'split("\n")')
+          echo "matrix=$MATRIX_REPOS" >> $GITHUB_OUTPUT
 
   scan:
     needs: fetch-and-scan
+    if: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) != [] }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: ${{fromJSON(needs.fetch-and-scan.outputs.matrix)}}
+        repo: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) }}
       fail-fast: false
     steps:
-      - name: Checkout Trivy
+      - name: Install Trivy
         uses: aquasecurity/trivy-action@master
         with:
           version: 1.5.2
