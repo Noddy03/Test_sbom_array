@@ -41,7 +41,6 @@ jobs:
             exit 1
           fi
 
-          # Convert to JSON array for matrix
           jq -R -s -c 'split("\n")[:-1]' repos.txt > repos.json
           echo "::set-output name=repo_list::$(cat repos.json)"
           echo "Fetched $(wc -l < repos.txt) repos."
@@ -66,8 +65,6 @@ jobs:
           REPO="${{ matrix.repo }}"
           NAME=$(basename "$REPO" .git)
           echo "Cloning $REPO"
-
-          # 20-minute timeout for cloning
           if ! timeout 1200 git clone --depth 1 "$REPO" "$NAME"; then
             echo "clone_timeout" > clone_error.txt
             exit 0
@@ -81,7 +78,7 @@ jobs:
 
           echo "Generating SBOM..."
           timeout 1200 trivy sbom \
-            --format cyclonedx-json \
+            --format cyclonedx \
             --output ../output/"${NAME}_sbom.json" .
 
           echo "Running SCA (direct)..."
@@ -108,3 +105,26 @@ jobs:
         with:
           name: ${{ matrix.repo }}-sbom-sca
           path: output/
+
+  aggregate-summary:
+    needs: scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all per-repo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_outputs
+
+      - name: Combine summaries into master_summary.csv
+        run: |
+          mkdir -p master
+          echo "repo,sbom_components,direct_vulnerabilities,sbom_vulnerabilities" > master/master_summary.csv
+
+          # Find all per-repo summary CSVs and append
+          find all_outputs -name "*_summary.csv" -exec tail -n +1 {} \; >> master/master_summary.csv
+
+      - name: Upload master_summary.csv
+        uses: actions/upload-artifact@v4
+        with:
+          name: master_summary
+          path: master/master_summary.csv
