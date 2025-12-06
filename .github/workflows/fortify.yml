@@ -76,26 +76,41 @@ jobs:
           mkdir -p output
           cd "$NAME"
 
+          # -------------------------
+          # 1️⃣ Generate SBOM (robust)
+          # -------------------------
           echo "Generating SBOM..."
-          timeout 1200 trivy sbom \
-            --scanners vuln \
-            --format cyclonedx \
-            --output ../output/"${NAME}_sbom.json" .
+          if timeout 1200 trivy sbom --scanners vuln --format cyclonedx --output ../output/"${NAME}_sbom.json" .; then
+            SBOM_OK=1
+          else
+            echo "⚠️ SBOM scan failed for $NAME"
+            SBOM_OK=0
+          fi
 
+          # -------------------------
+          # 2️⃣ Direct SCA (always runs)
+          # -------------------------
           echo "Running SCA (direct)..."
-          timeout 1200 trivy fs \
-            --security-checks vuln \
-            --format json \
-            --output ../output/"${NAME}_sca_direct.json" .
+          timeout 1200 trivy fs --security-checks vuln --format json --output ../output/"${NAME}_sca_direct.json" .
 
-          echo "Running SCA (from SBOM)..."
-          timeout 1200 trivy sbom \
-            --input ../output/"${NAME}_sbom.json" \
-            --format json \
-            --output ../output/"${NAME}_sca_from_sbom.json"
+          # -------------------------
+          # 3️⃣ SCA from SBOM (only if SBOM succeeded)
+          # -------------------------
+          if [ "$SBOM_OK" -eq 1 ]; then
+            echo "Running SCA (from SBOM)..."
+            timeout 1200 trivy sbom --input ../output/"${NAME}_sbom.json" --format json --output ../output/"${NAME}_sca_from_sbom.json"
+          else
+            echo "Skipping SCA from SBOM for $NAME"
+            echo '{}' > ../output/"${NAME}_sca_from_sbom.json"
+          fi
 
-          # Count components/vulnerabilities
-          sbom_count=$(jq '.components | length' ../output/"${NAME}_sbom.json" 2>/dev/null || echo 0)
+          # -------------------------
+          # 4️⃣ Generate summary CSV
+          # -------------------------
+          sbom_count=0
+          if [ "$SBOM_OK" -eq 1 ]; then
+            sbom_count=$(jq '.components | length' ../output/"${NAME}_sbom.json" 2>/dev/null || echo 0)
+          fi
           direct_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_direct.json" 2>/dev/null || echo 0)
           sbom_vuln=$(jq '[.Results[].Vulnerabilities[]?] | length' ../output/"${NAME}_sca_from_sbom.json" 2>/dev/null || echo 0)
 
@@ -121,7 +136,7 @@ jobs:
           mkdir -p master
           echo "repo,sbom_components,direct_vulnerabilities,sbom_vulnerabilities" > master/master_summary.csv
 
-          # Append per-repo CSVs (skip repeated headers)
+          # Append all per-repo CSVs (skip headers)
           for f in $(find all_outputs -name "*_summary.csv"); do
             tail -n +2 "$f" >> master/master_summary.csv
           done
