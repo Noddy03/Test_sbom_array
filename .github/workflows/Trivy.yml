@@ -1,60 +1,84 @@
-name: Top IoT Repos Trivy Scan
+name: IoT Repos SBOM + SCA with Trivy
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter repos (e.g., Java, Python)'
+        description: 'Programming language to filter IoT repos'
         required: true
         default: 'Java'
 
 jobs:
   fetch-and-scan:
     runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MAX_REPOS: 100
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl git coreutils
 
-      - name: Fetch top 100 IoT repos
-        id: fetch
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Search Top IoT Repos
+        id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          echo "Fetching top 100 IoT repos for language: $LANGUAGE"
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX_REPOS" \
+          | jq -r '.items[].clone_url' > repos.txt
+          echo "Fetched $(wc -l < repos.txt) repos."
 
-          REPOS=$(gh repo list --topic iot --language "$LANGUAGE" --limit 100 --json nameWithOwner,stargazerCount | \
-                  jq -r 'sort_by(.stargazerCount) | reverse | .[].nameWithOwner')
-
-          # Convert to JSON array for matrix
-          MATRIX_JSON=$(printf '%s\n' "$REPOS" | jq -R . | jq -s '{repo: .}')
-          echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
-
-      - name: Set matrix output
-        id: set-matrix
-        run: echo "matrix=${{ steps.fetch.outputs.matrix }}" >> $GITHUB_OUTPUT
-
-  scan:
-    needs: fetch-and-scan
-    runs-on: ubuntu-latest
-    strategy:
-      matrix: ${{fromJSON(needs.fetch-and-scan.outputs.matrix).repo}}
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-        with:
-          repository: ${{ matrix }}
-          path: repo
-
-      - name: Run Trivy scan
-        working-directory: repo
+      - name: Loop over Repos and Generate SBOM + Vulnerability Scan
         run: |
-          safe_name="${matrix//\//_}"  # replace slashes with underscore
-          echo "Scanning repository: $matrix -> $safe_name.json"
-          trivy fs --scanners vuln --timeout 15m --format json -o ../scan_${safe_name}.json .
+          mkdir -p output
+          echo "repo,dependencies,vulns,status" > output/summary.csv
 
-      - name: Upload Trivy scan result
-        uses: actions/upload-artifact@v3
+          while read repo; do
+            echo "Processing $repo"
+            name=$(basename $repo .git)
+
+            # Clone repository with 20 min timeout
+            if ! timeout 1200 git clone --depth 1 $repo $name; then
+              echo "Timeout cloning $repo. Skipping..."
+              echo "$name,0,0,clone_timeout" >> output/summary.csv
+              continue
+            fi
+
+            cd $name
+
+            # Generate SBOM (CycloneDX JSON) with 20 min timeout
+            if ! timeout 1200 trivy sbom --format cyclonedx-json . -o ../output/${name}_sbom.json; then
+              echo "Timeout generating SBOM for $repo. Skipping..."
+              echo "$name,0,0,sbom_timeout" >> ../output/summary.csv
+              cd ..
+              rm -rf $name
+              continue
+            fi
+
+            # Count dependencies from SBOM
+            deps=$(jq '.components | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
+
+            # Run vulnerability scan directly on repo with 20 min timeout
+            if timeout 1200 trivy fs --scanners vuln --format json -o ../output/${name}_vuln.json .; then
+              vulns=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_vuln.json 2>/dev/null || echo 0)
+            else
+              echo "Timeout vulnerability scan for $repo."
+              vulns=0
+            fi
+
+            echo "$name,$deps,$vulns,success" >> ../output/summary.csv
+
+            cd ..
+            rm -rf $name
+          done < repos.txt
+
+      - name: Upload SBOM, vulnerability scan artifacts, and summary
+        uses: actions/upload-artifact@v4
         with:
-          name: "trivy-scan-${{ matrix }}"
-          path: "../scan_${matrix//\//_}.json"
+          name: iot-sbom-vuln
+          path: output/
