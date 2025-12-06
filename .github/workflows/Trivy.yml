@@ -1,12 +1,12 @@
-name: IoT Repos SBOM + SCA with Trivy
+name: IoT Repos SBOM + SCA with Trivy (Fast Mode)
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter IoT repos'
+        description: "Programming language to filter IoT repos"
         required: true
-        default: 'Java'
+        default: "Java"
 
 jobs:
   fetch-and-scan:
@@ -14,71 +14,80 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       MAX_REPOS: 100
+
     steps:
-      - name: Install Dependencies
+      - name: Install Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl git coreutils
 
       - name: Install Trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
 
-      - name: Search Top IoT Repos
+      - name: Fetch top IoT repositories
         id: fetch_repos
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          curl -s -H "Authorization: token $GITHUB_TOKEN" \
-          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX_REPOS" \
-          | jq -r '.items[].clone_url' > repos.txt
-          echo "Fetched $(wc -l < repos.txt) repos."
 
-      - name: Loop over Repos and Generate SBOM + Vulnerability Scan
+          curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=$MAX_REPOS" \
+            | jq -r '.items[].clone_url' > repos.txt
+
+          echo "Fetched $(wc -l < repos.txt) repos"
+
+      - name: Scan repositories with fast SBOM + SCA
         run: |
           mkdir -p output
-          echo "repo,dependencies,vulns,status" > output/summary.csv
+          echo "repo,dependencies,vulnerabilities,status" > output/summary.csv
 
-          while read repo; do
-            echo "Processing $repo"
-            name=$(basename $repo .git)
+          while IFS= read -r repo; do
+            echo "=== Processing $repo ==="
+            name=$(basename "$repo" .git)
 
-            # Clone repository with 20 min timeout
-            if ! timeout 1200 git clone --depth 1 $repo $name; then
-              echo "Timeout cloning $repo. Skipping..."
+            # Clone with 5 min timeout (fast)
+            if ! timeout 300 git clone --depth 1 "$repo" "$name"; then
               echo "$name,0,0,clone_timeout" >> output/summary.csv
               continue
             fi
 
-            cd $name
+            cd "$name"
 
-            # Generate SBOM (CycloneDX JSON) with 20 min timeout
-            if ! timeout 1200 trivy sbom --format cyclonedx-json . -o ../output/${name}_sbom.json; then
-              echo "Timeout generating SBOM for $repo. Skipping..."
+            # Fast SBOM: file-system only (no dependency resolving!)
+            if timeout 300 trivy fs \
+                --format cyclonedx-json \
+                --dependency-tree \
+                . > "../output/${name}_sbom.json"; then
+
+              deps=$(jq '.components | length' "../output/${name}_sbom.json" 2>/dev/null || echo 0)
+            else
               echo "$name,0,0,sbom_timeout" >> ../output/summary.csv
               cd ..
-              rm -rf $name
+              rm -rf "$name"
               continue
             fi
 
-            # Count dependencies from SBOM
-            deps=$(jq '.components | length' ../output/${name}_sbom.json 2>/dev/null || echo 0)
+            # Fast vulnerability scan (no SBOM use)
+            if timeout 300 trivy fs \
+                --scanners vuln \
+                --format json \
+                -o "../output/${name}_vuln.json" \
+                .; then
 
-            # Run vulnerability scan directly on repo with 20 min timeout
-            if timeout 1200 trivy fs --scanners vuln --format json -o ../output/${name}_vuln.json .; then
-              vulns=$(jq '.Results[].Vulnerabilities | length' ../output/${name}_vuln.json 2>/dev/null || echo 0)
+              vulns=$(jq '[.Results[].Vulnerabilities[]?] | length' "../output/${name}_vuln.json" 2>/dev/null || echo 0)
             else
-              echo "Timeout vulnerability scan for $repo."
               vulns=0
             fi
 
             echo "$name,$deps,$vulns,success" >> ../output/summary.csv
 
             cd ..
-            rm -rf $name
+            rm -rf "$name"
           done < repos.txt
 
-      - name: Upload SBOM, vulnerability scan artifacts, and summary
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: iot-sbom-vuln
+          name: iot-fast-scans
           path: output/
