@@ -1,126 +1,115 @@
-name: IoT Repo Scanner
+name: IOT_SBOM_SCA
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language to filter repositories by"
+        description: "Language (e.g., Java, Python, C, C++)"
         required: true
         default: "Java"
 
 jobs:
-
-  fetch-repos:
+  scan:
     runs-on: ubuntu-latest
-    outputs:
-      repo_count: ${{ steps.count.outputs.repo_count }}
     steps:
-      - name: Fetch IoT Repositories
+
+      ############################################################
+      # Fetch top IoT repos
+      ############################################################
+      - name: Fetch IoT Repos
         id: fetch
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           LANGUAGE="${{ github.event.inputs.language }}"
-          echo "Fetching repos for language=$LANGUAGE"
-          
           curl -s \
-            -H "Authorization: Bearer $GH_TOKEN" \
             "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
             | jq -r '.items[].clone_url' > repos.txt
 
-          echo "Fetched $(wc -l < repos.txt) repos"
-          
-      - name: Count repos
-        id: count
-        run: |
-          echo "repo_count=$(wc -l < repos.txt)" >> $GITHUB_OUTPUT
+          echo "Found $(wc -l < repos.txt) repos."
 
-      - name: Upload repo list
-        uses: actions/upload-artifact@v4
-        with:
-          name: repo-list
-          path: repos.txt
-
-
-  scan-all:
-    needs: fetch-repos
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    steps:
-
-      - name: Download repo list
-        uses: actions/download-artifact@v4
-        with:
-          name: repo-list
-
+      ############################################################
+      # Install Trivy (SBOM + SCA)
+      ############################################################
       - name: Install Trivy
         run: |
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-      - name: Install Trivy SBOM Plugins
-        run: |
-          trivy plugin install cyclonedx
-          trivy plugin install spdx
-
-      - name: Prepare output directory
+      ############################################################
+      # Prepare output
+      ############################################################
+      - name: Prepare output directories
         run: |
           mkdir -p output
-          echo "repo,sbom_deps,sca_issues,sbom_sca_issues,status" > output/summary.csv
+          echo "repo,sbom_components,sca_direct,sca_from_sbom,status" > output/summary.csv
 
-      - name: Scan Each Repo
+      ############################################################
+      # Main loop: clone, SBOM, SCA direct, SCA-from-SBOM
+      ############################################################
+      - name: Process Each Repo
         run: |
           while read repo; do
-            echo "======== SCANNING $repo ========"
+            echo "========== Processing $repo =========="
 
-            name=$(basename $repo .git)
-            safe_name=${name//[^A-Za-z0-9._-]/_}
+            name=$(basename "$repo" .git)
 
-            # Clone
-            if ! timeout 1200 git clone --depth 1 "$repo" "$safe_name"; then
-              echo "$safe_name,0,0,0,clone_failed" >> output/summary.csv
+            # safe artifact name
+            safe=$(echo "$name" | tr -cd 'A-Za-z0-9._-')
+
+            # clone repository
+            if ! timeout 1200 git clone --depth 1 "$repo" "$safe"; then
+              echo "$safe,0,0,0,clone_failed" >> output/summary.csv
               continue
             fi
 
-            cd "$safe_name"
+            cd "$safe"
 
-            # SBOM Generation (CycloneDX)
-            if timeout 1200 trivy sbom --format cyclonedx --output "../output/${safe_name}_sbom.json" .; then
-              sbom_deps=$(jq '.components | length' "../output/${safe_name}_sbom.json" 2>/dev/null || echo 0)
+            ############################################################
+            # SBOM (CycloneDX) — does not crash workflow on failure
+            ############################################################
+            sbom_file="../output/${safe}_sbom.json"
+            if timeout 1200 trivy sbom --format cyclonedx --output "$sbom_file" . ; then
+              sbom_components=$(jq '.components | length' "$sbom_file" 2>/dev/null || echo 0)
             else
-              echo "SBOM FAILED for $name"
-              sbom_deps=0
+              echo "SBOM failed for $repo"
+              sbom_components=0
             fi
 
-            # Direct Vulnerability Scan
-            if timeout 1200 trivy fs --format json --output "../output/${safe_name}_sca_direct.json" .; then
-              sca_issues=$(jq '.Results[].Vulnerabilities | length' "../output/${safe_name}_sca_direct.json" 2>/dev/null | paste -sd+ - | bc || echo 0)
+            ############################################################
+            # SCA Scans Direct from Source
+            ############################################################
+            sca_file="../output/${safe}_sca_direct.json"
+            if timeout 1200 trivy fs --format json --output "$sca_file" . ; then
+              sca_direct=$(jq '[.Results[].Vulnerabilities | length] | add' "$sca_file" 2>/dev/null || echo 0)
             else
-              echo "SCA FAILED for $name"
-              sca_issues=0
+              sca_direct=0
             fi
 
-            # SCA from SBOM
-            if [ -f "../output/${safe_name}_sbom.json" ]; then
-              if timeout 1200 trivy sbom --input "../output/${safe_name}_sbom.json" --format json \
-                 --output "../output/${safe_name}_sca_from_sbom.json"; then
-                sbom_sca=$(jq '.Results[].Vulnerabilities | length' "../output/${safe_name}_sca_from_sbom.json" 2>/dev/null | paste -sd+ - | bc || echo 0)
+            ############################################################
+            # SCA Using Only SBOM
+            ############################################################
+            sbom_sca_file="../output/${safe}_sca_from_sbom.json"
+            if [ -f "$sbom_file" ]; then
+              if timeout 1200 trivy sbom --input "$sbom_file" --format json --output "$sbom_sca_file"; then
+                sca_from_sbom=$(jq '[.Results[].Vulnerabilities | length] | add' "$sbom_sca_file" 2>/dev/null || echo 0)
               else
-                sbom_sca=0
+                sca_from_sbom=0
               fi
             else
-              sbom_sca=0
+              sca_from_sbom=0
             fi
 
-            echo "$safe_name,$sbom_deps,$sca_issues,$sbom_sca,success" >> ../output/summary.csv
+            echo "$safe,$sbom_components,$sca_direct,$sca_from_sbom,success" >> ../output/summary.csv
 
             cd ..
-            rm -rf "$safe_name"
+            rm -rf "$safe"
 
           done < repos.txt
 
+      ############################################################
+      # Upload output artifacts
+      ############################################################
       - name: Upload Results
         uses: actions/upload-artifact@v4
         with:
-          name: full-iot-scan
+          name: iot_sbom_sca_results
           path: output/
