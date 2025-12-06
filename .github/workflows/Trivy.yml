@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter (e.g., Java, Python, JavaScript)'
+        description: 'Programming language to filter repositories (e.g., Java, Python)'
         required: true
-        type: string
+        default: 'Java'
 
 jobs:
   fetch-and-scan:
@@ -14,88 +14,70 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git curl
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Set up GitHub CLI
+        uses: cli/cli-action@v2
 
       - name: Fetch top 100 IoT repos
+        id: fetch-repos
+        run: |
+          echo "Fetching top 100 IoT repos for language: ${{ github.event.inputs.language }}"
+          repos=$(gh search repos "topic:IoT language:${{ github.event.inputs.language }}" --sort stars --limit 100 --json name,url -q '.[].url')
+          echo "repos=$repos" >> $GITHUB_OUTPUT
+
+      - name: Prepare matrix
         id: set-matrix
         run: |
-          LANGUAGE="${{ github.event.inputs.language }}"
-          echo "Fetching top 100 IoT repos in $LANGUAGE..."
-          REPOS=$(curl -s "https://api.github.com/search/repositories?q=iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
-            | jq -r '.items[].clone_url')
-          # Remove empty lines
-          REPOS=$(echo "$REPOS" | sed '/^$/d')
-          
-          if [ -z "$REPOS" ]; then
-            echo "No repositories found. Exiting."
-            echo "matrix=[]" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          # Convert newline-separated list to JSON array
+          echo "::set-output name=matrix::$(echo '${{ steps.fetch-repos.outputs.repos }}' | jq -R -s -c 'split("\n")[:-1]')"
 
-          MATRIX_REPOS=$(echo "$REPOS" | jq -R -s -c 'split("\n")')
-          echo "matrix=$MATRIX_REPOS" >> $GITHUB_OUTPUT
-
- 
   scan:
     needs: fetch-and-scan
-    if: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) && fromJSON(needs.fetch-and-scan.outputs.matrix) | length > 0 }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         repo: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) }}
-      fail-fast: false
-
     steps:
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@master
+      - name: Checkout repo
+        uses: actions/checkout@v3
         with:
-          version: 1.5.2
+          repository: ${{ matrix.repo }}
+          fetch-depth: 0
 
-      - name: Clone repository
+      - name: Install Trivy
         run: |
-          REPO_NAME=$(basename ${{ matrix.repo }} .git)
-          git clone --depth 1 ${{ matrix.repo }} $REPO_NAME
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
 
-      - name: Scan repository
+      - name: Run Trivy scan
         run: |
-          REPO_NAME=$(basename ${{ matrix.repo }} .git)
-          cd $REPO_NAME
+          mkdir -p scan
+          trivy fs --scanners vuln,secret --format json -o scan/scan-results.json .
 
-          # Java project
-          if [ -f "pom.xml" ]; then
-            echo "Java project detected"
-            trivy fs . \
-              --scanners vuln \
-              --timeout 20m \
-              --file-patterns '**/pom.xml' \
-              --format json \
-              -o ../output/${REPO_NAME}_java.json
+      - name: Upload individual scan results
+        uses: actions/upload-artifact@v3
+        with:
+          name: trivy-scan-${{ matrix.repo }}
+          path: scan/scan-results.json
 
-          # Python project
-          elif [ -f "requirements.txt" ] || [ -d "venv" ]; then
-            echo "Python project detected"
-            trivy fs . \
-              --scanners vuln \
-              --timeout 20m \
-              --file-patterns '**/requirements.txt' \
-              --format json \
-              -o ../output/${REPO_NAME}_python.json
+  merge-and-upload:
+    needs: scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all scan results
+        uses: actions/download-artifact@v3
+        with:
+          path: all-scans
 
-          # Node.js project
-          elif [ -f "package.json" ]; then
-            echo "Node.js project detected"
-            trivy fs . \
-              --scanners vuln \
-              --timeout 20m \
-              --file-patterns '**/package.json' \
-              --format json \
-              -o ../output/${REPO_NAME}_node.json
+      - name: Merge scan results into pastry_summary.json
+        run: |
+          mkdir merged
+          cp all-scans/*/* scan
+          jq -s '.' all-scans/*/* > pastry_summary.json
 
-          else
-            echo "Unknown language. Skipping repository."
-
-      - name: Move output
-        run: mkdir -p ../output
+      - name: Upload pastry_summary
+        uses: actions/upload-artifact@v3
+        with:
+          name: pastry_summary
+          path: pastry_summary.json
