@@ -25,11 +25,19 @@ jobs:
       - name: Search Top IoT Repos
         id: fetch_repos
         run: |
-          LANGUAGE="${{ github.event.inputs.language }}"
-          curl -s -H "Authorization: token $GITHUB_TOKEN" \
-          "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100" \
-          | jq -r '.items[].clone_url' > repos.txt
-          echo "Fetched $(wc -l < repos.txt) repos."
+            LANGUAGE="${{ github.event.inputs.language }}"
+            RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/search/repositories?q=topic:iot+language:$LANGUAGE&sort=stars&order=desc&per_page=100")
+
+            if echo "$RESPONSE" | jq -e 'has("items")' >/dev/null; then
+              echo "$RESPONSE" | jq -r '.items | .[]?.clone_url' > repos.txt
+            else
+              echo "⚠️ GitHub API returned no .items; likely rate-limit or error:"
+              echo "$RESPONSE"
+              exit   1
+            fi
+
+            echo "Fetched $(wc -l < repos.txt) repos."
 
   scan:
     needs: fetch-repos
