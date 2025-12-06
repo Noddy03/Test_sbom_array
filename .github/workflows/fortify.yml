@@ -78,6 +78,7 @@ jobs:
 
           echo "Generating SBOM..."
           timeout 1200 trivy sbom \
+            --scanners vuln \
             --format cyclonedx \
             --output ../output/"${NAME}_sbom.json" .
 
@@ -120,8 +121,10 @@ jobs:
           mkdir -p master
           echo "repo,sbom_components,direct_vulnerabilities,sbom_vulnerabilities" > master/master_summary.csv
 
-          # Find all per-repo summary CSVs and append
-          find all_outputs -name "*_summary.csv" -exec tail -n +1 {} \; >> master/master_summary.csv
+          # Append per-repo CSVs (skip repeated headers)
+          for f in $(find all_outputs -name "*_summary.csv"); do
+            tail -n +2 "$f" >> master/master_summary.csv
+          done
 
       - name: Upload master_summary.csv
         uses: actions/upload-artifact@v4
