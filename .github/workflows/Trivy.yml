@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter repositories (e.g., Java, Python)'
+        description: 'Programming language to filter repos'
         required: true
-        default: 'Java'
+        default: 'java'
+      max_repos:
+        description: 'Number of repos to fetch'
+        required: false
+        default: 100
 
 jobs:
   fetch-and-scan:
@@ -14,70 +18,50 @@ jobs:
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
       - name: Set up GitHub CLI
-        uses: cli/cli-action@v2
+        uses: cli/gh-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fetch top 100 IoT repos
+      - name: Fetch top IoT repos
         id: fetch-repos
         run: |
-          echo "Fetching top 100 IoT repos for language: ${{ github.event.inputs.language }}"
-          repos=$(gh search repos "topic:IoT language:${{ github.event.inputs.language }}" --sort stars --limit 100 --json name,url -q '.[].url')
-          echo "repos=$repos" >> $GITHUB_OUTPUT
+          echo "Fetching top ${{ github.event.inputs.max_repos }} repos in language ${{ github.event.inputs.language }}"
+          REPOS=$(gh repo list --topic iot --language ${{ github.event.inputs.language }} --limit ${{ github.event.inputs.max_repos }} --sort stars --json nameWithOwner | jq -r '.[].nameWithOwner')
+          MATRIX_JSON=$(jq -n --argjson repos "$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')" '{"include": $repos | map({repo: .})}')
+          echo "$MATRIX_JSON" > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare matrix
+      - name: Set matrix output
         id: set-matrix
         run: |
-          # Convert newline-separated list to JSON array
-          echo "::set-output name=matrix::$(echo '${{ steps.fetch-repos.outputs.repos }}' | jq -R -s -c 'split("\n")[:-1]')"
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
 
   scan:
     needs: fetch-and-scan
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        repo: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix) }}
+      matrix: ${{fromJSON(needs.fetch-and-scan.outputs.matrix).include}}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
         with:
           repository: ${{ matrix.repo }}
-          fetch-depth: 0
+          path: repo
 
       - name: Install Trivy
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+          sudo apt-get update && sudo apt-get install -y wget
+          wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.68.0_Linux-64bit.deb
+          sudo dpkg -i trivy_0.68.0_Linux-64bit.deb
 
       - name: Run Trivy scan
+        working-directory: repo
         run: |
-          mkdir -p scan
-          trivy fs --scanners vuln,secret --format json -o scan/scan-results.json .
+          trivy fs --scanners vuln,secret --timeout 30m -f json -o ../output_${{ matrix.repo//\//_ }}.json .
 
-      - name: Upload individual scan results
+      - name: Upload Trivy JSON
         uses: actions/upload-artifact@v3
         with:
-          name: trivy-scan-${{ matrix.repo }}
-          path: scan/scan-results.json
-
-  merge-and-upload:
-    needs: scan
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all scan results
-        uses: actions/download-artifact@v3
-        with:
-          path: all-scans
-
-      - name: Merge scan results into pastry_summary.json
-        run: |
-          mkdir merged
-          cp all-scans/*/* scan
-          jq -s '.' all-scans/*/* > pastry_summary.json
-
-      - name: Upload pastry_summary
-        uses: actions/upload-artifact@v3
-        with:
-          name: pastry_summary
-          path: pastry_summary.json
+          name: trivy-report-${{ matrix.repo//\//_ }}
+          path: ../output_${{ matrix.repo//\//_ }}.json
