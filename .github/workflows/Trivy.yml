@@ -4,67 +4,72 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: 'Programming language to filter repos'
+        description: 'Programming language to filter repositories (e.g., Java, Python, JavaScript)'
         required: true
-        default: 'java'
+        default: 'Java'
       max_repos:
-        description: 'Number of repos to fetch'
+        description: 'Number of top repos to fetch'
         required: false
         default: '100'
 
 jobs:
-  fetch-and-scan:
+  fetch:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      matrix: ${{ steps.make-matrix.outputs.matrix }}
     steps:
-      - name: Set up GitHub CLI
-        uses: cli/gh-action@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Fetch top IoT repos
-        id: fetch-repos
+        id: make-matrix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Fetching top ${{ github.event.inputs.max_repos }} repos in language ${{ github.event.inputs.language }}"
-          REPOS=$(gh repo list --topic iot --language ${{ github.event.inputs.language }} --limit ${{ github.event.inputs.max_repos }} --sort stars --json nameWithOwner | jq -r '.[].nameWithOwner')
-          MATRIX_JSON=$(jq -n --argjson repos "$(echo "$REPOS" | jq -R -s -c 'split("\n")[:-1]')" '{"include": $repos | map({repo: .})}')
-          echo "$MATRIX_JSON" > matrix.json
-          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
-
-      - name: Set matrix output
-        id: set-matrix
-        run: |
-          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+          LANGUAGE="${{ github.event.inputs.language }}"
+          MAX=${{ github.event.inputs.max_repos }}
+          echo "Fetching top $MAX IoT repos written in $LANGUAGE"
+          # Use GitHub REST API via gh CLI
+          repos=$(gh api search/repositories \
+            -f q="topic:iot language:$LANGUAGE" \
+            -f sort=stars \
+            -f order=desc \
+            -f per_page=$MAX \
+            --jq '.items[].full_name')
+          # Build JSON array
+          json=$(echo "$repos" | jq -R -s -c 'split("\n")[:-1]')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
 
   scan:
-    needs: fetch-and-scan
+    needs: fetch
     runs-on: ubuntu-latest
     strategy:
-      matrix: ${{ fromJSON(needs.fetch-and-scan.outputs.matrix).include }}
+      matrix:
+        repo: ${{ fromJSON(needs.fetch.outputs.matrix) }}
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-        with:
-          repository: ${{ matrix.repo }}
-          path: repo
+      - name: Clone repo
+        run: |
+          git clone --depth 1 https://github.com/${{ matrix.repo }} repo
 
       - name: Install Trivy
         run: |
-          sudo apt-get update && sudo apt-get install -y wget
+          sudo apt-get update
+          sudo apt-get install -y wget
           wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.68.0_Linux-64bit.deb
           sudo dpkg -i trivy_0.68.0_Linux-64bit.deb
 
       - name: Run Trivy scan
         working-directory: repo
         run: |
-          # Replace '/' with '_' for filename
-          FILE_NAME=${{ matrix.repo }}
-          FILE_NAME=${FILE_NAME//\//_}
-          trivy fs --scanners vuln,secret --timeout 30m -f json -o ../output_${FILE_NAME}.json .
+          trivy fs --scanners vuln --timeout 15m --format json -o ../scan_${{ matrix.repo//\//_ }}.json .
 
-      - name: Upload Trivy JSON
+  merge:
+    needs: scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge results
+        run: |
+          jq -s '.' scan_*.json > pastry_summary.json
+
+      - name: Upload summary
         uses: actions/upload-artifact@v3
         with:
-          name: trivy-report-${{ matrix.repo }}
-          path: ../output_${{ matrix.repo }}.json
+          name: pastry_summary
+          path: pastry_summary.json
