@@ -1,4 +1,4 @@
-name: IOT_SBOM_SCA
+name: IOT_SBOM_SCA_Trivy
 
 on:
   workflow_dispatch:
