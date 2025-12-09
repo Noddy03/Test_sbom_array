@@ -1,4 +1,4 @@
-name: Snyk-Centric Security Scan (with Optional Semgrep)
+name: Dependency-Track Security Scan (Snyk + Semgrep)
 
 on:
   workflow_dispatch:
@@ -6,14 +6,10 @@ on:
       repo_name:
         description: "GitHub repository to scan (e.g., owner/repo)"
         required: true
-      semgrep_enabled:
-        description: "Enable Semgrep scan (true/false)"
-        required: false
-        default: "false"
       semgrep_language:
-        description: "Optional Semgrep language hint"
+        description: "Language hint for Semgrep scan"
         required: false
-        default: "python"
+        default: "java"
 
 permissions:
   contents: read
@@ -31,63 +27,62 @@ jobs:
       - name: Checkout repository
         run: git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
-      # 2️⃣ Install dependencies based on project type
+      # 2️⃣ Setup Java 17 for Maven projects
+      - name: Setup Java 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-17-jdk maven
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          java -version
+          mvn -version
+
+      # 3️⃣ Install project dependencies
       - name: Install dependencies
         run: |
           cd project-src
-          # Java
           if [ -f pom.xml ]; then
-            echo "Detected Java project"
-            sudo apt-get update
-            sudo apt-get install -y openjdk-21-jdk
-            export JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
             mvn clean install -DskipTests
           fi
-          # Python
           if [ -f requirements.txt ]; then
             python3 -m pip install --upgrade pip
             pip install -r requirements.txt
           fi
-          # Node.js
           if [ -f package.json ]; then
             npm install
           fi
-          # Go
           if [ -f go.mod ]; then
             go mod download
           fi
-          # Ruby
           if [ -f Gemfile ]; then
             bundle install --jobs=4 || true
           fi
 
-      # 3️⃣ Setup Snyk
+      # 4️⃣ Setup Snyk CLI
       - name: Setup Snyk
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      # 4️⃣ Run Snyk Open Source (SCA + licenses)
+      # 5️⃣ Run Snyk Open Source (SCA + licenses)
       - name: Run Snyk Open Source (SCA)
         run: |
           snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
           echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
 
-      # 5️⃣ Run Snyk Code (SAST)
+      # 6️⃣ Run Snyk Code (SAST)
       - name: Run Snyk Code (SAST)
         run: |
           snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
           echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
-      # 6️⃣ Optional Semgrep scan
+      # 7️⃣ Install Semgrep
       - name: Install Semgrep
-        if: ${{ github.event.inputs.semgrep_enabled == 'true' }}
         run: |
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
+      # 8️⃣ Run Semgrep scan (mandatory)
       - name: Run Semgrep scan
-        if: ${{ github.event.inputs.semgrep_enabled == 'true' }}
         run: |
           SEMGREP_SARIF="project-src/semgrep.sarif"
           semgrep --config auto \
@@ -98,7 +93,7 @@ jobs:
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
 
-      # 7️⃣ Generate summary CSV
+      # 9️⃣ Generate summary.csv
       - name: Generate summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
@@ -118,30 +113,23 @@ jobs:
           SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/snyk-code.sarif || echo 0)
 
           # Semgrep counts
-          if [ -f project-src/semgrep.sarif ]; then
-            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif || echo 0)
-            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif || echo 0)
-            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
-            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
-          else
-            SEM_LOW=0
-            SEM_MEDIUM=0
-            SEM_HIGH=0
-            SEM_CRITICAL=0
-          fi
+          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif || echo 0)
+          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif || echo 0)
+          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
+          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
 
           TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+LICENSES+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
           echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$LICENSES,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
 
-      # 8️⃣ Sanitize artifact name
+      # 🔟 Sanitize artifact name
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 9️⃣ Upload artifacts
+      # 1️⃣1️⃣ Upload scan artifacts
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
