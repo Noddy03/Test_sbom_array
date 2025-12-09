@@ -26,7 +26,7 @@ jobs:
           repository: ${{ github.event.inputs.repo_name }}
           fetch-depth: 1
 
-      # 2️⃣ Setup Java + Maven (fast, uses pre-installed tools)
+      # 2️⃣ Setup Java + Maven
       - name: Setup Java 17 + Maven
         uses: actions/setup-java@v4
         with:
@@ -41,13 +41,13 @@ jobs:
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
-      # 4️⃣ Run Semgrep scan
+      # 4️⃣ Run Semgrep SAST scan
       - name: Run Semgrep SAST scan
         run: |
           SEMGREP_SARIF="project-src/semgrep.sarif"
-          semgrep --config "p/security-audit" \
-                  --recursive \
-                  --sarif -o "$SEMGREP_SARIF" project-src || true
+          mkdir -p project-src
+          semgrep scan --config "p/security-audit" \
+                       --sarif -o "$SEMGREP_SARIF" project-src || true
           if [ ! -s "$SEMGREP_SARIF" ]; then
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
@@ -58,7 +58,7 @@ jobs:
         with:
           snyk-version: "latest"
 
-      # 6️⃣ Run Snyk Open Source (dependency scanning)
+      # 6️⃣ Run Snyk Open Source (SCA)
       - name: Run Snyk Open Source (SCA)
         run: |
           snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
@@ -70,7 +70,7 @@ jobs:
           snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
           echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
-      # 8️⃣ Generate summary CSV with severity classification
+      # 8️⃣ Generate summary CSV
       - name: Generate summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
