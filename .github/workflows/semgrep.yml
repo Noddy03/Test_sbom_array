@@ -4,138 +4,200 @@ on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Programming language to filter repos"
+        description: "Programming language for ranking repos"
         required: true
         default: "Java"
       top_n:
-        description: "Top N repos to scan"
+        description: "How many top repos to consider"
         required: false
         default: "20"
 
 permissions:
   contents: read
-  actions: read
+  security-events: write
 
 jobs:
-  scan:
+  discover_repos:
     runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    outputs:
+      repo_list: ${{ steps.collect.outputs.repo_list }}
 
     steps:
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
-          pip install requests jq semgrep
+          pip install requests
 
-      - name: Fetch repos by language and filter SBOM
-        id: fetch_repos
+      - name: Fetch and filter repositories (recursive SBOM detection)
+        id: collect
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_LANGUAGE: ${{ inputs.language }}
           INPUT_TOP_N: ${{ inputs.top_n }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python << 'EOF'
-          import os, requests, urllib.parse
+          import os, requests, urllib.parse, time
 
           lang = os.environ["INPUT_LANGUAGE"]
           top_n = int(os.environ["INPUT_TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
-
           headers = {"Authorization": f"token {token}"}
 
-          # 1️⃣ Search top repos by language only
+          # 1️⃣ Fetch top N repos by language
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page={top_n}"
-          print("DEBUG Search URL:", url)
+          print("DEBUG: Search URL:", url)
+
           r = requests.get(url, headers=headers)
           r.raise_for_status()
+          repos = [i["full_name"] for i in r.json()["items"]]
+          print("DEBUG: Initial repos:", repos)
 
-          repos = [item["full_name"] for item in r.json().get("items", [])]
-          print("DEBUG Found repos:", repos)
-
-          sbom_matches = []
-          sbom_files = [
-              "sbom.json", "sbom.xml", "sbom",
-              "cyclonedx.json", "cyclonedx.xml", "cyclonedx",
-              "bom.json", "bom.xml", "bom"
+          # SBOM filename patterns (expanded)
+          sbom_keywords = [
+              "sbom", "bom",
+              "cyclonedx", "spdx",
+              "sbom.json", "sbom.xml",
+              "bom.json", "bom.xml",
+              "package-lock.cdx.json",
           ]
 
-          # 2️⃣ For each repo, check SBOM files using /contents/*
+          matches = []
+
+          # 2️⃣ Recursive SBOM search using Git Trees API
           for repo in repos:
-            print(f"Checking SBOM in {repo}")
-            for fname in sbom_files:
-              contents_url = f"https://api.github.com/repos/{repo}/contents/"
-              rc = requests.get(contents_url, headers=headers)
+            print(f"Checking SBOM in {repo} ...")
+            tree_url = f"https://api.github.com/repos/{repo}/git/trees/HEAD?recursive=1"
 
-              if not rc.ok:
-                continue
+            t = requests.get(tree_url, headers=headers)
+            if t.status_code == 403:   # rate limit
+              print("Hit rate limit. Sleeping...")
+              time.sleep(30)
+              t = requests.get(tree_url, headers=headers)
 
-              root_files = [f["name"].lower() for f in rc.json() if isinstance(f, dict)]
+            if not t.ok:
+              print("FAILED:", repo, t.text)
+              continue
 
-              if fname.lower() in root_files:
-                sbom_matches.append(repo)
-                print("✔ SBOM found:", repo)
-                break
+            files = [
+              node["path"].lower()
+              for node in t.json().get("tree", [])
+              if node.get("type") == "blob"
+            ]
 
-          print("DEBUG Repos with SBOM:", sbom_matches)
-          print(f"::set-output name=repos::{','.join(sbom_matches)}")
+            if any(keyword in f for keyword in sbom_keywords for f in files):
+              print("✔ SBOM FOUND:", repo)
+              matches.append(repo)
+            else:
+              print("✖ No SBOM in:", repo)
+
+          print("FINAL SBOM repos:", matches)
+          print(f"::set-output name=repo_list::{','.join(matches)}")
           EOF
 
-      - name: Prepare summary.csv
-        run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > summary.csv
+  scan_repos:
+    needs: discover_repos
 
-      - name: Scan repositories
+    if: ${{ needs.discover_repos.outputs.repo_list != '' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJson('["' + join(needs.discover_repos.outputs.repo_list, '","') + '"]') }}
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install tools
         run: |
-          if [ -z "${{ steps.fetch_repos.outputs.repos }}" ]; then
-            echo "No repos found with SBOM"
-            exit 0
+          sudo apt-get update
+          sudo apt-get install -y jq
+          pip install semgrep requests
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo }}
+          path: project-src
+
+      - name: Install dependencies (auto-detect)
+        working-directory: project-src
+        run: |
+          if [ -f pom.xml ]; then
+            mvn -B dependency:go-offline
+          elif [ -f package.json ]; then
+            npm ci || npm install
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           fi
 
-          for repo in ${{ steps.fetch_repos.outputs.repos }}; do
-            echo "Scanning $repo"
-            git clone --depth 1 https://github.com/$repo project-src
-            cd project-src || exit 1
+      - name: Run Snyk SCA
+        working-directory: project-src
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test --all-projects --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
 
-            # Dependency installation
-            if [ -f pom.xml ]; then
-              mvn -B dependency:go-offline
-            elif [ -f package.json ]; then
-              npm install
-            elif [ -f requirements.txt ]; then
-              pip install -r requirements.txt
-            fi
+      - name: Run Snyk SAST
+        working-directory: project-src
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk code test --sarif-file ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
 
-            snyk test --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
-            snyk code test --sarif-file ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
-            semgrep scan --config p/security-audit --sarif-file ../semgrep.sarif . || echo '{"runs":[]}' > ../semgrep.sarif
+      - name: Run Semgrep
+        working-directory: project-src
+        run: |
+          semgrep scan --config p/security-audit --sarif-file ../semgrep.sarif . || echo '{"runs":[]}' > ../semgrep.sarif
 
-            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
-            SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
-            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
-            SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
+      - name: Compute summary for repo
+        id: compute
+        run: |
+          REPO="${{ matrix.repo }}"
 
-            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
-            SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
-            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
-            SAST_CRITICAL=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' ../snyk-code.sarif)
+          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' snyk-sca.json)
+          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' snyk-sca.json)
+          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' snyk-sca.json)
+          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' snyk-sca.json)
 
-            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' ../semgrep.sarif)
-            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' ../semgrep.sarif)
-            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' ../semgrep.sarif)
-            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' ../semgrep.sarif)
+          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' snyk-code.sarif)
+          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' snyk-code.sarif)
+          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' snyk-code.sarif)
+          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' snyk-code.sarif)
 
-            TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' semgrep.sarif)
+          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' semgrep.sarif)
+          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' semgrep.sarif)
+          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' semgrep.sarif)
 
-            echo "\"$repo\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> ../summary.csv
+          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-            cd ..
-            rm -rf project-src
-          done
+          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary_${REPO//\//_}.csv
+          echo "$REPO,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary_${REPO//\//_}.csv
 
-      - name: Upload summary
+      - name: Upload Repo CSV
         uses: actions/upload-artifact@v4
         with:
-          name: top-repos-security-summary
+          name: "repo-summary-${{ matrix.repo }}"
+          path: summary_${{ matrix.repo//\//_ }}.csv
+
+
+  merge_results:
+    needs: scan_repos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all CSVs
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Merge CSVs
+        run: |
+          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary.csv
+          cat results/**/*.csv | grep -v "repo,SCA_LOW" >> summary.csv
+
+      - name: Upload Summary CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-summary
           path: summary.csv
