@@ -1,15 +1,16 @@
-name: Full Security Scan (Snyk + Semgrep)
+name: Top Repos Security Scan
 
 on:
   workflow_dispatch:
     inputs:
-      repo_name:
-        description: "GitHub repository to scan (owner/repo)"
-        required: true
       language:
-        description: "Semgrep language hint"
+        description: "Programming language to scan (e.g., java, python)"
+        required: true
+        default: 'java'
+      top_n:
+        description: "Number of top repos to fetch"
         required: false
-        default: "java"
+        default: '20'
 
 permissions:
   contents: read
@@ -17,121 +18,86 @@ permissions:
   actions: read
 
 jobs:
-  full_scan:
+  scan_top_repos:
     runs-on: ubuntu-latest
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      # 1️⃣ Checkout repository
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.event.inputs.repo_name }}
-          fetch-depth: 1
-
-      # 2️⃣ Setup Java + Maven (for Java repos)
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17  # use 17, 20, or adjust for repo
-          cache: maven
-
-      # 3️⃣ Install dependencies
       - name: Install dependencies
         run: |
-          cd $GITHUB_WORKSPACE
-          if [ -f pom.xml ]; then
-            mvn dependency:resolve
-          fi
-          if [ -f requirements.txt ]; then
-            python3 -m pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
-          if [ -f package.json ]; then
-            npm install
-          fi
+          sudo apt-get update
+          sudo apt-get install -y jq python3-pip git
+          pip3 install --upgrade pip semgrep
 
-      # 4️⃣ Setup Semgrep
-      - name: Install Semgrep
-        run: |
-          python3 -m pip install --upgrade pip
-          pip install semgrep jq
-
-      # 5️⃣ Run Semgrep scan (multiple rulesets)
-      - name: Run Semgrep scan
-        run: |
-          SEMGREP_SARIF="$GITHUB_WORKSPACE/semgrep.sarif"
-          semgrep scan \
-            --config "p/security-audit,p/owasp-top10,p/ci" \
-            --lang ${{ github.event.inputs.language }} \
-            --sarif -o "$SEMGREP_SARIF" $GITHUB_WORKSPACE || true
-          # Ensure SARIF exists
-          if [ ! -s "$SEMGREP_SARIF" ]; then
-            echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
-          fi
-
-      # 6️⃣ Setup Snyk CLI
-      - name: Setup Snyk
+      - name: Setup Snyk CLI
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      # 7️⃣ Run Snyk SCA scan (all projects)
-      - name: Run Snyk Open Source (SCA)
+      - name: Fetch top repositories
+        id: fetch_repos
         run: |
-          snyk test $GITHUB_WORKSPACE --all-projects --json > $GITHUB_WORKSPACE/snyk-sca.json || \
-          echo '{"vulnerabilities":[]}' > $GITHUB_WORKSPACE/snyk-sca.json
+          LANG="${{ github.event.inputs.language }}"
+          TOP_N="${{ github.event.inputs.top_n }}"
+          echo "Fetching top $TOP_N repos for language $LANG"
+          REPOS_JSON=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/search/repositories?q=language:$LANG&sort=stars&order=desc&per_page=$TOP_N")
+          echo "$REPOS_JSON" > repos.json
+          REPO_LIST=$(jq -r '.items[].full_name' repos.json)
+          echo "repos=$REPO_LIST" >> $GITHUB_OUTPUT
 
-      # 8️⃣ Run Snyk Code scan (SAST)
-      - name: Run Snyk Code (SAST)
+      - name: Initialize summary CSV
         run: |
-          snyk code test $GITHUB_WORKSPACE --all-projects --sarif-file=$GITHUB_WORKSPACE/snyk-code.sarif || \
-          echo '{"version":"2.1.0","runs":[]}' > $GITHUB_WORKSPACE/snyk-code.sarif
+          echo "repo_name,stars,sbom_exists,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > summary.csv
 
-      # 9️⃣ Generate summary.csv
-      - name: Generate summary.csv
+      - name: Scan top repositories
         run: |
-          SUMMARY="$GITHUB_WORKSPACE/summary.csv"
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
-          
-          # Snyk SCA severity counts
-          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
-          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
-          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
-          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
-          
-          # Snyk Code severity counts
-          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
-          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
-          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
-          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
-          
-          # Semgrep severity counts
-          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
-          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
-          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
-          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
-          
-          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
-          
-          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
+          for REPO in ${{ steps.fetch_repos.outputs.repos }}; do
+            echo "Scanning $REPO"
+            git clone --depth 1 "https://github.com/$REPO" repo-src
+            STARS=$(jq -r --arg r "$REPO" '.items[] | select(.full_name==$r) | .stargazers_count' repos.json)
+            SBOM_EXISTS=$(find repo-src -type f \( -iname "*sbom*" -o -iname "*bom*" \) | wc -l)
 
-      # 🔟 Sanitize artifact name
-      - name: Sanitize artifact name
-        id: sanitize
-        run: |
-          SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
-          echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
+            # Snyk SCA
+            snyk test repo-src --all-projects --json > repo-src/snyk-sca.json || echo '{"vulnerabilities":[]}' > repo-src/snyk-sca.json
+            # Snyk Code
+            snyk code test repo-src --all-projects --sarif-file=repo-src/snyk-code.sarif || echo '{"version":"2.1.0","runs":[]}' > repo-src/snyk-code.sarif
+            # Semgrep
+            semgrep --config auto --sarif -o repo-src/semgrep.sarif repo-src || echo '{"version":"2.1.0","runs":[]}' > repo-src/semgrep.sarif
 
-      # 1️⃣1️⃣ Upload artifacts
-      - name: Upload scan results
+            # SCA severity counts
+            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' repo-src/snyk-sca.json || echo 0)
+            SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' repo-src/snyk-sca.json || echo 0)
+            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' repo-src/snyk-sca.json || echo 0)
+            SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' repo-src/snyk-sca.json || echo 0)
+
+            # SAST severity counts
+            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' repo-src/snyk-code.sarif || echo 0)
+            SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' repo-src/snyk-code.sarif || echo 0)
+            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' repo-src/snyk-code.sarif || echo 0)
+            SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' repo-src/snyk-code.sarif || echo 0)
+
+            # Semgrep severity counts
+            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' repo-src/semgrep.sarif || echo 0)
+            SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' repo-src/semgrep.sarif || echo 0)
+            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' repo-src/semgrep.sarif || echo 0)
+            SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' repo-src/semgrep.sarif || echo 0)
+
+            TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+
+            echo "$REPO,$STARS,$SBOM_EXISTS,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary.csv
+
+            rm -rf repo-src
+          done
+
+      - name: Upload summary and results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.sanitize.outputs.safe_repo }}-security-results
+          name: top_repos_security_summary
           path: |
-            $GITHUB_WORKSPACE/summary.csv
-            $GITHUB_WORKSPACE/snyk-sca.json
-            $GITHUB_WORKSPACE/snyk-code.sarif
-            $GITHUB_WORKSPACE/semgrep.sarif
+            summary.csv
+            **/snyk-sca.json
+            **/snyk-code.sarif
+            **/semgrep.sarif
