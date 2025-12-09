@@ -1,4 +1,4 @@
-name: Single-Repo Snyk Full Scan (SCA + SAST w/ Severity)
+name: Single-Repo Snyk Full Scan (SCA + SAST with Severity)
 
 on:
   workflow_dispatch:
@@ -15,69 +15,88 @@ permissions:
 jobs:
   snyk_scan:
     runs-on: ubuntu-latest
-
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
+      # 1️⃣ Checkout repo
       - name: Checkout repository
         run: |
           git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
-      - name: Set up Snyk CLI
+      # 2️⃣ Install dependencies (auto-detect by language)
+      - name: Install dependencies
+        run: |
+          cd project-src
+          # Python
+          if [ -f requirements.txt ]; then
+            python3 -m pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+          # Node.js
+          if [ -f package.json ]; then
+            npm install
+          fi
+          # Java (Maven)
+          if [ -f pom.xml ]; then
+            mvn dependency:resolve
+          fi
+          # Go
+          if [ -f go.mod ]; then
+            go mod download
+          fi
+          # Ruby
+          if [ -f Gemfile ]; then
+            bundle install --jobs=4 || true
+          fi
+
+      # 3️⃣ Setup Snyk CLI
+      - name: Setup Snyk CLI
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      ############################################
-      # Snyk SCA (Open Source) - ALL MODULES
-      ############################################
+      # 4️⃣ Run SCA scan (Open Source dependencies)
       - name: Run Snyk Open Source (SCA)
         run: |
-          snyk test project-src \
-            --all-projects \
-            --json > project-src/snyk-sca.json || \
-            echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
+          snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
+          echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
 
-      ############################################
-      # Snyk Code (SAST) - ALL PROJECTS
-      ############################################
+      # 5️⃣ Run Snyk Code scan (SAST)
       - name: Run Snyk Code (SAST)
         run: |
-          snyk code test project-src \
-            --all-projects \
-            --sarif-file=project-src/snyk-code.sarif || \
-            echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
+          snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
+          echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
 
-      ############################################
-      # Summary CSV with severity levels
-      ############################################
+      # 6️⃣ Generate summary CSV
       - name: Generate summary.csv
         run: |
-          # SCA severity counts
-          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
-          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
-          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
-          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json 2>/dev/null || echo 0)
+          SUMMARY="project-src/summary.csv"
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical" > "$SUMMARY"
 
-          # SAST severity counts
-          SAST_ERROR=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
-          SAST_WARNING=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
-          SAST_NOTE=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif 2>/dev/null || echo 0)
+          # SCA counts
+          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json || echo 0)
+          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json || echo 0)
+          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json || echo 0)
+          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json || echo 0)
 
-          echo "repo,sca_critical,sca_high,sca_medium,sca_low,sast_error,sast_warning,sast_note" > project-src/summary.csv
-          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_CRITICAL,$SCA_HIGH,$SCA_MEDIUM,$SCA_LOW,$SAST_ERROR,$SAST_WARNING,$SAST_NOTE" \
-            >> project-src/summary.csv
+          # SAST counts (map levels to severity)
+          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif || echo 0)
+          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif || echo 0)
+          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif || echo 0)
+          # Optional: classify specific Snyk Code rules as critical
+          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/snyk-code.sarif || echo 0)
 
-      ############################################
-      # Upload results
-      ############################################
+          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL" >> "$SUMMARY"
+
+      # 7️⃣ Sanitize artifact name
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
+      # 8️⃣ Upload SARIF + CSV
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
