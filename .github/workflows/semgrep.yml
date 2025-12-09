@@ -1,4 +1,4 @@
-name: IoT Semgrep Single-Repo Scan
+name: IoT Semgrep Single-Repo Security Scan
 
 on:
   workflow_dispatch:
@@ -7,7 +7,7 @@ on:
         description: "GitHub repository to scan (format: owner/repo)"
         required: true
       language:
-        description: "Language hint for Semgrep auto rules"
+        description: "Optional language hint for Semgrep"
         required: false
         default: "python"
 
@@ -21,28 +21,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout target repository
+      # 1️⃣ Checkout repo
+      - name: Checkout repository
         run: |
           git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
+      # 2️⃣ Install Semgrep
       - name: Install Semgrep
         run: |
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
-      - name: Run Semgrep scan (SARIF output)
+      # 3️⃣ Run Semgrep scan (security-focused)
+      - name: Run Semgrep security scan
         run: |
           SEMGREP_SARIF="project-src/semgrep.sarif"
-          semgrep --config auto \
+          semgrep --config "p/security-audit" \
                   --lang ${{ github.event.inputs.language }} \
-                  --sarif \
-                  -o "$SEMGREP_SARIF" \
-                  project-src || true
+                  --recursive \
+                  --sarif -o "$SEMGREP_SARIF" project-src || true
+          # Ensure SARIF exists
           if [ ! -s "$SEMGREP_SARIF" ]; then
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
 
-      - name: Convert SARIF to summary.csv
+      # 4️⃣ Convert SARIF to summary.csv
+      - name: Generate summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
           echo "repo,total,low,medium,high,critical" > "$SUMMARY"
@@ -51,20 +55,22 @@ jobs:
           LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
           MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
           HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
-          
-          # Optional: mark critical based on a specific rule ID pattern (example)
-          CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
-          
+
+          # Critical: any rule in the security-audit critical subset
+          CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
+
           TOTAL=$((LOW + MEDIUM + HIGH + CRITICAL))
           echo "\"${{ github.event.inputs.repo_name }}\",$TOTAL,$LOW,$MEDIUM,$HIGH,$CRITICAL" >> "$SUMMARY"
 
+      # 5️⃣ Sanitize artifact name
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Upload SARIF + summary
+      # 6️⃣ Upload SARIF + summary CSV
+      - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.sanitize.outputs.safe_repo }}-semgrep
