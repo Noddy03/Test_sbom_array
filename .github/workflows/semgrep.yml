@@ -32,9 +32,10 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: '17'
-          cache: none
+         distribution: temurin
+         java-version: '17'
+         cache: maven
+
 
       # 3️⃣ Install dependencies
       - name: Install CLI tools
