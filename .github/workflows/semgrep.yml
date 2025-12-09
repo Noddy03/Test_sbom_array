@@ -28,18 +28,16 @@ jobs:
       - name: Install Semgrep
         run: |
           python3 -m pip install --upgrade pip
-          pip install semgrep
+          pip install semgrep jq
 
       - name: Run Semgrep scan (SARIF output)
         run: |
           SEMGREP_SARIF="project-src/semgrep.sarif"
-
           semgrep --config auto \
+                  --lang ${{ github.event.inputs.language }} \
                   --sarif \
                   -o "$SEMGREP_SARIF" \
                   project-src || true
-
-          # Ensure SARIF always exists
           if [ ! -s "$SEMGREP_SARIF" ]; then
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
@@ -47,13 +45,18 @@ jobs:
       - name: Convert SARIF to summary.csv
         run: |
           SUMMARY="project-src/summary.csv"
-          echo "repo,total_findings,high,severe" > "$SUMMARY"
+          echo "repo,total,low,medium,high,critical" > "$SUMMARY"
 
-          TOTAL=$(jq '[.runs[].results[]] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
-          HIGH=$(jq '[.runs[].results[] | select(.level=="WARNING" or .level=="ERROR")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
-          SEVERE=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
-
-          echo "\"${{ github.event.inputs.repo_name }}\",$TOTAL,$HIGH,$SEVERE" >> "$SUMMARY"
+          # Map Semgrep levels to severity
+          LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
+          MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
+          HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
+          
+          # Optional: mark critical based on a specific rule ID pattern (example)
+          CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/semgrep.sarif 2>/dev/null || echo 0)
+          
+          TOTAL=$((LOW + MEDIUM + HIGH + CRITICAL))
+          echo "\"${{ github.event.inputs.repo_name }}\",$TOTAL,$LOW,$MEDIUM,$HIGH,$CRITICAL" >> "$SUMMARY"
 
       - name: Sanitize artifact name
         id: sanitize
