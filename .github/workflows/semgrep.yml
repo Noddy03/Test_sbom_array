@@ -1,11 +1,15 @@
-name: Single-Repo Security Scan (SCA + SAST + Semgrep)
+name: Full Security Scan (Snyk + Semgrep)
 
 on:
   workflow_dispatch:
     inputs:
       repo_name:
-        description: "GitHub repository to scan (e.g., owner/repo)"
+        description: "GitHub repository to scan (owner/repo)"
         required: true
+      language:
+        description: "Semgrep language hint"
+        required: false
+        default: "java"
 
 permissions:
   contents: read
@@ -13,101 +17,121 @@ permissions:
   actions: read
 
 jobs:
-  security_scan:
+  full_scan:
     runs-on: ubuntu-latest
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-      # 1️⃣ Checkout repository first (required for caching)
+      # 1️⃣ Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.inputs.repo_name }}
-          path: project-src
           fetch-depth: 1
 
-      # 2️⃣ Setup Java 17 + Maven (cache works now)
-      - name: Setup Java 17 + Maven
+      # 2️⃣ Setup Java + Maven (for Java repos)
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 17  # use 17, 20, or adjust for repo
           cache: maven
-          cache-dependency-path: 'project-src/**/pom.xml'
 
-      # 3️⃣ Install Semgrep + jq
+      # 3️⃣ Install dependencies
+      - name: Install dependencies
+        run: |
+          cd $GITHUB_WORKSPACE
+          if [ -f pom.xml ]; then
+            mvn dependency:resolve
+          fi
+          if [ -f requirements.txt ]; then
+            python3 -m pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+          if [ -f package.json ]; then
+            npm install
+          fi
+
+      # 4️⃣ Setup Semgrep
       - name: Install Semgrep
         run: |
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
-      # 4️⃣ Run Semgrep SAST scan
-      - name: Run Semgrep SAST scan
+      # 5️⃣ Run Semgrep scan (multiple rulesets)
+      - name: Run Semgrep scan
         run: |
-          SEMGREP_SARIF="project-src/semgrep.sarif"
-          mkdir -p project-src
-          semgrep scan --config "p/security-audit" \
-                       --sarif -o "$SEMGREP_SARIF" project-src || true
+          SEMGREP_SARIF="$GITHUB_WORKSPACE/semgrep.sarif"
+          semgrep scan \
+            --config "p/security-audit,p/owasp-top10,p/ci" \
+            --lang ${{ github.event.inputs.language }} \
+            --sarif -o "$SEMGREP_SARIF" $GITHUB_WORKSPACE || true
+          # Ensure SARIF exists
           if [ ! -s "$SEMGREP_SARIF" ]; then
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
 
-      # 5️⃣ Setup Snyk CLI
+      # 6️⃣ Setup Snyk CLI
       - name: Setup Snyk
         uses: snyk/actions/setup@v1
         with:
           snyk-version: "latest"
 
-      # 6️⃣ Run Snyk Open Source (SCA)
+      # 7️⃣ Run Snyk SCA scan (all projects)
       - name: Run Snyk Open Source (SCA)
         run: |
-          snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
-          echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
+          snyk test $GITHUB_WORKSPACE --all-projects --json > $GITHUB_WORKSPACE/snyk-sca.json || \
+          echo '{"vulnerabilities":[]}' > $GITHUB_WORKSPACE/snyk-sca.json
 
-      # 7️⃣ Run Snyk Code (SAST)
+      # 8️⃣ Run Snyk Code scan (SAST)
       - name: Run Snyk Code (SAST)
         run: |
-          snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
-          echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
+          snyk code test $GITHUB_WORKSPACE --all-projects --sarif-file=$GITHUB_WORKSPACE/snyk-code.sarif || \
+          echo '{"version":"2.1.0","runs":[]}' > $GITHUB_WORKSPACE/snyk-code.sarif
 
-      # 8️⃣ Generate summary CSV
+      # 9️⃣ Generate summary.csv
       - name: Generate summary.csv
         run: |
-          SUMMARY="project-src/summary.csv"
+          SUMMARY="$GITHUB_WORKSPACE/summary.csv"
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
-
-          # SCA counts
-          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json || echo 0)
-          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json || echo 0)
-          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json || echo 0)
-          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json || echo 0)
-
-          # Snyk Code counts
-          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif || echo 0)
-          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif || echo 0)
-          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif || echo 0)
-          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' project-src/snyk-code.sarif || echo 0)
-
-          # Semgrep counts
-          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
-          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
-
+          
+          # Snyk SCA severity counts
+          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
+          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
+          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
+          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' $GITHUB_WORKSPACE/snyk-sca.json || echo 0)
+          
+          # Snyk Code severity counts
+          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
+          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
+          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
+          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' $GITHUB_WORKSPACE/snyk-code.sarif || echo 0)
+          
+          # Semgrep severity counts
+          SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
+          SEM_MEDIUM=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
+          SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
+          SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' $GITHUB_WORKSPACE/semgrep.sarif || echo 0)
+          
           TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+          
           echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
 
-      # 9️⃣ Sanitize artifact name
+      # 🔟 Sanitize artifact name
       - name: Sanitize artifact name
         id: sanitize
         run: |
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 🔟 Upload artifacts
+      # 1️⃣1️⃣ Upload artifacts
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.sanitize.outputs.safe_repo }}-security-results
-          path: project-src
+          path: |
+            $GITHUB_WORKSPACE/summary.csv
+            $GITHUB_WORKSPACE/snyk-sca.json
+            $GITHUB_WORKSPACE/snyk-code.sarif
+            $GITHUB_WORKSPACE/semgrep.sarif
