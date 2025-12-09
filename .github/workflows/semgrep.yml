@@ -55,7 +55,7 @@ jobs:
           repos = [item["full_name"] for item in items]
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
-              fh.write(f"repos={' '.join(repos)}\n")
+              fh.write(f"repos={','.join(repos)}\n")
 
           print("Found repos:", repos)
           EOF
@@ -66,60 +66,57 @@ jobs:
 
       - name: Scan repositories
         run: |
-          for repo in ${{ steps.fetch_repos.outputs.repos }}; do
-            echo "=============================="
-            echo "Scanning $repo"
-            echo "=============================="
+          IFS=',' read -ra REPO_LIST <<< "${{ steps.fetch_repos.outputs.repos }}"
+          for repo in "${REPO_LIST[@]}"; do
+              echo "=============================="
+              echo "Scanning $repo"
+              echo "=============================="
 
-            git clone --depth 1 https://github.com/$repo project-src
-            cd project-src || exit 1
+              git clone --depth 1 https://github.com/$repo project-src
+              cd project-src || exit 1
 
-            # Detect package manager
-            if [ -f pom.xml ]; then
-              echo "Using Maven"
-              mvn -B dependency:go-offline
-            elif [ -f package.json ]; then
-              echo "Using Node.js"
-              npm ci || npm install
-            elif [ -f requirements.txt ]; then
-              echo "Using Python"
-              python3 -m pip install --upgrade pip
-              pip install -r requirements.txt
-            else
-              echo "No recognized dependency file found"
-            fi
+              # Detect package manager
+              if [ -f pom.xml ]; then
+                echo "Using Maven"
+                mvn -B dependency:go-offline
+              elif [ -f package.json ]; then
+                echo "Using Node.js"
+                npm ci || npm install
+              elif [ -f requirements.txt ]; then
+                echo "Using Python"
+                python3 -m pip install --upgrade pip
+                pip install -r requirements.txt
+              else
+                echo "No recognized dependency file found"
+              fi
 
-            # Snyk SCA
-            snyk test --all-projects --json > ../snyk-sca.json 2>/dev/null || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
+              # Run scans
+              snyk test --all-projects --json > ../snyk-sca.json 2>/dev/null || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
+              snyk code test --all-projects --sarif-file ../snyk-code.sarif 2>/dev/null || echo '{"version":"2.1.0","runs":[]}' > ../snyk-code.sarif
+              semgrep scan --config p/security-audit --sarif-file ../semgrep.sarif . 2>/dev/null || echo '{"version":"2.1.0","runs":[]}' > ../semgrep.sarif
 
-            # Snyk Code (SAST)
-            snyk code test --all-projects --sarif-file ../snyk-code.sarif 2>/dev/null || echo '{"version":"2.1.0","runs":[]}' > ../snyk-code.sarif
+              # Parse counts
+              SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
+              SCA_MED=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
+              SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
+              SCA_CRIT=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
 
-            # Semgrep
-            semgrep scan --config p/security-audit --sarif-file ../semgrep.sarif . 2>/dev/null || echo '{"version":"2.1.0","runs":[]}' > ../semgrep.sarif
+              SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
+              SAST_MED=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
+              SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
+              SAST_CRIT=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' ../snyk-code.sarif)
 
-            # Parse counts
-            SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
-            SCA_MED=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
-            SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
-            SCA_CRIT=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
+              SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' ../semgrep.sarif)
+              SEM_MED=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' ../semgrep.sarif)
+              SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' ../semgrep.sarif)
+              SEM_CRIT=$(jq '[.runs[].results[] | select(.ruleId | test("critical|sql-injection|hardcoded|xss"))] | length' ../semgrep.sarif)
 
-            SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
-            SAST_MED=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
-            SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
-            SAST_CRIT=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' ../snyk-code.sarif)
+              TOTAL=$((SCA_LOW+SCA_MED+SCA_HIGH+SCA_CRIT+SAST_LOW+SAST_MED+SAST_HIGH+SAST_CRIT+SEM_LOW+SEM_MED+SEM_HIGH+SEM_CRIT))
 
-            SEM_LOW=$(jq '[.runs[].results[] | select(.level=="INFO")] | length' ../semgrep.sarif)
-            SEM_MED=$(jq '[.runs[].results[] | select(.level=="WARNING")] | length' ../semgrep.sarif)
-            SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' ../semgrep.sarif)
-            SEM_CRIT=$(jq '[.runs[].results[] | select(.ruleId | test("critical|sql-injection|hardcoded|xss"))] | length' ../semgrep.sarif)
+              echo "\"$repo\",$SCA_LOW,$SCA_MED,$SCA_HIGH,$SCA_CRIT,$SAST_LOW,$SAST_MED,$SAST_HIGH,$SAST_CRIT,$SEM_LOW,$SEM_MED,$SEM_HIGH,$SEM_CRIT,$TOTAL" >> ../summary.csv
 
-            TOTAL=$((SCA_LOW+SCA_MED+SCA_HIGH+SCA_CRIT+SAST_LOW+SAST_MED+SAST_HIGH+SAST_CRIT+SEM_LOW+SEM_MED+SEM_HIGH+SEM_CRIT))
-
-            echo "\"$repo\",$SCA_LOW,$SCA_MED,$SCA_HIGH,$SCA_CRIT,$SAST_LOW,$SAST_MED,$SAST_HIGH,$SAST_CRIT,$SEM_LOW,$SEM_MED,$SEM_HIGH,$SEM_CRIT,$TOTAL" >> ../summary.csv
-
-            cd ..
-            rm -rf project-src
+              cd ..
+              rm -rf project-src
           done
 
       - name: Upload summary.csv
