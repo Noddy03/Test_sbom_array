@@ -1,13 +1,13 @@
-name: Dependency-Track Security Scan (Snyk + Semgrep)
+name: Full Security Scan (Snyk + Semgrep)
 
 on:
   workflow_dispatch:
     inputs:
       repo_name:
-        description: "GitHub repository to scan (e.g., owner/repo)"
+        description: "GitHub repository to scan (owner/repo)"
         required: true
       semgrep_language:
-        description: "Language hint for Semgrep scan"
+        description: "Language hint for Semgrep (default: java)"
         required: false
         default: "java"
 
@@ -17,7 +17,7 @@ permissions:
   actions: read
 
 jobs:
-  security_scan:
+  full_scan:
     runs-on: ubuntu-latest
     env:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
@@ -25,67 +25,43 @@ jobs:
     steps:
       # 1️⃣ Checkout repository
       - name: Checkout repository
-        run: git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
+        run: |
+          git clone --depth 1 "https://github.com/${{ github.event.inputs.repo_name }}" project-src
 
-      # 2️⃣ Setup Java 17 for Maven projects
-      - name: Setup Java 17
+      # 2️⃣ Setup Java 17 + Maven 3.9.6
+      - name: Setup Java 17 + Maven 3.9.6
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jdk maven
+          sudo apt-get install -y openjdk-17-jdk wget unzip
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           java -version
+
+          MAVEN_VERSION=3.9.6
+          wget https://archive.apache.org/dist/maven/maven-3/$MAVEN_VERSION/binaries/apache-maven-$MAVEN_VERSION-bin.zip
+          unzip apache-maven-$MAVEN_VERSION-bin.zip -d $HOME
+          export MAVEN_HOME=$HOME/apache-maven-$MAVEN_VERSION
+          export PATH=$MAVEN_HOME/bin:$PATH
           mvn -version
 
-      # 3️⃣ Install project dependencies
-      - name: Install dependencies
+      # 3️⃣ Resolve dependencies (do not build fully)
+      - name: Resolve Maven dependencies
         run: |
           cd project-src
           if [ -f pom.xml ]; then
-            mvn clean install -DskipTests
-          fi
-          if [ -f requirements.txt ]; then
-            python3 -m pip install --upgrade pip
-            pip install -r requirements.txt
-          fi
-          if [ -f package.json ]; then
-            npm install
-          fi
-          if [ -f go.mod ]; then
-            go mod download
-          fi
-          if [ -f Gemfile ]; then
-            bundle install --jobs=4 || true
+            mvn dependency:resolve
           fi
 
-      # 4️⃣ Setup Snyk CLI
-      - name: Setup Snyk
-        uses: snyk/actions/setup@v1
-        with:
-          snyk-version: "latest"
-
-      # 5️⃣ Run Snyk Open Source (SCA + licenses)
-      - name: Run Snyk Open Source (SCA)
-        run: |
-          snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
-          echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
-
-      # 6️⃣ Run Snyk Code (SAST)
-      - name: Run Snyk Code (SAST)
-        run: |
-          snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
-          echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
-
-      # 7️⃣ Install Semgrep
+      # 4️⃣ Install Semgrep
       - name: Install Semgrep
         run: |
           python3 -m pip install --upgrade pip
           pip install semgrep jq
 
-      # 8️⃣ Run Semgrep scan (mandatory)
-      - name: Run Semgrep scan
+      # 5️⃣ Run Semgrep scan
+      - name: Run Semgrep SAST scan
         run: |
           SEMGREP_SARIF="project-src/semgrep.sarif"
-          semgrep --config auto \
+          semgrep --config "p/security-audit" \
                   --lang ${{ github.event.inputs.semgrep_language }} \
                   --recursive \
                   --sarif -o "$SEMGREP_SARIF" project-src || true
@@ -93,20 +69,37 @@ jobs:
             echo '{"version":"2.1.0","runs":[]}' > "$SEMGREP_SARIF"
           fi
 
+      # 6️⃣ Setup Snyk CLI
+      - name: Setup Snyk CLI
+        uses: snyk/actions/setup@v1
+        with:
+          snyk-version: "latest"
+
+      # 7️⃣ Run Snyk SCA (Open Source)
+      - name: Run Snyk Open Source (SCA)
+        run: |
+          snyk test project-src --all-projects --json > project-src/snyk-sca.json || \
+          echo '{"vulnerabilities":[]}' > project-src/snyk-sca.json
+
+      # 8️⃣ Run Snyk Code (SAST)
+      - name: Run Snyk Code (SAST)
+        run: |
+          snyk code test project-src --all-projects --sarif-file=project-src/snyk-code.sarif || \
+          echo '{"version":"2.1.0","runs":[]}' > project-src/snyk-code.sarif
+
       # 9️⃣ Generate summary.csv
-      - name: Generate summary.csv
+      - name: Generate summary CSV
         run: |
           SUMMARY="project-src/summary.csv"
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,licenses,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,total" > "$SUMMARY"
 
-          # Snyk SCA counts
+          # SCA counts
           SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' project-src/snyk-sca.json || echo 0)
           SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' project-src/snyk-sca.json || echo 0)
           SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' project-src/snyk-sca.json || echo 0)
           SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' project-src/snyk-sca.json || echo 0)
-          LICENSES=$(jq '[.vulnerabilities[] | select(.isLicense==true)] | length' project-src/snyk-sca.json || echo 0)
 
-          # Snyk Code counts
+          # SAST counts (Snyk Code)
           SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' project-src/snyk-code.sarif || echo 0)
           SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' project-src/snyk-code.sarif || echo 0)
           SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' project-src/snyk-code.sarif || echo 0)
@@ -118,9 +111,9 @@ jobs:
           SEM_HIGH=$(jq '[.runs[].results[] | select(.level=="ERROR")] | length' project-src/semgrep.sarif || echo 0)
           SEM_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical|hardcoded|sql-injection|xss"))] | length' project-src/semgrep.sarif || echo 0)
 
-          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+LICENSES+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
+          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
 
-          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$LICENSES,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
+          echo "\"${{ github.event.inputs.repo_name }}\",$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> "$SUMMARY"
 
       # 🔟 Sanitize artifact name
       - name: Sanitize artifact name
@@ -129,7 +122,7 @@ jobs:
           SAFE_NAME=$(echo "${{ github.event.inputs.repo_name }}" | sed 's/[^A-Za-z0-9._-]/_/g')
           echo "safe_repo=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      # 1️⃣1️⃣ Upload scan artifacts
+      # 1️⃣1️⃣ Upload artifacts
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
