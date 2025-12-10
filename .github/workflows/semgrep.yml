@@ -70,19 +70,14 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
 
-          # Always output a valid JSON array
+          # Always output a JSON array
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
 
   scan_repos:
     needs: fetch_repos
-    if: ${{ needs.fetch_repos.outputs.repos != '[]' }}   # Skip if no repos
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    continue-on-error: true
     steps:
       - name: Install tools
         run: |
@@ -91,50 +86,58 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
 
-      - name: Clone repository safely
+      - name: Set repos variable
+        run: echo "REPOS=${{ needs.fetch_repos.outputs.repos }}" >> $GITHUB_ENV
+
+      - name: Loop and scan repositories
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || {
-            echo "Repo ${{ matrix.repo }} not found, skipping."
-            exit 0
-          }
+          mkdir -p all_results
+          for repo in $(echo "$REPOS" | jq -r '.[]'); do
+            echo "Scanning $repo"
+            SAFE_NAME=$(echo "$repo" | tr '/' '-')
+            mkdir -p project
+            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || {
+              echo "Repo $repo not found, skipping."
+              continue
+            }
 
-      - name: Run security scans
-        run: |
-          cd project || exit 0
-          echo "Skipping full build to speed up scan"
-          snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+            cd project || continue
+            snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
+            snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
+            semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-          SBOM_L=0
-          SBOM_M=0
-          SBOM_H=0
-          SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
-          for sbom in $SBOM_FILES; do
+            SBOM_L=0
+            SBOM_M=0
+            SBOM_H=0
+            SBOM_C=0
+            SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+            for sbom in $SBOM_FILES; do
               if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
                   SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
                   SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
                   SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
                   SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
               fi
+            done
+
+            cd ..
+            mkdir -p results
+            echo "$repo" > results/repo.txt
+            cp sca.json results/
+            cp sast.sarif results/
+            cp semgrep.json results/
+            echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
+            mv results all_results/$SAFE_NAME
           done
 
-          cd ..
-          mkdir -p results
-          echo "${{ matrix.repo }}" > results/repo.txt
-          cp sca.json results/
-          cp sast.sarif results/
-          cp semgrep.json results/
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-
-      - name: Upload per-repo results
+      - name: Upload all results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ matrix.repo//\//- }}"
-          path: results
+          name: repo-results
+          path: all_results
 
   summarize:
     needs: scan_repos
