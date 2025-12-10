@@ -34,18 +34,15 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, subprocess, tempfile, shutil, json
-
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
-
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100"
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           items = r.json()["items"]
-
           selected_repos = []
           for repo in items:
               if len(selected_repos) >= top_n:
@@ -59,6 +56,7 @@ jobs:
                   )
                   if result.returncode != 0:
                       continue
+                  # Search for SBOM files
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f",
                        "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
@@ -70,7 +68,6 @@ jobs:
                       selected_repos.append(full_name)
               finally:
                   shutil.rmtree(tmpdir)
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
@@ -105,28 +102,61 @@ jobs:
         run: |
           mkdir -p results
           cd project || exit 0
-
           snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
-
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
-          for sbom in $SBOM_FILES; do
-            if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
-                SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
-                SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
-                SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
-                SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
-            fi
-          done
-
           cd ..
+
+          mkdir -p results
+
+          # SBOM counting in Python (JSON + XML support)
+          python3 <<'EOF'
+          import os, glob, json, xml.etree.ElementTree as ET
+          
+          sbom_counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+          
+          sbom_files = glob.glob("project/**/*bom*.json", recursive=True) + \
+                       glob.glob("project/**/*cyclonedx*.json", recursive=True) + \
+                       glob.glob("project/**/*.cdx.json", recursive=True) + \
+                       glob.glob("project/**/*.spdx.json", recursive=True) + \
+                       glob.glob("project/**/*.spdx", recursive=True) + \
+                       glob.glob("project/**/*bom*.xml", recursive=True) + \
+                       glob.glob("project/**/*cyclonedx*.xml", recursive=True)
+          
+          for sbom in sbom_files:
+              try:
+                  if sbom.endswith((".json")):
+                      with open(sbom, "r") as f:
+                          data = json.load(f)
+                      vulns = data.get("vulnerabilities", [])
+                      for v in vulns:
+                          for rating in v.get("ratings", []):
+                              sev = rating.get("severity", "").lower()
+                              if sev in sbom_counts:
+                                  sbom_counts[sev] += 1
+                  else:  # XML SBOM
+                      tree = ET.parse(sbom)
+                      root = tree.getroot()
+                      for vuln in root.findall(".//vulnerability"):
+                          sev = vuln.findtext("ratings/rating/severity")
+                          if not sev:
+                              sev = vuln.findtext("severity")
+                          if sev:
+                              sev = sev.lower()
+                              if sev in sbom_counts:
+                                  sbom_counts[sev] += 1
+              except Exception as e:
+                  print(f"Skipping {sbom} due to error: {e}")
+          
+          os.makedirs("results", exist_ok=True)
+          with open("results/sbom_counts.txt", "w") as f:
+              f.write(f"{sbom_counts['low']},{sbom_counts['medium']},{sbom_counts['high']},{sbom_counts['critical']}")
+          EOF
+
           echo "${{ matrix.repo }}" > results/repo.txt
           cp sca.json results/
           cp sast.sarif results/
           cp semgrep.json results/
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
           mkdir -p all_results
           mv results all_results/$SAFE_NAME
