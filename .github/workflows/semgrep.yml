@@ -33,7 +33,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, subprocess, tempfile, shutil
+          import os, requests, urllib.parse, subprocess, tempfile, shutil, json
           
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
@@ -68,12 +68,12 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
           
-          # Always add test repos
+          # Always include test repos
           TEST_REPOS = ["snyk/test-vulnerabilities-java","snyk/test-vulnerabilities-node"]
           final_list = selected_repos + TEST_REPOS
           
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={','.join(final_list)}\n")
+              gh.write(f"repos={json.dumps(final_list)}\n")
           EOF
 
   scan_repos:
@@ -81,7 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        repo: ${{ fromJSON('["' + needs.fetch_repos.outputs.repos.replace(',', '","') + '"]') }}
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     steps:
       - name: Install tools
         run: |
@@ -98,23 +98,34 @@ jobs:
       - name: Run security scans
         run: |
           cd project
-
-          # Skip full build for faster scans
           echo "Skipping full build to speed up scan"
 
-          # Run scans
           snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+
+          # SBOM vulnerability counts
+          SBOM_L=0
+          SBOM_M=0
+          SBOM_H=0
+          SBOM_C=0
+          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+          for sbom in $SBOM_FILES; do
+              if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
+                  SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
+                  SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
+                  SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
+                  SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
+              fi
+          done
           cd ..
 
-      - name: Collect results
-        run: |
           mkdir -p results
           echo "${{ matrix.repo }}" > results/repo.txt
           cp sca.json results/
           cp sast.sarif results/
           cp semgrep.json results/
+          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
@@ -133,7 +144,7 @@ jobs:
 
       - name: Generate summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           for d in all_results/*; do
             [ -d "$d" ] || continue
             repo=$(cat "$d/repo.txt")
@@ -149,8 +160,12 @@ jobs:
             SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$d/semgrep.json")
             SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$d/semgrep.json")
             SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$d/semgrep.json")
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C))
-            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$TOTAL" >> summary.csv
+            SBOM_L=$(cut -d',' -f1 "$d/sbom_counts.txt")
+            SBOM_M=$(cut -d',' -f2 "$d/sbom_counts.txt")
+            SBOM_H=$(cut -d',' -f3 "$d/sbom_counts.txt")
+            SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+            echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
