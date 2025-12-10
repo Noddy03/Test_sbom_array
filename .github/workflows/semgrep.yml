@@ -28,7 +28,7 @@ jobs:
           pip install requests semgrep
           npm install -g snyk
 
-      - name: Fetch top N repositories
+      - name: Fetch top N repositories with SBOM
         id: fetch
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -36,57 +36,54 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python <<'EOF'
-          import os, requests, urllib.parse
+          import os, requests, urllib.parse, subprocess, tempfile, shutil
+          
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
+          
           q = urllib.parse.quote(f"language:{lang}")
-          url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page={top_n}"
+          url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100"
           r = requests.get(url, headers=headers)
           r.raise_for_status()
-          repos = [item["full_name"] for item in r.json()["items"]]
+          items = r.json()["items"]
+          
+          selected_repos = []
+          for repo in items:
+              if len(selected_repos) >= top_n:
+                  break
+              full_name = repo["full_name"]
+              print(f"Checking SBOM in {full_name} ...")
+              tmpdir = tempfile.mkdtemp()
+              try:
+                  subprocess.run(
+                      ["git", "clone", "--depth", "1", f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                  )
+                  sbom_files = subprocess.run(
+                      ["find", tmpdir, "-type", "f", "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
+                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
+                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
+                      stdout=subprocess.PIPE
+                  ).stdout.decode().strip()
+                  if sbom_files:
+                      print(f"→ SBOM found in {full_name}")
+                      selected_repos.append(full_name)
+                  else:
+                      print(f"→ No SBOM")
+              except Exception as e:
+                  print(f"Error checking {full_name}: {e}")
+              finally:
+                  shutil.rmtree(tmpdir)
+          
+          # ALWAYS add known test repos
+          TEST_REPOS = ["snyk/test-vulnerabilities-java", "snyk/test-vulnerabilities-node"]
+          final_list = selected_repos + TEST_REPOS
+          
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={','.join(repos)}\n")
+              gh.write(f"repos={','.join(final_list)}\n")
           EOF
-
-      - name: Detect SBOM repos
-        id: filter
-        env:
-          REPOS: ${{ steps.fetch.outputs.repos }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p sbom-check
-          SBOM_REPOS=""
-          SBOM_PATTERNS="bom cyclonedx sbom spdx"
-          REPOS_LIST="${REPOS}"
-          IFS=","
-          set -- $REPOS_LIST
-          for repo in "$@"; do
-            echo "Checking SBOM in $repo"
-            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
-            cd sbom-check/$repo || continue
-
-            FILES=$(find . -type f \( -iname "*.json" -o -iname "*.xml" -o -iname "*.spdx" \) 2>/dev/null)
-            HIT=0
-            for f in $FILES; do
-              for p in $SBOM_PATTERNS; do
-                if echo "$f" | grep -qi "$p"; then HIT=1; fi
-              done
-            done
-
-            if [ $HIT -eq 1 ]; then
-              echo "→ SBOM FOUND in $repo"
-              SBOM_REPOS="$SBOM_REPOS,$repo"
-            else
-              echo "→ No SBOM"
-            fi
-            cd ../../
-          done
-
-          TEST_REPOS="snyk/test-vulnerabilities-java,snyk/test-vulnerabilities-node"
-          FINAL_LIST="${SBOM_REPOS#,},$TEST_REPOS"
-          echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
         run: |
@@ -96,7 +93,8 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          REPOS_LIST="${{ steps.filter.outputs.filtered }}"
+          REPOS_LIST="${{ steps.fetch.outputs.repos }}"
+          echo "Repos to scan: $REPOS_LIST"
           IFS=","
           set -- $REPOS_LIST
           for repo in "$@"; do
@@ -137,7 +135,7 @@ jobs:
             SBOM_M=0
             SBOM_H=0
             SBOM_C=0
-            SBOM_FILES=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \) 2>/dev/null)
+            SBOM_FILES=$(find project -type f \( -iname "*bom*.json" -o -iname "*bom*.xml" -o -iname "*cyclonedx*.json" -o -iname "*cyclonedx*.xml" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \) 2>/dev/null)
             for sbom in $SBOM_FILES; do
               if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
                 SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
