@@ -10,7 +10,7 @@ on:
       top_n:
         description: "Number of top repositories to scan"
         required: false
-        default: "5"
+        default: "20"
 
 permissions:
   contents: read
