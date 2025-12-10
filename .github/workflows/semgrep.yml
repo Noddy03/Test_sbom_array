@@ -8,7 +8,7 @@ on:
         required: true
         default: "Java"
       top_n:
-        description: "Number of top repositories"
+        description: "Number of top repositories to scan"
         required: false
         default: "5"
 
@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
+
     steps:
       - name: Install Python dependencies
         run: pip install requests
@@ -48,8 +49,9 @@ jobs:
           if not repos:
               repos = ["snyk/test-vulnerabilities-java"]
 
+          # Write JSON array to GITHUB_OUTPUT for matrix
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"repo_list={json.dumps(repos)}\n")
+              f.write(f'repo_list={json.dumps(repos)}\n')
           EOF
 
   scan_repos:
@@ -69,7 +71,7 @@ jobs:
           pip install --upgrade semgrep requests
 
       - name: Clone repository
-        run: git clone --depth 1 https://x-access-token:${GITHUB_TOKEN}@github.com/${{ matrix.repo }} project-src
+        run: git clone --depth 1 https://github.com/${{ matrix.repo }} project-src
 
       - name: Install dependencies
         working-directory: project-src
@@ -101,7 +103,6 @@ jobs:
       - name: Compute summary for repo
         run: |
           REPO="${{ matrix.repo }}"
-
           SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
           SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
           SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
