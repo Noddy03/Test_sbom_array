@@ -43,7 +43,6 @@ jobs:
 
           headers = {"Authorization": f"token {token}"}
 
-          # Fetch top repositories by language
           q = urllib.parse.quote(f"language:{lang}")
           url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page={top_n}"
           print("DEBUG Search URL:", url)
@@ -52,7 +51,6 @@ jobs:
           r.raise_for_status()
           repos = [i["full_name"] for i in r.json().get("items", [])]
 
-          # SBOM filename patterns
           sbom_keywords = [
               "sbom", "bom",
               "cyclonedx", "spdx",
@@ -99,21 +97,20 @@ jobs:
               exit 0
           fi
 
-          # Split comma-separated repos into array
           IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
           for repo in "${REPO_ARRAY[@]}"; do
               echo "Scanning $repo"
               git clone --depth 1 https://github.com/$repo project-src
               cd project-src || exit 1
 
-              # Dependency installation (handle Maven failures gracefully)
+              # Install dependencies robustly
               if [ -f pom.xml ]; then
-                  echo "Using Maven (allowing failures)..."
-                  mvn -B dependency:go-offline || echo "⚠ Could not fetch all Maven dependencies. Continuing scan..."
+                  echo "Using Maven (build continues even if dependencies fail)..."
+                  mvn -B install -DskipTests || echo "⚠ Maven build failed, continuing..."
               elif [ -f package.json ]; then
-                  npm ci || npm install
+                  npm ci || npm install || echo "⚠ NPM install failed, continuing..."
               elif [ -f requirements.txt ]; then
-                  pip install -r requirements.txt
+                  pip install -r requirements.txt || echo "⚠ Python install failed, continuing..."
               fi
 
               # Run Snyk Open Source (SCA)
@@ -122,10 +119,10 @@ jobs:
               # Run Snyk Code (SAST)
               snyk code test --all-projects --sarif-file ../snyk-code.sarif || echo '{"version":"2.1.0","runs":[]}' > ../snyk-code.sarif
 
-              # Run Semgrep
-              semgrep scan --config p/security-audit --sarif-file ../semgrep.sarif . || echo '{"version":"2.1.0","runs":[]}' > ../semgrep.sarif
+              # Run Semgrep with broader rules
+              semgrep scan --config p/ci --sarif-file ../semgrep.sarif . || echo '{"version":"2.1.0","runs":[]}' > ../semgrep.sarif
 
-              # Parse counts
+              # Parse counts safely
               SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
               SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
               SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
