@@ -33,7 +33,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, subprocess, tempfile, shutil, json
+          import os, requests, urllib.parse, json
           
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
@@ -51,24 +51,16 @@ jobs:
               if len(selected_repos) >= top_n:
                   break
               full_name = repo["full_name"]
-              tmpdir = tempfile.mkdtemp()
+              # Use GitHub API to check for SBOM files instead of cloning
+              contents_url = f"https://api.github.com/repos/{full_name}/contents"
               try:
-                  result = subprocess.run(
-                      ["git", "clone", "--depth", "1", f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                  )
-                  if result.returncode != 0:
-                      continue  # skip repo if it cannot be cloned
-                  sbom_files = subprocess.run(
-                      ["find", tmpdir, "-type", "f", "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
-                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
-                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
-                      stdout=subprocess.PIPE
-                  ).stdout.decode().strip()
-                  if sbom_files:
+                  r2 = requests.get(contents_url, headers=headers)
+                  r2.raise_for_status()
+                  files = [f['name'].lower() for f in r2.json()]
+                  if any(x in f for f in files for x in ["bom", "cyclonedx", "spdx"]):
                       selected_repos.append(full_name)
-              finally:
-                  shutil.rmtree(tmpdir)
+              except:
+                  continue
           
           final_list = selected_repos
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
@@ -134,7 +126,6 @@ jobs:
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          # Replace / with __ in repo name to make artifact name valid
           name: "repo-results-${{ matrix.repo//\//__ }}"
           path: results
 
@@ -153,6 +144,10 @@ jobs:
           for d in all_results/*; do
             [ -d "$d" ] || continue
             repo=$(cat "$d/repo.txt")
+            [ -f "$d/sca.json" ] || echo '{"vulnerabilities":[]}' > "$d/sca.json"
+            [ -f "$d/sast.sarif" ] || echo '{"runs":[]}' > "$d/sast.sarif"
+            [ -f "$d/semgrep.json" ] || echo '{"results":[]}' > "$d/semgrep.json"
+
             SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
             SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
             SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
