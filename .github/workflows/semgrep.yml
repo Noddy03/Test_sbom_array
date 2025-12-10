@@ -17,6 +17,7 @@ permissions:
   security-events: write
 
 jobs:
+
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -60,7 +61,8 @@ jobs:
                   if result.returncode != 0:
                       continue
                   sbom_files = subprocess.run(
-                      ["find", tmpdir, "-type", "f", "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
+                      ["find", tmpdir, "-type", "f",
+                       "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
                        "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
                        "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
                       stdout=subprocess.PIPE
@@ -70,7 +72,7 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
 
-          # Always output a JSON array
+          # Safe JSON output
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
@@ -78,6 +80,11 @@ jobs:
   scan_repos:
     needs: fetch_repos
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos || '[]') }}
+
     steps:
       - name: Install tools
         run: |
@@ -86,54 +93,51 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
 
-      - name: Set repos variable
-        run: echo "REPOS=${{ needs.fetch_repos.outputs.repos }}" >> $GITHUB_ENV
-
-      - name: Loop and scan repositories
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p all_results
-          for repo in $(echo "$REPOS" | jq -r '.[]'); do
-            echo "Scanning $repo"
-            SAFE_NAME=$(echo "$repo" | tr '/' '-')
-            mkdir -p project
-            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || {
-              echo "Repo $repo not found, skipping."
-              continue
-            }
+          SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          mkdir -p project
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || {
+            echo "Repo ${{ matrix.repo }} not found, skipping."
+            exit 0
+          }
 
-            cd project || continue
-            snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-            snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-            semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+      - name: Run security scans
+        run: |
+          cd project || exit 0
+          mkdir -p ../results
 
-            SBOM_L=0
-            SBOM_M=0
-            SBOM_H=0
-            SBOM_C=0
-            SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
-            for sbom in $SBOM_FILES; do
-              if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
-                  SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
-                  SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
-                  SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
-                  SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
-              fi
-            done
+          snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
+          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
+          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-            cd ..
-            mkdir -p results
-            echo "$repo" > results/repo.txt
-            cp sca.json results/
-            cp sast.sarif results/
-            cp semgrep.json results/
-            echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-
-            mv results all_results/$SAFE_NAME
+          SBOM_L=0
+          SBOM_M=0
+          SBOM_H=0
+          SBOM_C=0
+          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+          for sbom in $SBOM_FILES; do
+            if jq -e ".vulnerabilities" "$sbom" >/dev/null 2>&1; then
+                SBOM_L=$((SBOM_L + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="low")] | length' "$sbom")))
+                SBOM_M=$((SBOM_M + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="medium")] | length' "$sbom")))
+                SBOM_H=$((SBOM_H + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="high")] | length' "$sbom")))
+                SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
+            fi
           done
 
-      - name: Upload all results
+          cd ..
+          mkdir -p results
+          echo "${{ matrix.repo }}" > results/repo.txt
+          cp sca.json results/
+          cp sast.sarif results/
+          cp semgrep.json results/
+          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
+          mv results all_results/$(echo "${{ matrix.repo }}" | tr '/' '-')
+
+      - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
           name: repo-results
@@ -172,7 +176,6 @@ jobs:
             SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
             echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
-          done
 
       - name: Upload summary
         uses: actions/upload-artifact@v4
