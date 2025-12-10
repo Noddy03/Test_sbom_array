@@ -1,4 +1,4 @@
-name: Top Repos SBOM Security Scan
+name: Test Dispatch Workflow
 
 on:
   workflow_dispatch:
@@ -8,13 +8,9 @@ on:
         required: true
         default: "Java"
       top_n:
-        description: "Number of top repositories"
+        description: "Number of top repos"
         required: false
-        default: "20"
-
-permissions:
-  contents: read
-  security-events: write
+        default: "3"
 
 jobs:
   fetch_repos:
@@ -22,10 +18,9 @@ jobs:
     outputs:
       repo_list: ${{ steps.collect.outputs.repo_list }}
     steps:
-      - name: Install Python dependencies
+      - name: Install Python
         run: pip install requests
-
-      - name: Fetch top repos
+      - name: Fetch repos
         id: collect
         env:
           INPUT_LANGUAGE: ${{ inputs.language }}
@@ -39,112 +34,23 @@ jobs:
           top_n = int(os.environ["INPUT_TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
 
-          # Fetch top repositories
           url = f"https://api.github.com/search/repositories?q=language:{lang}&sort=stars&order=desc&per_page={top_n}"
           r = requests.get(url, headers={"Authorization": f"token {token}"})
           r.raise_for_status()
           repos = [item["full_name"] for item in r.json().get("items", [])]
-
-          # Ensure at least one repo
           if not repos:
               repos = ["snyk/test-vulnerabilities-java"]
 
-          # Write JSON array to GITHUB_OUTPUT for matrix
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f'repo_list={json.dumps(repos)}\n')
+              f.write(f"repo_list={json.dumps(repos)}\n")
           EOF
 
   scan_repos:
     needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
         repo: ${{ fromJson(needs.fetch_repos.outputs.repo_list) }}
-
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq npm
-          npm install -g snyk
-          pip install --upgrade semgrep requests
-
-      - name: Clone repository
-        run: git clone --depth 1 https://x-access-token:${GITHUB_TOKEN}@github.com/${{ matrix.repo }} project-src
-
-      - name: Install dependencies
-        working-directory: project-src
-        run: |
-          if [ -f pom.xml ]; then
-              mvn -B install -DskipTests || echo "⚠ Maven build failed, continuing..."
-          elif [ -f package.json ]; then
-              npm ci || npm install || echo "⚠ NPM install failed, continuing..."
-          elif [ -f requirements.txt ]; then
-              pip install -r requirements.txt || echo "⚠ Python install failed, continuing..."
-          fi
-
-      - name: Run Snyk SCA
-        working-directory: project-src
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk test --all-projects --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
-
-      - name: Run Snyk Code (SAST)
-        working-directory: project-src
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk code test --all-projects --sarif > ../snyk-code.sarif || echo '{"runs":[]}' > ../snyk-code.sarif
-
-      - name: Run Semgrep
-        working-directory: project-src
-        run: semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
-
-      - name: Compute summary for repo
-        run: |
-          REPO="${{ matrix.repo }}"
-          SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
-          SCA_MEDIUM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' ../snyk-sca.json)
-          SCA_HIGH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' ../snyk-sca.json)
-          SCA_CRITICAL=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' ../snyk-sca.json)
-
-          SAST_LOW=$(jq '[.runs[].results[] | select(.level=="note")] | length' ../snyk-code.sarif)
-          SAST_MEDIUM=$(jq '[.runs[].results[] | select(.level=="warning")] | length' ../snyk-code.sarif)
-          SAST_HIGH=$(jq '[.runs[].results[] | select(.level=="error")] | length' ../snyk-code.sarif)
-          SAST_CRITICAL=$(jq '[.runs[].results[] | select(.rule_id | test("critical"))] | length' ../snyk-code.sarif)
-
-          SEM_LOW=$(jq '[.results[] | select(.extra.level=="INFO")] | length' ../semgrep.json)
-          SEM_MEDIUM=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' ../semgrep.json)
-          SEM_HIGH=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' ../semgrep.json)
-          SEM_CRITICAL=$(jq '[.results[] | select(.check_id | test("critical|hardcoded|sql-injection|xss"))] | length' ../semgrep.json)
-
-          TOTAL=$((SCA_LOW+SCA_MEDIUM+SCA_HIGH+SCA_CRITICAL+SAST_LOW+SAST_MEDIUM+SAST_HIGH+SAST_CRITICAL+SEM_LOW+SEM_MEDIUM+SEM_HIGH+SEM_CRITICAL))
-
-          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary_${REPO//\//_}.csv
-          echo "$REPO,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary_${REPO//\//_}.csv
-
-      - name: Upload repo CSV
-        uses: actions/upload-artifact@v4
-        with:
-          name: "repo-summary-${{ matrix.repo }}"
-          path: summary_${{ matrix.repo//\//_ }}.csv
-
-  merge_results:
-    needs: scan_repos
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all CSVs
-        uses: actions/download-artifact@v4
-        with:
-          path: results
-
-      - name: Merge CSVs
-        run: |
-          echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary.csv
-          cat results/**/*.csv | grep -v "repo,SCA_LOW" >> summary.csv
-
-      - name: Upload final summary
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-summary
-          path: summary.csv
+      - name: Show repo
+        run: echo "Scanning ${{ matrix.repo }}"
