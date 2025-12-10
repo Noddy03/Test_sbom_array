@@ -93,26 +93,28 @@ jobs:
           pip3 install semgrep
           npm install -g snyk
 
-      - name: Clone repository
+      - name: Prepare results folder
+        run: mkdir -p all_results
+
+      - name: Clone and scan repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          mkdir -p project
+          mkdir -p project results
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || {
             echo "Repo ${{ matrix.repo }} not found, skipping."
-            exit 0
+            continue
           }
 
-      - name: Run security scans
-        run: |
           cd project || exit 0
-          mkdir -p ../results
 
+          # Run scans
           snyk test --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
+          # SBOM counts
           SBOM_L=0
           SBOM_M=0
           SBOM_H=0
@@ -135,9 +137,11 @@ jobs:
           cp semgrep.json results/
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-          mv results all_results/$(echo "${{ matrix.repo }}" | tr '/' '-')
+          # Move results safely into all_results
+          mv results "all_results/$SAFE_NAME"
+          rm -rf project
 
-      - name: Upload per-repo results
+      - name: Upload all repo results
         uses: actions/upload-artifact@v4
         with:
           name: repo-results
