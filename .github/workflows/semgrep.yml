@@ -70,7 +70,6 @@ jobs:
               finally:
                   shutil.rmtree(tmpdir)
           
-          # Only include existing repos
           final_list = selected_repos
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(final_list)}\n")
@@ -135,7 +134,8 @@ jobs:
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ matrix.repo }}"
+          # Replace / with __ in repo name to make artifact name valid
+          name: "repo-results-${{ matrix.repo//\//__ }}"
           path: results
 
   summarize:
