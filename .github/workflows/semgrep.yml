@@ -35,7 +35,7 @@ jobs:
           TOP_N: ${{ inputs.top_n }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python << 'EOF'
+          python <<'EOF'
           import os, requests, urllib.parse
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
