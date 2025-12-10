@@ -10,7 +10,7 @@ on:
       top_n:
         description: "Number of top repositories to scan"
         required: false
-        default: "20"
+        default: "5"
 
 permissions:
   contents: read
@@ -63,7 +63,6 @@ jobs:
               "snyk/test-vulnerabilities-node"
           ])
 
-          # Output JSON array for matrix
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f'repo_list={json.dumps(matches)}\n')
           EOF
@@ -132,7 +131,7 @@ jobs:
         working-directory: project-src
         run: semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
-      - name: Generate summary
+      - name: Generate summary CSV
         run: |
           REPO="${{ matrix.repo }}"
           SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
@@ -151,7 +150,7 @@ jobs:
           echo "repo,SCA_LOW,SCA_MEDIUM,SCA_HIGH,SCA_CRITICAL,SAST_LOW,SAST_MEDIUM,SAST_HIGH,SAST_CRITICAL,SEM_LOW,SEM_MEDIUM,SEM_HIGH,SEM_CRITICAL,TOTAL" > summary_${REPO//\//_}.csv
           echo "$REPO,$SCA_LOW,$SCA_MEDIUM,$SCA_HIGH,$SCA_CRITICAL,$SAST_LOW,$SAST_MEDIUM,$SAST_HIGH,$SAST_CRITICAL,$SEM_LOW,$SEM_MEDIUM,$SEM_HIGH,$SEM_CRITICAL,$TOTAL" >> summary_${REPO//\//_}.csv
 
-      - name: Upload repo summary CSV
+      - name: Upload repo CSV
         uses: actions/upload-artifact@v4
         with:
           name: "repo-summary-${{ matrix.repo }}"
