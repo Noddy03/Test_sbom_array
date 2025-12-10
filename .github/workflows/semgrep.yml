@@ -60,7 +60,6 @@ jobs:
           SBOM_REPOS=""
           SBOM_PATTERNS="bom cyclonedx sbom spdx"
 
-          # POSIX-safe split
           REPOS_LIST="$REPOS"
           OLD_IFS="$IFS"
           IFS=','
@@ -102,7 +101,6 @@ jobs:
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # POSIX-safe split
           REPOS_LIST="${{ steps.filter.outputs.filtered }}"
           OLD_IFS="$IFS"
           IFS=','
@@ -160,7 +158,6 @@ jobs:
                       SBOM_C=$((SBOM_C + $(jq '[.vulnerabilities[] | select(.ratings[].severity=="critical")] | length' "$sbom")))
                   fi
 
-                  # SPDX safe
                   if jq -e '.packages' "$sbom" >/dev/null 2>&1; then
                       SBOM_H=$((SBOM_H + $(jq '[.packages[] | select((.externalRefs // []) | map(.referenceCategory=="SECURITY") | any)] | length' "$sbom")))
                   fi
