@@ -81,7 +81,14 @@ jobs:
               else:
                   print("✖ No SBOM in:", repo)
 
-          print(f"FINAL SBOM repos: {matches}")
+          # Add known vulnerable test repos for verification
+          known_vuln_repos = [
+              "snyk/test-vulnerabilities-java",
+              "snyk/test-vulnerabilities-node"
+          ]
+          matches.extend(known_vuln_repos)
+
+          print(f"FINAL SBOM repos + test repos: {matches}")
           print(f"::set-output name=repo_list::{','.join(matches)}")
           EOF
 
@@ -103,7 +110,7 @@ jobs:
               git clone --depth 1 https://github.com/$repo project-src
               cd project-src || exit 1
 
-              # Install dependencies robustly
+              # Install dependencies (continue even if failing)
               if [ -f pom.xml ]; then
                   echo "Using Maven (build continues even if dependencies fail)..."
                   mvn -B install -DskipTests || echo "⚠ Maven build failed, continuing..."
@@ -113,14 +120,18 @@ jobs:
                   pip install -r requirements.txt || echo "⚠ Python install failed, continuing..."
               fi
 
-              # Run Snyk Open Source (SCA)
-              snyk test --all-projects --json > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
+              # Run Snyk Open Source (SCA) in source-only mode if deps fail
+              snyk test --all-projects --json || snyk test --all-projects --json --all-sub-projects > ../snyk-sca.json || echo '{"vulnerabilities":[]}' > ../snyk-sca.json
 
               # Run Snyk Code (SAST)
               snyk code test --all-projects --sarif-file ../snyk-code.sarif || echo '{"version":"2.1.0","runs":[]}' > ../snyk-code.sarif
 
               # Run Semgrep with broader rules
               semgrep scan --config p/ci --sarif-file ../semgrep.sarif . || echo '{"version":"2.1.0","runs":[]}' > ../semgrep.sarif
+
+              # Save SARIF logs for debugging
+              cp ../snyk-code.sarif ../sarif_snyk_${repo//\//_}.sarif
+              cp ../semgrep.sarif ../sarif_semgrep_${repo//\//_}.sarif
 
               # Parse counts safely
               SCA_LOW=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' ../snyk-sca.json)
@@ -151,3 +162,9 @@ jobs:
         with:
           name: top-repos-security-summary
           path: summary.csv
+
+      - name: Upload SARIF logs for debugging
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-logs
+          path: "*.sarif"
