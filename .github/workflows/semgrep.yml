@@ -34,7 +34,6 @@ jobs:
           LANG_FILTER: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
           python <<'EOF'
           import os, requests, urllib.parse
@@ -56,14 +55,19 @@ jobs:
         env:
           REPOS: ${{ steps.fetch.outputs.repos }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
         run: |
           mkdir sbom-check
           SBOM_REPOS=""
           SBOM_PATTERNS="bom cyclonedx sbom spdx"
-          IFS=',' read -ra REPO_ARRAY <<< "$REPOS"
 
-          for repo in "${REPO_ARRAY[@]}"; do
+          # POSIX-safe split
+          REPOS_LIST="$REPOS"
+          OLD_IFS="$IFS"
+          IFS=','
+          set -- $REPOS_LIST
+          IFS="$OLD_IFS"
+
+          for repo in "$@"; do
               echo "Checking SBOM in $repo"
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo sbom-check/$repo || continue
               cd sbom-check/$repo
@@ -91,18 +95,21 @@ jobs:
           echo "filtered=$FINAL_LIST" >> $GITHUB_OUTPUT
 
       - name: Prepare summary.csv
-        shell: bash
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
 
       - name: Scan repositories
-        shell: bash
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          IFS=',' read -ra REPOS <<< "${{ steps.filter.outputs.filtered }}"
+          # POSIX-safe split
+          REPOS_LIST="${{ steps.filter.outputs.filtered }}"
+          OLD_IFS="$IFS"
+          IFS=','
+          set -- $REPOS_LIST
+          IFS="$OLD_IFS"
 
-          for repo in "${REPOS[@]}"; do
+          for repo in "$@"; do
               echo "=== SCANNING $repo ==="
 
               git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || continue
