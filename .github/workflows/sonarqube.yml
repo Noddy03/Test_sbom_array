@@ -10,7 +10,7 @@ on:
       top_n:
         description: "Number of top repositories to scan"
         required: false
-        default: "5"
+        default: "20"
 
 permissions:
   contents: read
@@ -56,7 +56,6 @@ jobs:
                   )
                   if result.returncode != 0:
                       continue
-                  # Search for SBOM files
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f",
                        "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
@@ -84,9 +83,11 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip
+          sudo apt-get install -y jq git npm python3-pip curl
           pip3 install semgrep
           npm install -g snyk
+          # Install grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -107,46 +108,50 @@ jobs:
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
           cd ..
 
-          mkdir -p results
-
-          # SBOM counting in Python (JSON + XML support)
+          # -------------------------------
+          # SBOM vulnerability scanning (Grype)
+          # -------------------------------
           python3 <<'EOF'
-          import os, glob, json, xml.etree.ElementTree as ET
+          import os, subprocess, json, glob
+          
+          # Find SBOM files (JSON + XML)
+          sbom_files = (
+              glob.glob("project/**/*bom*.json", recursive=True) +
+              glob.glob("project/**/*cyclonedx*.json", recursive=True) +
+              glob.glob("project/**/*.cdx.json", recursive=True) +
+              glob.glob("project/**/*.spdx.json", recursive=True) +
+              glob.glob("project/**/*.spdx", recursive=True) +
+              glob.glob("project/**/*bom*.xml", recursive=True) +
+              glob.glob("project/**/*cyclonedx*.xml", recursive=True)
+          )
           
           sbom_counts = {"low": 0, "medium": 0, "high": 0, "critical": 0}
           
-          sbom_files = glob.glob("project/**/*bom*.json", recursive=True) + \
-                       glob.glob("project/**/*cyclonedx*.json", recursive=True) + \
-                       glob.glob("project/**/*.cdx.json", recursive=True) + \
-                       glob.glob("project/**/*.spdx.json", recursive=True) + \
-                       glob.glob("project/**/*.spdx", recursive=True) + \
-                       glob.glob("project/**/*bom*.xml", recursive=True) + \
-                       glob.glob("project/**/*cyclonedx*.xml", recursive=True)
-          
           for sbom in sbom_files:
               try:
-                  if sbom.endswith((".json")):
-                      with open(sbom, "r") as f:
-                          data = json.load(f)
-                      vulns = data.get("vulnerabilities", [])
-                      for v in vulns:
-                          for rating in v.get("ratings", []):
-                              sev = rating.get("severity", "").lower()
-                              if sev in sbom_counts:
-                                  sbom_counts[sev] += 1
-                  else:  # XML SBOM
-                      tree = ET.parse(sbom)
-                      root = tree.getroot()
-                      for vuln in root.findall(".//vulnerability"):
-                          sev = vuln.findtext("ratings/rating/severity")
-                          if not sev:
-                              sev = vuln.findtext("severity")
-                          if sev:
-                              sev = sev.lower()
-                              if sev in sbom_counts:
-                                  sbom_counts[sev] += 1
+                  # Run Grype on SBOM
+                  result = subprocess.run(
+                      ["grype", f"sbom:{sbom}", "-o", "json"],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True
+                  )
+          
+                  if result.returncode != 0:
+                      continue
+          
+                  data = json.loads(result.stdout)
+          
+                  # Extract vulnerabilities
+                  vulns = data.get("matches", [])
+          
+                  for v in vulns:
+                      sev = v.get("vulnerability", {}).get("severity", "").lower()
+                      if sev in sbom_counts:
+                          sbom_counts[sev] += 1
+          
               except Exception as e:
-                  print(f"Skipping {sbom} due to error: {e}")
+                  print(f"SBOM scan error in {sbom}: {e}")
           
           os.makedirs("results", exist_ok=True)
           with open("results/sbom_counts.txt", "w") as f:
