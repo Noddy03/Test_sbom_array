@@ -152,17 +152,20 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          snyk test --all-projects --json --severity-threshold=low > results/sca.json \
+            || echo '{"vulnerabilities":[]}' > results/sca.json
 
       - name: SAST - Snyk Code (FULL SCAN)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
+          snyk code test --sarif --all-projects > results/sast.sarif \
+            || echo '{"runs":[]}' > results/sast.sarif
 
       - name: Semgrep (full rule pack)
         run: |
-          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json > results/semgrep.json \
+            || echo '{"results":[]}' > results/semgrep.json
 
       - name: SBOM Scanning
         run: |
