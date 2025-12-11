@@ -99,12 +99,15 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle
+          sudo apt-get install -y jq git npm python3-pip maven gradle unzip
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sh -s -- -b /usr/local/bin
+          # --- RELIABLE GRYPE INSTALLATION (NO 504 ERRORS) ---
+          echo "deb [trusted=yes] https://download.anchore.io/grype/stable/deb/ /" \
+            | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install -y grype
 
       - name: Safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
@@ -116,29 +119,36 @@ jobs:
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       # ---------------- FULL SNYK SCAN ----------------
-      - name: SCA - Snyk Open Source (Full Scan)
+      - name: SCA - Snyk Open Source (FULL SCAN)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          snyk test --all-projects --json > results/sca.json \
+            || echo '{"vulnerabilities":[]}' > results/sca.json
 
-      - name: SAST - Snyk Code
+      - name: SAST - Snyk Code (FULL SCAN)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
+          snyk code test --sarif --all-projects > results/sast.sarif \
+            || echo '{"runs":[]}' > results/sast.sarif
 
-      - name: Semgrep (full rules)
+      - name: Semgrep (full rule pack)
         run: |
-          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json > results/semgrep.json \
+            || echo '{"results":[]}' > results/semgrep.json
 
       - name: SBOM Scanning
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
 
-          SBOMS=$(find project -type f -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                      -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx")
+          SBOMS=$(find project -type f -iname "*bom*.json" \
+                                         -o -iname "*cyclonedx*.json" \
+                                         -o -iname "*.cdx.json" \
+                                         -o -iname "*.spdx.json" \
+                                         -o -iname "*.spdx")
+
           for sb in $SBOMS; do
             grype sbom:"$sb" -o json > results/sbom.json || continue
 
@@ -150,11 +160,11 @@ jobs:
 
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      # Zip all results for summarize
+      # Zip per-repo results
       - name: Package results
         run: zip -r "${SAFE_NAME}.zip" results
 
-      - name: Upload results
+      - name: Upload per-repo results
         uses: actions/upload-artifact@v4
         with:
           name: "repo-results-${{ env.SAFE_NAME }}"
@@ -201,8 +211,10 @@ jobs:
             # ---------- SBOM ----------
             IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
 
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SAST_L+SAST_M+SAST_H+SAST_C +
-                     SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C +
+                     SAST_L+SAST_M+SAST_H+SAST_C +
+                     SEM_L+SEM_M+SEM_H+SEM_C +
+                     SBOM_L+SBOM_M+SBOM_H+SBOM_C))
 
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
 
