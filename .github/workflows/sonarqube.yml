@@ -26,7 +26,7 @@ jobs:
       - name: Install Python and git
         run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
 
-      - name: Fetch 200 top Java Maven repositories with SBOM (short-circuits on match)
+      - name: Fetch top N repositories (relaxed SBOM)
         id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -35,34 +35,26 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, subprocess, tempfile, shutil, json
-
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
+          # Search for Java repos with Maven (pom.xml)
+          q = urllib.parse.quote(f"language:{lang} filename:pom.xml")
+          url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=200"
+          r = requests.get(url, headers=headers)
+          r.raise_for_status()
+          items = r.json()["items"]
 
-          # Search Java + Maven repos (200 repos → 2 pages)
-          repos = []
-          for page in [1, 2]:
-              query = f"language:{lang} filename:pom.xml"
-              q = urllib.parse.quote(query)
-              url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100&page={page}"
-              r = requests.get(url, headers=headers)
-              r.raise_for_status()
-              repos.extend(r.json().get("items", []))
-
-          selected = []
-
-          for repo in repos:
-              if len(selected) >= top_n:
+          selected_repos = []
+          for repo in items:
+              if len(selected_repos) >= top_n:
                   break
-
               full_name = repo["full_name"]
-              print(f"Checking repo: {full_name}")
 
+              # Relaxed: only clone, do not require pre-existing SBOM
               tmpdir = tempfile.mkdtemp()
               try:
-                  # Shallow clone
                   result = subprocess.run(
                       ["git", "clone", "--depth", "1",
                        f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
@@ -72,37 +64,24 @@ jobs:
                   if result.returncode != 0:
                       continue
 
-                  # Look for SBOM files
-                  sbom_files = subprocess.run(
-                      ["find", tmpdir, "-type", "f",
-                       "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
-                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
-                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json",
-                       "-o", "-iname", "*.spdx"],
-                      stdout=subprocess.PIPE
-                  ).stdout.decode().strip()
-
-                  if sbom_files:
-                      print(f"✓ SBOM found in {full_name}")
-                      selected.append(full_name)
-                  else:
-                      print(f"✗ No SBOM in {full_name}")
+                  # Relax SBOM detection: allow any Maven project, SBOM optional
+                  selected_repos.append(full_name)
 
               finally:
                   shutil.rmtree(tmpdir)
 
-          # Output results
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(selected or [])}\n")
+              gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
 
   scan_repos_sequentially:
     needs: fetch_repos
+    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-      max-parallel: 1
+      max-parallel: 1   # Sequential execution to save disk space
     continue-on-error: true
 
     steps:
@@ -125,23 +104,16 @@ jobs:
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
-      - name: Build Java project (Option A)
+      - name: Build Java project (Maven only for now)
         run: |
           cd project || exit 0
-
-          echo "🔍 Detecting build system..."
           if [ -f "./mvnw" ]; then
             chmod +x mvnw
             ./mvnw -B -DskipTests clean package || exit 1
           elif [ -f "pom.xml" ]; then
             mvn -B -DskipTests clean package || exit 1
-          elif [ -f "./gradlew" ]; then
-            chmod +x gradlew
-            ./gradlew build -x test || exit 1
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            gradle build -x test || exit 1
           else
-            echo "❌ No Java build system detected — skipping build"
+            echo "❌ No Maven build system detected — skipping build"
           fi
           cd ..
 
@@ -156,10 +128,15 @@ jobs:
           snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
           semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
 
+          # Generate SBOM via Maven if available
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                         -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-                                         -o -iname "*.spdx" -o -iname "*bom*.xml" \))
+          if [ -f "pom.xml" ]; then
+            mvn -B org.cyclonedx:cyclonedx-maven-plugin:makeBom -DincludeBomSerialNumber=false || true
+            SBOM_FILES=$(find . -type f -iname "target/bom*.xml" -o -iname "target/bom*.json")
+          else
+            SBOM_FILES=""
+          fi
+
           for sbom in $SBOM_FILES; do
             grype sbom:$sbom -o json > ../sbom_scan.json || continue
             SBOM_L=$((SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' ../sbom_scan.json)))
@@ -178,6 +155,7 @@ jobs:
           mkdir -p all_results
           mv results all_results/$SAFE_NAME
 
+          # Cleanup
           rm -rf project
           rm -rf ~/.m2/repository
           rm -rf ~/.gradle/caches
