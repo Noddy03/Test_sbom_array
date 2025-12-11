@@ -1,4 +1,4 @@
-name: Top Repos Security Scan  (SBOM Filtered)
+name: Top Repos Security Scan (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -84,35 +84,6 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle
-          pip3 install semgrep
-          npm install -g snyk
-      
-          echo "⚙️ Installing Grype safely with retries..."
-          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin"
-      
-          for i in 1 2 3 4 5; do
-            echo "Attempt $i to install Grype..."
-            if eval "$install_cmd"; then
-              if command -v grype >/dev/null; then
-                echo "Grype installed successfully"
-                grype version
-                break
-              fi
-            fi
-            echo "❌ Grype install failed on attempt $i"
-            sleep 3
-          done
-      
-          if ! command -v grype >/dev/null; then
-            echo "❌ Failed to install Grype after 5 attempts"
-            exit 1
-          fi
-      
-
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
 
@@ -122,6 +93,20 @@ jobs:
         run: |
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq git npm python3-pip maven gradle
+          pip3 install semgrep
+          npm install -g snyk
+          snyk auth $SNYK_TOKEN
+
+          echo "⚙️ Installing Grype binary..."
+          wget -q https://github.com/anchore/grype/releases/latest/download/grype_linux_amd64.tar.gz -O /tmp/grype.tar.gz
+          tar -xzf /tmp/grype.tar.gz -C /tmp/
+          sudo mv /tmp/grype /usr/local/bin/
+          grype version
 
       - name: Build Java project (automatic detection)
         run: |
@@ -140,47 +125,39 @@ jobs:
           fi
           cd ..
 
+      - name: Prepare per-repo result directory
+        run: |
+          mkdir -p all_results/${{ env.SAFE_NAME }}
+          echo "${{ matrix.repo }}" > all_results/${{ env.SAFE_NAME }}/repo.txt
+
       - name: Run security scans
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SAFE_NAME: ${{ env.SAFE_NAME }}
         run: |
           ROOT_DIR="$GITHUB_WORKSPACE/project"
-          RESULT_DIR="$GITHUB_WORKSPACE/results"
-          mkdir -p "$RESULT_DIR"
+          RESULT_DIR="$GITHUB_WORKSPACE/all_results/$SAFE_NAME"
 
           # Prepare empty aggregated SCA JSON
-          AGG_SCA="$RESULT_DIR/sca.json"
-          echo '{"vulnerabilities":[]}' > "$AGG_SCA"
+          echo '{"vulnerabilities":[]}' > "$RESULT_DIR/sca.json"
 
-          echo "📦 Scanning modules in $ROOT_DIR"
           MODULE_FILES=$(find "$ROOT_DIR" -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
-
           for module_file in $MODULE_FILES; do
-            echo "Scanning module: $module_file"
             MODULE_JSON="$RESULT_DIR/module_sca.json"
-
-            if snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null; then
-              jq -s '{
-                vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities)
-              }' "$AGG_SCA" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
-              mv "$RESULT_DIR/tmp.json" "$AGG_SCA"
-            fi
+            snyk test --file="$module_file" --json > "$MODULE_JSON" 2>/dev/null || echo '{"vulnerabilities":[]}' > "$MODULE_JSON"
+            jq -s '{ vulnerabilities: (.[0].vulnerabilities + .[1].vulnerabilities) }' "$RESULT_DIR/sca.json" "$MODULE_JSON" > "$RESULT_DIR/tmp.json"
+            mv "$RESULT_DIR/tmp.json" "$RESULT_DIR/sca.json"
           done
 
           # SAST scan
-          SAST_JSON="$RESULT_DIR/sast.sarif"
-          snyk code test --sarif > "$SAST_JSON" || echo '{"runs":[]}' > "$SAST_JSON"
+          snyk code test --sarif > "$RESULT_DIR/sast.sarif" || echo '{"runs":[]}' > "$RESULT_DIR/sast.sarif"
 
           # Semgrep scan
-          SEMGREP_JSON="$RESULT_DIR/semgrep.json"
-          semgrep --config p/ci --json > "$SEMGREP_JSON" || echo '{"results":[]}' > "$SEMGREP_JSON"
+          semgrep --config p/ci --json > "$RESULT_DIR/semgrep.json" || echo '{"results":[]}' > "$RESULT_DIR/semgrep.json"
 
           # SBOM scan summary
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                                -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-                                                -o -iname "*.spdx" -o -iname "*bom*.xml" \))
-
+          SBOM_FILES=$(find "$ROOT_DIR" -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*bom*.xml" \))
           for sbom in $SBOM_FILES; do
             SBOM_JSON="$RESULT_DIR/sbom_scan.json"
             grype sbom:"$sbom" -o json > "$SBOM_JSON" || continue
@@ -189,7 +166,6 @@ jobs:
             SBOM_H=$(( SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' "$SBOM_JSON") ))
             SBOM_C=$(( SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$SBOM_JSON") ))
           done
-
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > "$RESULT_DIR/sbom_counts.txt"
 
       - name: Upload per-repo results
