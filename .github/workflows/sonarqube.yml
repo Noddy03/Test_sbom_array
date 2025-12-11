@@ -103,9 +103,6 @@ jobs:
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
-          # ==========================================================
-          #  STABLE GRYPE INSTALLER WITH RETRY + FALLBACK MIRRORS
-          # ==========================================================
           install_grype() {
             VERSION="v0.73.2"
             FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
@@ -158,44 +155,42 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --json > results/sca.json \
-            || echo '{"vulnerabilities":[]}' > results/sca.json
+          snyk test --all-projects --json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
 
       - name: SAST - Snyk Code (FULL SCAN)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          snyk code test --sarif --all-projects > results/sast.sarif \
-            || echo '{"runs":[]}' > results/sast.sarif
+          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
 
       - name: Semgrep (full rule pack)
         run: |
-          semgrep --config p/ci --json > results/semgrep.json \
-            || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: SBOM Scanning
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-
           SBOMS=$(find project -type f -iname "*bom*.json" \
                                          -o -iname "*cyclonedx*.json" \
                                          -o -iname "*.cdx.json" \
                                          -o -iname "*.spdx.json" \
                                          -o -iname "*.spdx")
-
           for sb in $SBOMS; do
             grype sbom:"$sb" -o json > results/sbom.json || continue
-
             SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' results/sbom.json) ))
             SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' results/sbom.json) ))
             SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' results/sbom.json) ))
             SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' results/sbom.json) ))
           done
-
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      - name: Package results
-        run: zip -r "${SAFE_NAME}.zip" results
+      - name: Package results (always produces a zip)
+        run: |
+          mkdir -p results
+          # Add placeholder if results folder is empty
+          [ -z "$(ls -A results)" ] && touch results/placeholder.txt
+          ls -l results
+          zip -r "${SAFE_NAME}.zip" results
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
