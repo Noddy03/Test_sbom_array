@@ -1,4 +1,4 @@
-name: Top Repos Security Scan faster (SBOM Filtered)
+name: Top Repos Security Scan MATRIX (SBOM Filtered)
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
+
     steps:
       - name: Install Python and git
         run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
@@ -35,67 +36,62 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, subprocess, tempfile, shutil, json
-
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
+          q = urllib.parse.quote(f"language:{lang}")
+          url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=50"
+          r = requests.get(url, headers=headers)
+          r.raise_for_status()
 
-          # Fetch top 200 repos (2 pages)
-          repos = []
-          for page in range(1, 3):
-              q = urllib.parse.quote(f"language:{lang}")
-              url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=100&page={page}"
-              r = requests.get(url, headers=headers)
-              r.raise_for_status()
-              repos.extend(r.json().get("items", []))
+          items = r.json()["items"]
+          selected = []
 
-          selected_repos = []
-          for repo in repos:
-              if len(selected_repos) >= top_n:
+          for repo in items:
+              if len(selected) >= top_n:
                   break
-              full_name = repo["full_name"]
-              tmpdir = tempfile.mkdtemp()
+              full = repo["full_name"]
+
+              tmp = tempfile.mkdtemp()
               try:
-                  # shallow clone
-                  result = subprocess.run(
+                  res = subprocess.run(
                       ["git", "clone", "--depth", "1",
-                       f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
+                       f"https://x-access-token:{token}@github.com/{full}", tmp],
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE
                   )
-                  if result.returncode != 0:
+                  if res.returncode != 0:
                       continue
 
-                  # check for SBOM files
-                  sbom_files = subprocess.run(
-                      ["find", tmpdir, "-type", "f",
-                       "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
-                       "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
+                  sbom = subprocess.run(
+                      ["find", tmp, "-type", "f",
+                       "-iname", "*bom*.json", "-o", "-iname", "*cyclonedx*.json",
                        "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json",
-                       "-o", "-iname", "*.spdx"],
+                       "-o", "-iname", "*.spdx", "-o", "-iname", "*bom*.xml"],
                       stdout=subprocess.PIPE
                   ).stdout.decode().strip()
 
-                  if sbom_files:
-                      selected_repos.append(full_name)
+                  if sbom:
+                      selected.append(full)
               finally:
-                  shutil.rmtree(tmpdir)
-
-          # Avoid empty matrix issue
-          if not selected_repos:
-              selected_repos = ["__NO_REPO__"]
+                  shutil.rmtree(tmp)
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(selected_repos)}\n")
+              gh.write(f"repos={json.dumps(selected)}\n")
           EOF
 
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
+
+    # ----------- SAFE MATRIX ------------
     strategy:
       fail-fast: false
+      max-parallel: 5 # prevents GitHub overload
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
+    # -------------------------------------
+
     continue-on-error: true
 
     steps:
@@ -105,114 +101,97 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
-      - name: Set safe repo name
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Safe name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
 
-      - name: Clone repository safely
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ matrix.repo }}" = "__NO_REPO__" ]; then exit 0; fi
-          mkdir -p project
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || true
 
-      - name: Build Java project (automatic detection)
-        run: |
-          cd project || exit 0
-          echo "🔍 Detecting build system..."
-          if [ -f "./mvnw" ]; then
-            chmod +x mvnw
-            ./mvnw -B -DskipTests clean package || exit 1
-          elif [ -f "pom.xml" ]; then
-            mvn -B -DskipTests clean package || exit 1
-          elif [ -f "./gradlew" ]; then
-            chmod +x gradlew
-            ./gradlew build -x test || exit 1
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            gradle build -x test || exit 1
-          else
-            echo "❌ No Java build system detected — skipping build"
-          fi
-          cd ..
-
-      - name: Run security scans
+      - name: Run scanning tools
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          if [ "${{ matrix.repo }}" = "__NO_REPO__" ]; then exit 0; fi
-          mkdir -p results
-          cd project || exit 0
+          ROOT=project
+          OUT=results
+          mkdir -p "$OUT"
 
-          snyk test --all-projects --detection-depth=8 --json > ../sca.json || echo '{"vulnerabilities":[]}' > ../sca.json
-          snyk code test --sarif > ../sast.sarif || echo '{"runs":[]}' > ../sast.sarif
-          semgrep --config p/ci --json > ../semgrep.json || echo '{"results":[]}' > ../semgrep.json
+          echo "module,sca_low,sca_medium,sca_high,sca_critical" > "$OUT/sca_summary.csv"
 
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
-                                         -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
-                                         -o -iname "*.spdx" -o -iname "*bom*.xml" \))
-          for sbom in $SBOM_FILES; do
-            grype sbom:$sbom -o json > ../sbom_scan.json || continue
-            SBOM_L=$((SBOM_L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' ../sbom_scan.json)))
-            SBOM_M=$((SBOM_M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' ../sbom_scan.json)))
-            SBOM_H=$((SBOM_H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' ../sbom_scan.json)))
-            SBOM_C=$((SBOM_C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' ../sbom_scan.json)))
+          # ---------- FAST MODULE SCAN (no deep recursive scanning) ----------
+          MODULE_FILES=$(find "$ROOT" -maxdepth 2 -type f \
+            \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+
+          for mod in $MODULE_FILES; do
+            NAME=$(basename $(dirname "$mod"))
+            JSON="$OUT/module_${NAME}.json"
+
+            snyk test --file="$mod" --json > "$JSON" 2>/dev/null || continue
+
+            L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$JSON")
+            M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$JSON")
+            H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$JSON")
+            C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$JSON")
+
+            echo "$NAME,$L,$M,$H,$C" >> "$OUT/sca_summary.csv"
           done
 
-          cd ..
-          echo "${{ matrix.repo }}" > results/repo.txt
-          cp sca.json results/
-          cp sast.sarif results/
-          cp semgrep.json results/
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-          mkdir -p all_results
-          mv results all_results/$SAFE_NAME
-          rm -rf project
+          # ---- SAST ----
+          snyk code test --sarif > "$OUT/sast.sarif" || echo '{"runs":[]}' > "$OUT/sast.sarif"
 
-      - name: Upload per-repo results
+          # ---- Semgrep FAST MODE ----
+          semgrep --config auto --json > "$OUT/semgrep.json" || echo '{"results":[]}' > "$OUT/semgrep.json"
+
+          # ---- SBOM / Grype ----
+          L=0; M=0; H=0; C=0
+          SBOMS=$(find "$ROOT" -type f \( -iname "*bom*.json" -o -iname "cyclonedx*.json" \
+                                        -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
+          for f in $SBOMS; do
+            grype sbom:"$f" -o json > "$OUT/sbom.json" || continue
+            L=$(( L + $(jq '[.matches[] | select(.vulnerability.severity=="Low")] | length' "$OUT/sbom.json") ))
+            M=$(( M + $(jq '[.matches[] | select(.vulnerability.severity=="Medium")] | length' "$OUT/sbom.json") ))
+            H=$(( H + $(jq '[.matches[] | select(.vulnerability.severity=="High")] | length' "$OUT/sbom.json") ))
+            C=$(( C + $(jq '[.matches[] | select(.vulnerability.severity=="Critical")] | length' "$OUT/sbom.json") ))
+          done
+          echo "$L,$M,$H,$C" > "$OUT/sbom_counts.txt"
+
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ github.run_id }}-${{ env.SAFE_NAME }}"
-          path: all_results/${{ env.SAFE_NAME }}
+          name: "repo-results-${{ env.SAFE_NAME }}"
+          path: results
+
 
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: all_results
 
-      - name: Generate summary.csv
+      - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,module,sca_low,sca_medium,sca_high,sca_critical" > summary.csv
+
           for d in all_results/*; do
-            if [ -d "$d" ]; then
-              repo=$(cat "$d/repo.txt")
-              SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
-              SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
-              SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
-              SCA_C=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' "$d/sca.json")
-              SAST_L=$(jq '[.runs[].results[] | select(.level=="note")] | length' "$d/sast.sarif")
-              SAST_M=$(jq '[.runs[].results[] | select(.level=="warning")] | length' "$d/sast.sarif")
-              SAST_H=$(jq '[.runs[].results[] | select(.level=="error")] | length' "$d/sast.sarif")
-              SAST_C=$(jq '[.runs[].results[] | select(.ruleId | test("critical"))] | length' "$d/sast.sarif")
-              SEM_L=$(jq '[.results[] | select(.extra.level=="INFO")] | length' "$d/semgrep.json")
-              SEM_M=$(jq '[.results[] | select(.extra.level=="WARNING")] | length' "$d/semgrep.json")
-              SEM_H=$(jq '[.results[] | select(.extra.level=="ERROR")] | length' "$d/semgrep.json")
-              SEM_C=$(jq '[.results[] | select(.check_id | test("critical|sql|xss|injection"))] | length' "$d/semgrep.json")
-              SBOM_L=$(cut -d',' -f1 "$d/sbom_counts.txt")
-              SBOM_M=$(cut -d',' -f2 "$d/sbom_counts.txt")
-              SBOM_H=$(cut -d',' -f3 "$d/sbom_counts.txt")
-              SBOM_C=$(cut -d',' -f4 "$d/sbom_counts.txt")
-              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SAST_L+SAST_M+SAST_H+SAST_C+SEM_L+SEM_M+SEM_H+SEM_C+SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-              echo "\"$repo\",$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
+            repo_name=$(basename "$d" | sed 's/repo-results-//')
+
+            if [ -f "$d/sca_summary.csv" ]; then
+              tail -n +2 "$d/sca_summary.csv" | while IFS=',' read m l m2 h c; do
+                echo "$repo_name,$m,$l,$m2,$h,$c" >> summary.csv
+              done
             fi
           done
 
       - uses: actions/upload-artifact@v4
         with:
-          name: "security-summary-${{ github.run_id }}"
+          name: "summary-${{ github.run_id }}"
           path: summary.csv
