@@ -127,10 +127,27 @@ jobs:
           mkdir -p results
           cd project || exit 0
 
-          # --- SCA scan (scan all sub-projects) ---
-          if ! snyk test --all-sub-projects --detection-depth=8 --exclude=**/test,**/examples --json > ../sca.json; then
-            echo '{"vulnerabilities":[]}' > ../sca.json
-          fi
+          # --- Initialize empty JSON for aggregated SCA results ---
+          echo '{"vulnerabilities":[]}' > ../sca_agg.json
+
+          # --- Find all pom.xml and build.gradle files (modules) ---
+          MODULE_FILES=$(find . -type f \( -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts" \))
+
+          # --- Scan each module individually ---
+          for module_file in $MODULE_FILES; do
+            echo "Scanning module $module_file"
+            if snyk test --file="$module_file" --json > ../module_sca.json 2>/dev/null; then
+              # Merge vulnerabilities into aggregated JSON
+              jq -s '{vulnerabilities: map(.vulnerabilities) | add}' ../module_sca.json ../sca_agg.json > ../sca_tmp.json
+              mv ../sca_tmp.json ../sca_agg.json
+            fi
+          done
+
+          # Fallback if no vulnerabilities found
+          [ ! -s ../sca_agg.json ] && echo '{"vulnerabilities":[]}' > ../sca_agg.json
+
+          # --- Copy aggregated JSON to results ---
+          cp ../sca_agg.json results/sca.json
 
           # --- SAST scan ---
           if ! snyk code test --sarif > ../sast.sarif; then
@@ -164,6 +181,7 @@ jobs:
           mkdir -p all_results
           mv results all_results/$SAFE_NAME
           rm -rf project
+
 
       - name: Upload per-repo results
         uses: actions/upload-artifact@v4
