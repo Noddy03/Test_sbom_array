@@ -44,11 +44,13 @@ jobs:
           r = requests.get(url, headers=headers)
           r.raise_for_status()
           items = r.json()["items"]
+
           selected_repos = []
           for repo in items:
               if len(selected_repos) >= top_n:
                   break
               full_name = repo["full_name"]
+
               tmpdir = tempfile.mkdtemp()
               try:
                   result = subprocess.run(
@@ -56,19 +58,25 @@ jobs:
                        f"https://x-access-token:{token}@github.com/{full_name}", tmpdir],
                       stdout=subprocess.PIPE, stderr=subprocess.PIPE
                   )
+
                   if result.returncode != 0:
                       continue
+
                   sbom_files = subprocess.run(
                       ["find", tmpdir, "-type", "f",
                        "-iname", "*bom*.json", "-o", "-iname", "*bom*.xml",
                        "-o", "-iname", "*cyclonedx*.json", "-o", "-iname", "*cyclonedx*.xml",
-                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
+                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json",
+                       "-o", "-iname", "*.spdx"],
                       stdout=subprocess.PIPE
                   ).stdout.decode().strip()
+
                   if sbom_files:
                       selected_repos.append(full_name)
+
               finally:
                   shutil.rmtree(tmpdir)
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(selected_repos or [])}\n")
           EOF
@@ -86,11 +94,9 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven
+          sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-
-          # Install Grype for SBOM vulnerability scanning
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
             | sh -s -- -b /usr/local/bin
 
@@ -104,34 +110,62 @@ jobs:
           mkdir -p project
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project || exit 0
 
-      - name: Build Java project (Option A)
+      - name: Build Java project (Option A - automatic detection)
         run: |
           cd project || exit 0
-          if [ -f "mvnw" ]; then
+
+          echo "🔍 Detecting build system..."
+
+          if [ -f "./mvnw" ]; then
+            echo "➡ Maven Wrapper detected"
             chmod +x mvnw
-            ./mvnw -q -DskipTests install || true
+            ./mvnw -B -DskipTests clean package || exit 1
+
           elif [ -f "pom.xml" ]; then
-            mvn -q -DskipTests install || true
+            echo "➡ Maven project detected"
+            mvn -B -DskipTests clean package || exit 1
+
+          elif [ -f "./gradlew" ]; then
+            echo "➡ Gradle Wrapper detected"
+            chmod +x gradlew
+            ./gradlew build -x test || exit 1
+
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "➡ Gradle project detected"
+            gradle build -x test || exit 1
+
+          else
+            echo "❌ No Java build system detected — skipping build"
           fi
+
           cd ..
 
       - name: Run security scans
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           mkdir -p results
           cd project || exit 0
 
-          # Better Java SCA (Option A + deeper detection)
-          snyk test --all-projects --detection-depth=5 --json > ../sca.json \
+          echo "▶ Running Snyk SCA"
+          snyk test \
+            --all-projects \
+            --detection-depth=8 \
+            --exclude=**/test,**/examples \
+            --json > ../sca.json \
             || echo '{"vulnerabilities":[]}' > ../sca.json
 
+          echo "▶ Running Snyk Code (SAST)"
           snyk code test --sarif > ../sast.sarif \
             || echo '{"runs":[]}' > ../sast.sarif
 
+          echo "▶ Running Semgrep"
           semgrep --config p/ci --json > ../semgrep.json \
             || echo '{"results":[]}' > ../semgrep.json
 
-          # SBOM scanning using Grype, aggregating all sboms
+          echo "▶ Scanning SBOM files with Grype"
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
+
           SBOM_FILES=$(find . -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" \
                                          -o -iname "*.cdx.json" -o -iname "*.spdx.json" \
                                          -o -iname "*.spdx" -o -iname "*bom*.xml" \))
@@ -147,6 +181,7 @@ jobs:
           done
 
           cd ..
+
           echo "${{ matrix.repo }}" > results/repo.txt
           cp sca.json results/
           cp sast.sarif results/
@@ -174,9 +209,11 @@ jobs:
       - name: Generate summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sast_low,sast_medium,sast_high,sast_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+
           for d in all_results/*; do
             if [ -d "$d" ]; then
               repo=$(cat "$d/repo.txt")
+
               SCA_L=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' "$d/sca.json")
               SCA_M=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' "$d/sca.json")
               SCA_H=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' "$d/sca.json")
