@@ -222,10 +222,10 @@ jobs:
               unzip -o "$zipfile" -d temp
 
               # ---------- SCA ----------
-              SCA_L=$(jq '[.vulnerabilities[]?|select(.severity=="low")] | length' temp/results/sca.json)
-              SCA_M=$(jq '[.vulnerabilities[]?|select(.severity=="medium")] | length' temp/results/sca.json)
-              SCA_H=$(jq '[.vulnerabilities[]?|select(.severity=="high")] | length' temp/results/sca.json)
-              SCA_C=$(jq '[.vulnerabilities[]?|select(.severity=="critical")] | length' temp/results/sca.json)
+              SCA_L=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="low")] | length' temp/results/sca.json)
+              SCA_M=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="medium")] | length' temp/results/sca.json)
+              SCA_H=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="high")] | length' temp/results/sca.json)
+              SCA_C=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="critical")] | length' temp/results/sca.json)
 
               # ---------- SAST ----------
               SAST_L=$(jq '[.runs[].results[]?|select(.level=="note")] | length' temp/results/sast.sarif)
