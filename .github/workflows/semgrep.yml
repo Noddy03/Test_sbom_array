@@ -90,25 +90,28 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle
           pip3 install semgrep
           npm install -g snyk
-
+      
           echo "⚙️ Installing Grype safely with retries..."
-          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin --fail-on-checksum=false"
-
+          install_cmd="curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin"
+      
           for i in 1 2 3 4 5; do
             echo "Attempt $i to install Grype..."
             if eval "$install_cmd"; then
-              echo "Grype installed successfully"
-              grype version
-              break
+              if command -v grype >/dev/null; then
+                echo "Grype installed successfully"
+                grype version
+                break
+              fi
             fi
-            echo "Grype install failed on attempt $i"
+            echo "❌ Grype install failed on attempt $i"
             sleep 3
           done
-
+      
           if ! command -v grype >/dev/null; then
             echo "❌ Failed to install Grype after 5 attempts"
             exit 1
           fi
+      
 
       - name: Set safe repo name
         run: echo "SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')" >> $GITHUB_ENV
