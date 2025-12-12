@@ -103,24 +103,23 @@ jobs:
       - name: Semgrep
         run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: SBOM Scanning
+      - name: SBOM Scanning (robust)
         run: |
+          grype db update
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOMS=$(find project -type f -iname "*bom*.json" \
-                                         -o -iname "*cyclonedx*.json" \
-                                         -o -iname "*.cdx.json" \
-                                         -o -iname "*.spdx.json" \
-                                         -o -iname "*.spdx")
+          SBOMS=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \))
           for sb in $SBOMS; do
+            echo "Scanning SBOM: $sb"
             TMP_FILE=$(mktemp)
-            grype sbom:"$sb" -o json > "$TMP_FILE" || continue
-            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' "$TMP_FILE") ))
-            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' "$TMP_FILE") ))
-            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP_FILE") ))
-            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP_FILE") ))
+            grype sbom:"$sb" -o json > "$TMP_FILE" || { echo "Grype failed for $sb"; continue; }
+            SBOM_L=$(( SBOM_L + $(jq '[.matches[]? | select(.vulnerability.severity=="Low")] // [] | length' "$TMP_FILE") ))
+            SBOM_M=$(( SBOM_M + $(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] // [] | length' "$TMP_FILE") ))
+            SBOM_H=$(( SBOM_H + $(jq '[.matches[]? | select(.vulnerability.severity=="High")] // [] | length' "$TMP_FILE") ))
+            SBOM_C=$(( SBOM_C + $(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] // [] | length' "$TMP_FILE") ))
             rm -f "$TMP_FILE"
           done
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
+
       - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
