@@ -77,7 +77,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # 🟢 SCA - Multi-manifest Snyk Scan (raw)
+      # SCA - Multi-manifest Snyk Scan (raw)
       ###########################################################################
       - name: SCA - Multi-manifest Snyk Scan (fully recursive & merged)
         env:
@@ -96,19 +96,25 @@ jobs:
           ' results/sca_raw.json > results/sca.json
 
       ###########################################################################
-      # 🟢 Cleaned SCA
+      # SCA - Cleaned (strong filters & deduplicate)
       ###########################################################################
       - name: SCA - Cleaned
         run: |
           jq '
             .vulnerabilities |= map(
               select(
-                (.isIgnored | not) and
-                (.isPatched | not) and
-                (.cvssScore // 0) >= 5
+                (.isIgnored | not)
+                and (.isPatched | not)
+                and (.cvssScore // 0) >= 5
+                and (.identifiers.CVE | length > 0)
               )
             )
-          ' results/sca.json > results/sca_cleaned.json
+          ' results/sca.json > results/sca_cleaned_temp.json
+          # Deduplicate by packageName + version + vulnerability ID
+          jq '
+            .vulnerabilities |= unique_by(.packageName + ":" + .version + ":" + .id)
+          ' results/sca_cleaned_temp.json > results/sca_cleaned.json
+          rm results/sca_cleaned_temp.json
 
       ###########################################################################
       # SAST
@@ -125,7 +131,7 @@ jobs:
         run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # 🟢 SBOM Scanning + Validation
+      # SBOM Scanning + Validation
       ###########################################################################
       - name: SBOM Scanning (validated)
         run: |
