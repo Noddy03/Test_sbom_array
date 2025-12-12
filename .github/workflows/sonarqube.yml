@@ -63,15 +63,17 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # Install tools with PATH fix for cyclonedx-bom
+      # Install tools with proper PATH for cyclonedx-bom
       ###########################################################################
       - name: Install security tools
         run: |
           sudo apt-get update
           sudo apt-get install -y npm python3-pip unzip curl git maven gradle
           npm install -g snyk
-          pip3 install cyclonedx-bom semgrep
-          export PATH=$PATH:~/.local/bin
+          pip3 install --user cyclonedx-bom semgrep
+          # Add pip user binaries to PATH
+          export PATH="$HOME/.local/bin:$PATH"
+
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
           curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
