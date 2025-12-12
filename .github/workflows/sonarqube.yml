@@ -75,16 +75,35 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Multi-manifest Snyk Scan (raw + transitive deps)
+      # SCA - Multi-manifest Snyk Scan with auto-lockfile detection
       ###########################################################################
-      - name: SCA - Multi-manifest Snyk Scan (raw, include transitive)
+      - name: SCA - Multi-manifest Snyk Scan (auto-detect lockfiles)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          echo "Running full recursive SCA scan (including transitive dependencies)…"
-          snyk test --all-projects --detection-depth=10 --json > results/sca_raw.json || true
-          # Normalize array vs object
+          echo "Finding lockfiles and manifest files to scan…"
+
+          LOCKFILES=$(find project -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "Pipfile.lock" -o -name "poetry.lock" -o -name "pom.xml" -o -name "build.gradle" \))
+
+          if [ -z "$LOCKFILES" ]; then
+            echo "No lockfiles found, scanning all manifests recursively"
+            snyk test --all-projects --detection-depth=10 --json > results/sca_raw.json || true
+          else
+            echo "Lockfiles found:"
+            echo "$LOCKFILES"
+            > results/sca_raw.json
+            for f in $LOCKFILES; do
+              echo "Scanning $f..."
+              TMP=$(mktemp)
+              snyk test --file="$f" --all-projects --detection-depth=10 --json > "$TMP" || true
+              jq -s add results/sca_raw.json "$TMP" > results/sca_tmp.json
+              mv results/sca_tmp.json results/sca_raw.json
+              rm -f "$TMP"
+            done
+          fi
+
+          # Normalize array vs object for cleaning
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -101,7 +120,6 @@ jobs:
         run: |
           echo "Cleaning SCA results (Option B)…"
 
-          # Step 1: keep low with CVE, all medium/high/critical
           jq '
             .vulnerabilities |= map(
               select(
@@ -123,7 +141,6 @@ jobs:
             )
           ' results/sca_normalized.json > results/sca_clean_step1.json
 
-          # Step 2: remove test/mock/sample/example/fixture
           jq '
             .vulnerabilities |= map(
               select(
@@ -132,7 +149,6 @@ jobs:
             )
           ' results/sca_clean_step1.json > results/sca_clean_step2.json
 
-          # Step 3: deduplicate by package + version + id
           jq '
             .vulnerabilities |= unique_by(
               (.packageName + ":" + .version + ":" + (.id // "noid"))
@@ -147,18 +163,13 @@ jobs:
       - name: SAST - Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-        run: |
-          mkdir -p results
-          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
+        run: snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
 
       - name: Semgrep
-        run: |
-          mkdir -p results
-          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+        run: semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: SBOM Scanning (validated)
         run: |
-          mkdir -p results
           grype db update || true
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           STATUS="no_sbom"
@@ -225,17 +236,14 @@ jobs:
             REPO="${SAFE#repo-results-}"
             mkdir temp
             unzip -o "$zipfile" -d temp >/dev/null
-            # Use cleaned SCA for summary
             SCA_L=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="low")] | length' temp/results/sca_cleaned.json)
             SCA_M=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="medium")] | length' temp/results/sca_cleaned.json)
             SCA_H=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="high")] | length' temp/results/sca_cleaned.json)
             SCA_C=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="critical")] | length' temp/results/sca_cleaned.json)
-            # Semgrep
             SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
             SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
             SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
-            # SBOM
             if [ -f temp/results/sbom_counts.txt ]; then
               IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
             else
