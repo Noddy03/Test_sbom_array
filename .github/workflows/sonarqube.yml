@@ -63,7 +63,6 @@ jobs:
           sudo apt-get install -y jq git npm python3-pip maven gradle unzip curl
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
-          # install grype
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
           curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
@@ -76,40 +75,16 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Multi-manifest Snyk Scan (raw -> normalized)
+      # SCA - Multi-manifest Snyk Scan (raw + transitive deps)
       ###########################################################################
-      - name: SCA - Multi-manifest Snyk Scan (fully recursive & save raw)
+      - name: SCA - Multi-manifest Snyk Scan (raw, include transitive)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          echo "Running full recursive SCA scan…"
-          snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
-          # Normalize/merge vulnerabilities into a predictable structure `results/sca.json`
-          jq '
-            # handle array or single object Snyk output
-            if (input | length) == 0 then
-              try ( . ) catch . end
-            else .
-            end
-          ' results/sca_raw.json > /dev/null 2>&1 || true
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
-
-      ###########################################################################
-      # SCA - Cleaned (All real vulns, minimal noise)
-      ###########################################################################
-      - name: SCA - Cleaned (Option B, robust)
-        run: |
-          echo "Cleaning SCA results (Option B)…"
-
-          # Normalize Snyk output: if array, merge vulnerabilities; if object, keep vulnerabilities
+          echo "Running full recursive SCA scan (including transitive dependencies)…"
+          snyk test --all-projects --detection-depth=10 --json > results/sca_raw.json || true
+          # Normalize array vs object
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -119,7 +94,14 @@ jobs:
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca_normalized.json
 
-          # Step 1 — keep all medium/high/critical, low only if CVE
+      ###########################################################################
+      # SCA - Cleaned (Option B)
+      ###########################################################################
+      - name: SCA - Cleaned (Option B)
+        run: |
+          echo "Cleaning SCA results (Option B)…"
+
+          # Step 1: keep low with CVE, all medium/high/critical
           jq '
             .vulnerabilities |= map(
               select(
@@ -129,12 +111,10 @@ jobs:
                 and (.version != null)
                 and (.packageName != "")
                 and (
-                  # LOW → only if CVE
                   ((.severity|ascii_downcase=="low")
                     and (.identifiers | type=="object")
                     and (.identifiers.CVE | type=="array")
                     and ((.identifiers.CVE | length) > 0))
-                  # MEDIUM/HIGH/CRITICAL → always keep
                   or ((.severity|ascii_downcase) == "medium")
                   or ((.severity|ascii_downcase) == "high")
                   or ((.severity|ascii_downcase) == "critical")
@@ -143,7 +123,7 @@ jobs:
             )
           ' results/sca_normalized.json > results/sca_clean_step1.json
 
-          # Step 2 — remove noise packages
+          # Step 2: remove test/mock/sample/example/fixture
           jq '
             .vulnerabilities |= map(
               select(
@@ -152,7 +132,7 @@ jobs:
             )
           ' results/sca_clean_step1.json > results/sca_clean_step2.json
 
-          # Step 3 — deduplicate by package + version + id
+          # Step 3: deduplicate by package + version + id
           jq '
             .vulnerabilities |= unique_by(
               (.packageName + ":" + .version + ":" + (.id // "noid"))
@@ -162,7 +142,7 @@ jobs:
           rm -f results/sca_normalized.json results/sca_clean_step1.json results/sca_clean_step2.json
 
       ###########################################################################
-      # SAST
+      # SAST, Semgrep, SBOM steps remain unchanged
       ###########################################################################
       - name: SAST - Snyk Code
         env:
@@ -171,21 +151,14 @@ jobs:
           mkdir -p results
           snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
 
-      ###########################################################################
-      # Semgrep
-      ###########################################################################
       - name: Semgrep
         run: |
           mkdir -p results
           semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      ###########################################################################
-      # SBOM Scanning + Validation (grype on detected SBOMs)
-      ###########################################################################
       - name: SBOM Scanning (validated)
         run: |
           mkdir -p results
-          # update grype DB (best-effort)
           grype db update || true
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           STATUS="no_sbom"
@@ -228,9 +201,6 @@ jobs:
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
           echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-          # ensure results exist
-          mkdir -p results
-          # include raw and cleaned sca files (raw=sca_raw.json, normalized=sca.json, cleaned=sca_cleaned.json)
           zip -r "$SAFE.zip" results || true
 
       - uses: actions/upload-artifact@v4
@@ -241,7 +211,6 @@ jobs:
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -257,10 +226,10 @@ jobs:
             mkdir temp
             unzip -o "$zipfile" -d temp >/dev/null
             # Use cleaned SCA for summary
-            SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
-            SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
-            SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
-            SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
+            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="low")] | length' temp/results/sca_cleaned.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="medium")] | length' temp/results/sca_cleaned.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="high")] | length' temp/results/sca_cleaned.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity|ascii_downcase=="critical")] | length' temp/results/sca_cleaned.json)
             # Semgrep
             SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
