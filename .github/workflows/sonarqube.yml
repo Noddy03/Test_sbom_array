@@ -75,35 +75,38 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Multi-manifest Snyk Scan with auto-lockfile detection
+      # SCA - Robust Multi-module Scan
       ###########################################################################
-      - name: SCA - Multi-manifest Snyk Scan (auto-detect lockfiles)
+      - name: SCA - Robust Multi-module Scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          echo "Finding lockfiles and manifest files to scan…"
+          echo "Scanning all lockfiles and manifests in repo…"
 
-          LOCKFILES=$(find project -type f \( -name "package-lock.json" -o -name "yarn.lock" -o -name "Pipfile.lock" -o -name "poetry.lock" -o -name "pom.xml" -o -name "build.gradle" \))
+          FILES=$(find project -type f \( \
+            -name "package-lock.json" -o -name "yarn.lock" \
+            -o -name "Pipfile.lock" -o -name "poetry.lock" \
+            -o -name "pom.xml" -o -name "build.gradle" \
+          \))
 
-          if [ -z "$LOCKFILES" ]; then
+          if [ -z "$FILES" ]; then
             echo "No lockfiles found, scanning all manifests recursively"
             snyk test --all-projects --detection-depth=10 --json > results/sca_raw.json || true
           else
-            echo "Lockfiles found:"
-            echo "$LOCKFILES"
+            echo "Found files to scan:"
+            echo "$FILES"
             > results/sca_raw.json
-            for f in $LOCKFILES; do
+            for f in $FILES; do
               echo "Scanning $f..."
               TMP=$(mktemp)
-              snyk test --file="$f" --all-projects --detection-depth=10 --json > "$TMP" || true
+              snyk test --file="$f" --json > "$TMP" || true
               jq -s add results/sca_raw.json "$TMP" > results/sca_tmp.json
               mv results/sca_tmp.json results/sca_raw.json
               rm -f "$TMP"
             done
           fi
 
-          # Normalize array vs object for cleaning
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -119,7 +122,6 @@ jobs:
       - name: SCA - Cleaned (Option B)
         run: |
           echo "Cleaning SCA results (Option B)…"
-
           jq '
             .vulnerabilities |= map(
               select(
