@@ -218,3 +218,9 @@ jobs:
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
+
+      - name: Upload summary.csv
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
