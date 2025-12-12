@@ -75,6 +75,57 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
+      # Install project dependencies for full SCA
+      ###########################################################################
+      - name: Install project dependencies
+        run: |
+          set -e
+          echo "Installing project dependencies…"
+
+          # Node.js
+          if [ -f project/package-lock.json ]; then
+            echo "Installing Node.js dependencies (npm ci)…"
+            cd project
+            npm ci
+            cd ..
+          elif [ -f project/yarn.lock ]; then
+            echo "Installing Node.js dependencies (yarn install)…"
+            cd project
+            yarn install --frozen-lockfile
+            cd ..
+          fi
+
+          # Python
+          if [ -f project/requirements.txt ]; then
+            echo "Installing Python dependencies (pip)…"
+            pip install -r project/requirements.txt
+          elif [ -f project/Pipfile ]; then
+            echo "Installing Python dependencies (pipenv)…"
+            pip install pipenv
+            pipenv install --deploy --ignore-pipfile
+          elif [ -f project/pyproject.toml ]; then
+            echo "Installing Python dependencies (poetry)…"
+            pip install poetry
+            cd project
+            poetry install --no-interaction --no-ansi
+            cd ..
+          fi
+
+          # Maven
+          if [ -f project/pom.xml ]; then
+            echo "Resolving Maven dependencies…"
+            mvn -f project/pom.xml dependency:resolve -Dsilent=true
+          fi
+
+          # Gradle
+          if [ -f project/build.gradle ] || [ -f project/build.gradle.kts ]; then
+            echo "Resolving Gradle dependencies…"
+            cd project
+            ./gradlew build -x test
+            cd ..
+          fi
+
+      ###########################################################################
       # SCA - Robust Multi-module Scan
       ###########################################################################
       - name: SCA - Robust Multi-module Scan
