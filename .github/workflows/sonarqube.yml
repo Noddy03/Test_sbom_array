@@ -23,7 +23,7 @@ jobs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl unzip npm maven gradle
 
       - name: Fetch top N repos
         id: set_output
@@ -57,31 +57,45 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle unzip curl
-          pip3 install semgrep cyclonedx-bom
-          npm install -g snyk
-          VERSION="v0.73.2"
-          FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
-          curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
-          tar -xzf grype.tgz
-          sudo mv grype /usr/local/bin/ || true
-
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # Install dependencies for each project type
+      # Install tools
+      ###########################################################################
+      - name: Install security tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y npm python3-pip unzip curl git maven gradle
+          npm install -g snyk
+          pip3 install semgrep cyclonedx-bom
+          VERSION="v0.73.2"
+          FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
+          curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
+          tar -xzf grype.tgz
+          chmod +x grype
+          sudo mv grype /usr/local/bin/
+          
+          echo "Tool versions:"
+          snyk --version
+          grype version
+          semgrep --version
+          cyclonedx-bom --version
+
+      - name: Make Gradle wrapper executable
+        run: |
+          if [ -f project/gradlew ]; then
+            chmod +x project/gradlew
+          fi
+
+      ###########################################################################
+      # Install project dependencies
       ###########################################################################
       - name: Install project dependencies
         run: |
           set -e
-          echo "Installing project dependencies…"
-
           # Node.js
           if [ -f project/package-lock.json ]; then
             cd project && npm ci && cd ..
@@ -123,9 +137,9 @@ jobs:
           done
 
       ###########################################################################
-      # SCA - Robust Multi-module Scan
+      # SCA - Multi-module scan
       ###########################################################################
-      - name: SCA - Multi-module Scan
+      - name: SCA - Multi-module scan
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
@@ -153,9 +167,9 @@ jobs:
           jq '.vulnerabilities |= map(select((.isIgnored|not) and (.isPatched|not) and (.packageName!=null) and (.version!=null) and (.packageName!="") and ((.severity|ascii_downcase=="low" and (.identifiers.CVE|type=="array"|length>0)) or (.severity|ascii_downcase=="medium") or (.severity|ascii_downcase=="high") or (.severity|ascii_downcase=="critical"))))' results/sca_normalized.json > results/sca_cleaned.json
 
       ###########################################################################
-      # SBOM scan using Grype
+      # SBOM scan with Grype
       ###########################################################################
-      - name: SBOM Scan with Grype
+      - name: SBOM Scan
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
           for sb in results/sboms/*.cdx.json; do
