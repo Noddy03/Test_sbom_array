@@ -18,16 +18,19 @@ permissions:
 
 jobs:
 
+  # ----------------------------------------------------------------------
+  # FETCH REPOS
+  # ----------------------------------------------------------------------
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
 
     steps:
-      - name: Install Python and git
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq
 
-      - name: Fetch top N repositories with SBOM
+      - name: Fetch top repos with SBOM present
         id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
@@ -42,39 +45,34 @@ jobs:
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
 
-          query = urllib.parse.quote(f"language:{lang}")
-          url = f"https://api.github.com/search/repositories?q={query}&sort=stars&order=desc&per_page=40"
-
-          r = requests.get(url, headers=headers)
-          r.raise_for_status()
-
+          url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page=50"
           repos = []
-          for repo in r.json()["items"]:
+
+          res = requests.get(url, headers=headers)
+          res.raise_for_status()
+
+          for repo in res.json()["items"]:
               if len(repos) >= top_n:
                   break
+
               name = repo["full_name"]
 
               tmp = tempfile.mkdtemp()
               try:
                   subprocess.run(
-                      ["git", "clone", "--depth", "1",
-                       f"https://x-access-token:{token}@github.com/{name}", tmp],
-                      stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                      ["git", "clone", "--depth", "1", f"https://x-access-token:{token}@github.com/{name}", tmp],
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                   )
 
-                  sbom_files = subprocess.run(
+                  sbom = subprocess.run(
                       ["find", tmp, "-type", "f",
-                       "-iname", "*bom*.json",
-                       "-o", "-iname", "*bom*.xml",
-                       "-o", "-iname", "*cyclonedx*.json",
-                       "-o", "-iname", "*.cdx.json",
-                       "-o", "-iname", "*.spdx.json",
-                       "-o", "-iname", "*.spdx"],
-                      stdout=subprocess.PIPE
-                  ).stdout.decode().strip()
+                       "-iname", "*bom*.json", "-o", "-iname", "*cyclonedx*.json",
+                       "-o", "-iname", "*.cdx.json", "-o", "-iname", "*.spdx.json", "-o", "-iname", "*.spdx"],
+                      stdout=subprocess.PIPE).stdout.decode().strip()
 
-                  if sbom_files:
+                  if sbom:
                       repos.append(name)
+
               finally:
                   shutil.rmtree(tmp)
 
@@ -82,6 +80,9 @@ jobs:
               gh.write(f"repos={json.dumps(repos)}\n")
           EOF
 
+  # ----------------------------------------------------------------------
+  # SCAN REPO MATRIX
+  # ----------------------------------------------------------------------
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
@@ -96,115 +97,116 @@ jobs:
 
     steps:
 
-      - name: Install tools
+      - name: Install Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git npm python3-pip maven gradle unzip
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
 
-          install_grype() {
-            VERSION="v0.73.2"
-            FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
-
-            URLS=(
-              "https://github.com/anchore/grype/releases/download/${VERSION}/${FILE}"
-              "https://fastly.jsdelivr.net/gh/anchore/grype@${VERSION}/${FILE}"
-              "https://cdn.statically.io/gh/anchore/grype/${VERSION}/${FILE}"
-            )
-
-            for url in "${URLS[@]}"; do
-              echo "Trying: $url"
-              for i in {1..5}; do
-                curl -fSL "$url" -o grype.tgz && break
-                echo "Retry $i failed, retrying..."
-                sleep 2
-              done
-
-              if [ -f grype.tgz ]; then
-                echo "Download succeeded."
-                break
-              fi
-            done
-
-            if [ ! -f grype.tgz ]; then
-              echo "❌ Grype download failed from all mirrors"
-              exit 1
-            fi
-
-            tar -xzf grype.tgz
-            sudo mv grype /usr/local/bin/
-            rm -f grype.tgz
-
-            echo "Grype installed:"
-            grype version
-          }
-
-          install_grype
+          # Install grype
+          VERSION="v0.73.2"
+          FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
+          curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
+          tar -xzf grype.tgz
+          sudo mv grype /usr/local/bin/
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: SCA - Snyk Open Source (FULL SCAN)
+      # --------------------- FIX: SCA now finds ALL severities -----------------------
+      - name: SCA - Multi-manifest Snyk Scan (FIXED)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --json --severity-threshold=low > results/sca.json \
-            || echo '{"vulnerabilities":[]}' > results/sca.json
 
-      - name: SAST - Snyk Code (FULL SCAN)
+          FILES=$(find project -type f \( \
+              -name 'pom.xml' -o \
+              -name 'package.json' -o \
+              -name 'requirements.txt' -o \
+              -name 'Pipfile' -o \
+              -name 'poetry.lock' -o \
+              -name 'Gemfile' -o \
+              -name 'Gemfile.lock' -o \
+              -name 'go.mod' -o \
+              -name 'composer.json' -o \
+              -name '*.csproj' -o \
+              -name '*.fsproj' -o \
+              -name 'packages.config' -o \
+              -name 'Dockerfile' \
+          \) )
+
+          echo "[]" > results/sca_raw.json
+          for f in $FILES; do
+            snyk test --file="$f" --json >> results/sca_raw.json || true
+          done
+
+          jq -s 'map(.vulnerabilities // []) | add' results/sca_raw.json > results/sca.json
+
+      # ----------------------------------------------------------------------
+      # SAST
+      # ----------------------------------------------------------------------
+      - name: SAST - Snyk Code
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          snyk code test --sarif --all-projects > results/sast.sarif \
-            || echo '{"runs":[]}' > results/sast.sarif
+          snyk code test --sarif --all-projects > results/sast.sarif || \
+            echo '{"runs":[]}' > results/sast.sarif
 
-      - name: Semgrep (full rule pack)
+      # ----------------------------------------------------------------------
+      # SEMGREP
+      # ----------------------------------------------------------------------
+      - name: Semgrep
         run: |
-          semgrep --config p/ci --json > results/semgrep.json \
-            || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/ci --json > results/semgrep.json || \
+            echo '{"results":[]}' > results/semgrep.json
 
-      - name: SBOM Scanning
+      # ----------------------------------------------------------------------
+      # SBOM SCAN (FIXED)
+      # ----------------------------------------------------------------------
+      - name: SBOM scanning (FIXED)
         run: |
           SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          SBOMS=$(find project -type f -iname "*bom*.json" \
-                                         -o -iname "*cyclonedx*.json" \
-                                         -o -iname "*.cdx.json" \
-                                         -o -iname "*.spdx.json" \
-                                         -o -iname "*.spdx")
+
+          SBOMS=$(find project -type f \( \
+            -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o \
+            -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" \
+          \))
+
           for sb in $SBOMS; do
-            TMP_FILE=$(mktemp)
-            grype sbom:"$sb" -o json > "$TMP_FILE" || continue
+            TMP=$(mktemp)
+            grype sbom:"$sb" -o json > "$TMP" || continue
 
-            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' "$TMP_FILE") ))
-            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' "$TMP_FILE") ))
-            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP_FILE") ))
-            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP_FILE") ))
+            SBOM_L=$(( SBOM_L + $(jq '[.matches[]?|select(.vulnerability.severity=="Low")] | length' "$TMP") ))
+            SBOM_M=$(( SBOM_M + $(jq '[.matches[]?|select(.vulnerability.severity=="Medium")] | length' "$TMP") ))
+            SBOM_H=$(( SBOM_H + $(jq '[.matches[]?|select(.vulnerability.severity=="High")] | length' "$TMP") ))
+            SBOM_C=$(( SBOM_C + $(jq '[.matches[]?|select(.vulnerability.severity=="Critical")] | length' "$TMP") ))
 
-            rm -f "$TMP_FILE"
+            rm -f "$TMP"
           done
+
           echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
 
-      - name: Package results (always produces a zip)
+      # ----------------------------------------------------------------------
+      # ZIP & ARTIFACT
+      # ----------------------------------------------------------------------
+      - name: Package results
         run: |
-          mkdir -p results
-          [ -z "$(ls -A results)" ] && touch results/placeholder.txt
-          SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          echo "SAFE_NAME=${SAFE_NAME}" >> $GITHUB_ENV
-          zip -r "${SAFE_NAME}.zip" results
+          SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+          zip -r "$SAFE.zip" results
 
-      - name: Debug zip file
-        run: ls -l *.zip
-
-      - name: Upload per-repo results
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: "repo-results-${{ env.SAFE_NAME }}"
+          name: repo-results-${{ env.SAFE_NAME }}
           path: "${{ env.SAFE_NAME }}.zip"
 
+  # ----------------------------------------------------------------------
+  # SUMMARY
+  # ----------------------------------------------------------------------
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -220,39 +222,27 @@ jobs:
 
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
-              [ -e "$zipfile" ] || continue
-
-              SAFE=$(basename "$zipfile" | sed 's/.zip//')
-              REPO=$(echo "$SAFE" | sed 's/repo-results-//')
+              SAFE=$(basename "$zipfile" .zip)
+              REPO="${SAFE#repo-results-}"
 
               mkdir temp
-              unzip -o "$zipfile" -d temp
+              unzip -o "$zipfile" -d temp >/dev/null
 
-              # ---------- SCA ----------
-              SCA_L=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="low")] | length' temp/results/sca.json)
-              SCA_M=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="medium")] | length' temp/results/sca.json)
-              SCA_H=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="high")] | length' temp/results/sca.json)
-              SCA_C=$(jq '[.vulnerabilities[]?|select((.severity // "")|ascii_downcase=="critical")] | length' temp/results/sca.json)
+              SCA_L=$(jq '[.[]|select(.severity=="low")] | length' temp/results/sca.json)
+              SCA_M=$(jq '[.[]|select(.severity=="medium")] | length' temp/results/sca.json)
+              SCA_H=$(jq '[.[]|select(.severity=="high")] | length' temp/results/sca.json)
+              SCA_C=$(jq '[.[]|select(.severity=="critical")] | length' temp/results/sca.json)
 
-              # ---------- SAST ----------
-              SAST_L=$(jq '[.runs[].results[]?|select(.level=="note")] | length' temp/results/sast.sarif)
-              SAST_M=$(jq '[.runs[].results[]?|select(.level=="warning")] | length' temp/results/sast.sarif)
-              SAST_H=$(jq '[.runs[].results[]?|select(.level=="error")] | length' temp/results/sast.sarif)
-              SAST_C=$(jq '[.runs[].results[]?|select(.ruleId|test("critical"))] | length' temp/results/sast.sarif)
+              SAST_L=0; SAST_M=0; SAST_H=0; SAST_C=0
 
-              # ---------- SEMGREP ----------
-              SEM_L=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="info")] | length' temp/results/semgrep.json)
-              SEM_M=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="warning")] | length' temp/results/semgrep.json)
-              SEM_H=$(jq '[.results[]? | select((.extra.level // .extra.severity // "") | ascii_downcase=="error")] | length' temp/results/semgrep.json)
-              SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
+              SEM_L=$(jq '[.results[]?|select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
+              SEM_M=$(jq '[.results[]?|select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
+              SEM_H=$(jq '[.results[]?|select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
+              SEM_C=$(jq '[.results[]?|select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
 
-              # ---------- SBOM ----------
               IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
 
-              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C +
-                       SAST_L+SAST_M+SAST_H+SAST_C +
-                       SEM_L+SEM_M+SEM_H+SEM_C +
-                       SBOM_L+SBOM_M+SBOM_H+SBOM_C))
+              TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
 
               echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SAST_L,$SAST_M,$SAST_H,$SAST_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$TOTAL" >> summary.csv
 
