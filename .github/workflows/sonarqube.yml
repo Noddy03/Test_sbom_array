@@ -63,7 +63,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # Install tools with proper PATH for cyclonedx-bom
+      # Install tools and persist PATH for cyclonedx-bom
       ###########################################################################
       - name: Install security tools
         run: |
@@ -71,8 +71,9 @@ jobs:
           sudo apt-get install -y npm python3-pip unzip curl git maven gradle
           npm install -g snyk
           pip3 install --user cyclonedx-bom semgrep
-          # Add pip user binaries to PATH
-          export PATH="$HOME/.local/bin:$PATH"
+
+          # Persist ~/.local/bin in PATH across all steps
+          echo "PATH=$HOME/.local/bin:$PATH" >> $GITHUB_ENV
 
           VERSION="v0.73.2"
           FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
