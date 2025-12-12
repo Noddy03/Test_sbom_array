@@ -96,7 +96,7 @@ jobs:
           ' results/sca_raw.json > results/sca.json
 
       ###########################################################################
-      # SCA - Cleaned (all severities, deduplicated)
+      # SCA - Cleaned (all severities, noise filtered, deduplicated)
       ###########################################################################
       - name: SCA - Cleaned
         run: |
@@ -105,11 +105,17 @@ jobs:
               select(
                 (.isIgnored | not)
                 and (.isPatched | not)
-                and (.identifiers.CVE | length > 0)
+                and (
+                  (.severity|ascii_downcase=="low" and (.identifiers.CVE | length > 0))
+                  or (.severity|ascii_downcase=="medium")
+                  or (.severity|ascii_downcase=="high")
+                  or (.severity|ascii_downcase=="critical")
+                )
               )
             )
           ' results/sca.json > results/sca_cleaned_temp.json
 
+          # Deduplicate by packageName + version + vulnerability ID
           jq '
             .vulnerabilities |= unique_by(.packageName + ":" + .version + ":" + .id)
           ' results/sca_cleaned_temp.json > results/sca_cleaned.json
