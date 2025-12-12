@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (SBOM + Semgrep Fixed)
+name: Top Repos Security Scan (Fully Fixed)
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       top_n:
         description: "Number of top repositories to scan"
         required: false
-        default: "10"
+        default: "5"
 
 permissions:
   contents: read
@@ -62,7 +62,7 @@ jobs:
           npm install -g snyk
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
 
-      - name: Clone repo
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
@@ -141,7 +141,8 @@ jobs:
           mkdir -p results
           grype db update || true
           L=0; M=0; H=0; C=0; STATUS="no_sbom"
-          for sb in $(find project -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json"); do
+
+          for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
             TMP=$(mktemp)
             grype sbom:"$sb" -o json > "$TMP" || continue
             L=$((L+$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")))
@@ -151,13 +152,14 @@ jobs:
             rm -f "$TMP"
             STATUS="valid_with_vuln"
           done
+
           echo "$L,$M,$H,$C" > results/sbom_counts.txt
           echo "$STATUS" > results/sbom_status.txt
 
       ###########################################################################
       # PACKAGE RESULTS
       ###########################################################################
-      - name: Package
+      - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
           echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
@@ -181,14 +183,14 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
 
-          for z in all_results/**/*.zip; do
-            SAFE=$(basename "$z" .zip)
-            mkdir temp && unzip -o "$z" -d temp >/dev/null
+          for zipfile in all_results/**/*.zip; do
+            SAFE=$(basename "$zipfile" .zip)
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
-            SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_lowercase)=="low")] | length' temp/results/sca_cleaned.json)
-            SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_lowercase)=="medium")] | length' temp/results/sca_cleaned.json)
-            SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_lowercase)=="high")] | length' temp/results/sca_cleaned.json)
-            SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_lowercase)=="critical")] | length' temp/results/sca_cleaned.json)
+            SCA_L=$(jq '[.vulnerabilities[]? | select((.severity | ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select((.severity | ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select((.severity | ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select((.severity | ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
 
             SEM_L=$(jq '[.results[]? | select((.extra.severity // "" | ascii_upcase)=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select((.extra.severity // "" | ascii_upcase)=="WARNING")] | length' temp/results/semgrep.json)
