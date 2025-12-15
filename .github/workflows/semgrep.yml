@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Final Fixed)
+name: Top Repos Security Scan (Trivy Final Updated)
 
 on:
   workflow_dispatch:
@@ -85,17 +85,24 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # TRIVY SBOM VULNERABILITY SCAN
+      # GENERATE CYCLONEDX SBOM
       ###########################################################################
-      - name: Trivy SBOM scan
+      - name: Generate CycloneDX SBOM
         run: |
           mkdir -p results
-          trivy sbom project \
+          trivy sbom project --format cyclonedx --output results/trivy_sbom.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/trivy_sbom.json
+
+      ###########################################################################
+      # SCAN SBOM FOR VULNERABILITIES
+      ###########################################################################
+      - name: Scan SBOM for vulnerabilities
+        run: |
+          trivy sbom results/trivy_sbom.json \
             --scanners vuln \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sbom_vulns.json || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
-          # Normalize SBOM if needed
+          # Normalize SBOM JSON for jq parsing
           jq 'if has("Results") then . else {Results:[{Target:"sbom",Vulnerabilities:.Vulnerabilities}]} end' \
             results/trivy_sbom_vulns.json > results/trivy_sbom_normalized.json
           [ -f results/trivy_sbom_normalized.json ] || echo '{"Results":[]}' > results/trivy_sbom_normalized.json
@@ -133,13 +140,13 @@ jobs:
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
-            # SCA FS counts
+            # SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            # SBOM counts (normalized)
+            # SBOM counts
             SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_normalized.json)
             SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_normalized.json)
             SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_normalized.json)
