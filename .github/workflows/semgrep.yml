@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Final Separate Counts)
+name: Top Repos Security Scan (Trivy Final Fixed)
 
 on:
   workflow_dispatch:
@@ -22,7 +22,8 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
 
       - id: set_output
         env:
@@ -66,10 +67,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      ###########################################################################
-      # BUILD PROJECT (optional, improves dependency resolution)
-      ###########################################################################
-      - name: Build project
+      - name: Build project (optional)
         run: |
           cd project
           mvn -q -DskipTests package || gradle build -x test || true
@@ -84,23 +82,20 @@ jobs:
             --scanners vuln \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
-            --output results/trivy_fs.json || true
-          [ -f results/trivy_fs.json ] || echo '{"Results":[]}' > results/trivy_fs.json
+            --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # TRIVY SBOM SCAN
+      # TRIVY SBOM VULNERABILITY SCAN
       ###########################################################################
       - name: Trivy SBOM scan
         run: |
           mkdir -p results
           trivy sbom project \
-            --format cyclonedx \
-            --output results/trivy_sbom.json || true
-          trivy sbom results/trivy_sbom.json \
+            --scanners vuln \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
-            --output results/trivy_sbom_vulns.json || true
-          # Normalize SBOM if top-level "Vulnerabilities" exists
+            --output results/trivy_sbom_vulns.json || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
+          # Normalize SBOM if needed
           jq 'if has("Results") then . else {Results:[{Target:"sbom",Vulnerabilities:.Vulnerabilities}]} end' \
             results/trivy_sbom_vulns.json > results/trivy_sbom_normalized.json
           [ -f results/trivy_sbom_normalized.json ] || echo '{"Results":[]}' > results/trivy_sbom_normalized.json
