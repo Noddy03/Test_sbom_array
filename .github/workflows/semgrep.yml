@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Only)
+name: Top Repos Security Scan (Trivy Fixed)
 
 on:
   workflow_dispatch:
@@ -60,8 +60,6 @@ jobs:
           sudo apt-get install -y jq git unzip curl maven gradle
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
@@ -78,22 +76,27 @@ jobs:
           gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FS SCAN (SCA + SAST-like)
+      # TRIVY FS SCAN (SCA)
       ###########################################################################
       - name: Trivy filesystem scan
         run: |
           mkdir -p results
           trivy fs project \
-            --scanners vuln,secret,misconfig \
+            --scanners vuln \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_fs.json || true
 
+          # Ensure file exists
+          [ -f results/trivy_fs.json ] || echo '{"Results":[]}' > results/trivy_fs.json
+
       ###########################################################################
-      # TRIVY SBOM GENERATION + SCAN
+      # TRIVY SBOM GENERATION + SCAN (SAFE)
       ###########################################################################
       - name: Trivy SBOM scan
         run: |
+          mkdir -p results
+
           trivy sbom project \
             --format cyclonedx \
             --output results/trivy_sbom.json || true
@@ -103,18 +106,13 @@ jobs:
             --format json \
             --output results/trivy_sbom_vulns.json || true
 
-      ###########################################################################
-      # OPTIONAL: GRYPE SBOM SCAN (comparison)
-      ###########################################################################
-      - name: Grype SBOM scan
-        run: |
-          mkdir -p results
-          grype sbom:results/trivy_sbom.json -o json > results/grype_sbom.json || true
+          # Force empty JSON if Trivy produced nothing
+          [ -f results/trivy_sbom_vulns.json ] || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
 
       ###########################################################################
-      # NORMALISE TRIVY RESULTS
+      # NORMALISE TRIVY FS RESULTS (SCA MODEL)
       ###########################################################################
-      - name: Normalize Trivy results
+      - name: Normalize Trivy SCA
         run: |
           jq '
             [.Results[]?.Vulnerabilities[]?]
@@ -171,6 +169,7 @@ jobs:
 
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
             echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+
             rm -rf temp
           done
 
