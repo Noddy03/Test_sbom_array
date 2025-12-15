@@ -8,7 +8,7 @@ on:
         default: "Java"
       top_n:
         required: false
-        default: "5"
+        default: "10"
 
 permissions:
   contents: read
@@ -19,7 +19,8 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y python3 jq curl
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y python3 jq curl
 
       - id: set_output
         env:
@@ -29,14 +30,23 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, json
+
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
+
           headers = {"Authorization": f"token {token}"}
-          url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page=50"
+          url = (
+              "https://api.github.com/search/repositories"
+              f"?q=language:{urllib.parse.quote(lang)}"
+              "&sort=stars&order=desc&per_page=50"
+          )
+
           res = requests.get(url, headers=headers)
           res.raise_for_status()
+
           repos = [r["full_name"] for r in res.json()["items"][:top_n]]
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
@@ -61,7 +71,7 @@ jobs:
         run: git clone --depth 1 https://github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # FIND REPO-PROVIDED SBOMS
+      # LOCATE REPO-PROVIDED SBOMS
       ###########################################################################
       - name: Locate SBOMs
         run: |
@@ -82,7 +92,9 @@ jobs:
           echo '{"Results":[]}' > results/trivy_sbom_vulns.json
 
           while read -r sbom; do
+            [ -z "$sbom" ] && continue
             echo "Scanning SBOM: $sbom"
+
             trivy sbom \
               --scanners vuln \
               --format json \
@@ -92,7 +104,8 @@ jobs:
               {
                 Results: (.[0].Results + .[1].Results)
               }
-            ' results/trivy_sbom_vulns.json results/_tmp_sbom.json > results/_merged.json
+            ' results/trivy_sbom_vulns.json results/_tmp_sbom.json \
+              > results/_merged.json
 
             mv results/_merged.json results/trivy_sbom_vulns.json
           done < results/sbom_list.txt
@@ -100,23 +113,26 @@ jobs:
           rm -f results/_tmp_sbom.json
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # PACKAGE RESULTS (SAFE ARTIFACT NAME)
       ###########################################################################
       - name: Package results
         run: |
-          SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          zip -r "$SAFE.zip" results
+          SAFE_REPO=$(echo '${{ matrix.repo }}' | sed 's/[^a-zA-Z0-9._-]/-/g')
+          echo "SAFE_REPO=$SAFE_REPO" >> $GITHUB_ENV
+          zip -r "$SAFE_REPO.zip" results
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload repo artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ matrix.repo }}
-          path: "*.zip"
+          name: repo-results-${{ env.SAFE_REPO }}
+          path: "${{ env.SAFE_REPO }}.zip"
 
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: all
 
@@ -132,17 +148,22 @@ jobs:
             unzip -o "$z" -d tmp >/dev/null
             repo=$(basename "$z" .zip)
 
-            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' tmp/results/trivy_sbom_vulns.json)
-            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' tmp/results/trivy_sbom_vulns.json)
-            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' tmp/results/trivy_sbom_vulns.json)
-            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' tmp/results/trivy_sbom_vulns.json)
+            FILE="tmp/results/trivy_sbom_vulns.json"
+
+            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$FILE")
+            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$FILE")
+            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$FILE")
+            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$FILE")
 
             TOTAL=$((SB_L+SB_M+SB_H+SB_C))
             echo "$repo,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+
             rm -rf tmp
           done
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+
