@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Smart SBOM)
+name: Top Repos Security Scan (Trivy Reliable)
 
 on:
   workflow_dispatch:
@@ -85,39 +85,12 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # CONDITIONAL SBOM SCAN (ONLY IF DEPENDENCY FILE EXISTS)
+      # GENERATE CYCLONEDX SBOM (FOR INVENTORY ONLY)
       ###########################################################################
-      - name: Check for dependency file
-        id: check_deps
-        run: |
-          if [ -f "project/pom.xml" ] || [ -f "project/build.gradle" ] || [ -f "project/package.json" ] || [ -f "project/go.mod" ]; then
-            echo "DEP_EXISTS=true" >> $GITHUB_ENV
-          else
-            echo "DEP_EXISTS=false" >> $GITHUB_ENV
-          fi
-
-      - name: Scan SBOM for vulnerabilities
-        if: env.DEP_EXISTS == 'true'
+      - name: Generate CycloneDX SBOM
         run: |
           mkdir -p results
-          # Generate SBOM
           trivy sbom project --format cyclonedx --output results/trivy_sbom.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/trivy_sbom.json
-          # Scan SBOM for vulnerabilities
-          trivy sbom results/trivy_sbom.json \
-            --scanners vuln \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_sbom_vulns.json || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
-          # Normalize SBOM JSON for jq
-          jq 'if has("Results") then . else {Results:[{Target:"sbom",Vulnerabilities:.Vulnerabilities}]} end' \
-            results/trivy_sbom_vulns.json > results/trivy_sbom_normalized.json
-          [ -f results/trivy_sbom_normalized.json ] || echo '{"Results":[]}' > results/trivy_sbom_normalized.json
-
-      - name: Create empty SBOM JSON if no dependencies
-        if: env.DEP_EXISTS == 'false'
-        run: |
-          mkdir -p results
-          echo '{"Results":[]}' > results/trivy_sbom_normalized.json
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -146,26 +119,27 @@ jobs:
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_present,total" > summary.csv
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
-            # SCA FS counts
+            # SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            # SBOM counts (from normalized JSON)
-            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_normalized.json)
-            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_normalized.json)
-            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_normalized.json)
-            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sbom_normalized.json)
+            # SBOM presence
+            if [ -f temp/results/trivy_sbom.json ]; then
+              SBOM_PRESENT=1
+            else
+              SBOM_PRESENT=0
+            fi
 
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SBOM_PRESENT,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
