@@ -1,4 +1,4 @@
-name: Top Repos Security Scan filtered  (SBOM Filtered)
+name: Top Repos Security Scan (Trivy Only)
 
 on:
   workflow_dispatch:
@@ -22,11 +22,9 @@ jobs:
     outputs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
+      - run: sudo apt-get update && sudo apt-get install -y python3 python3-pip git jq curl
 
-      - name: Fetch top N repos
-        id: set_output
+      - id: set_output
         env:
           LANG_FILTER: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
@@ -45,172 +43,100 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(repos)}\n")
           EOF
+
   scan_repo:
     needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 5
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
 
     steps:
-      - name: Install Tools
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip maven gradle unzip curl
-          pip3 install semgrep cyclonedx-bom
-          npm install -g snyk
-          # install grype
-          VERSION="v0.73.2"
-          FILE="grype_${VERSION#v}_linux_amd64.tar.gz"
-          curl -L "https://github.com/anchore/grype/releases/download/$VERSION/$FILE" -o grype.tgz
-          tar -xzf grype.tgz
-          sudo mv grype /usr/local/bin/ || true
+          sudo apt-get install -y jq git unzip curl maven gradle
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA - Multi-manifest Snyk Scan (raw -> normalized)
+      # BUILD (best-effort)
       ###########################################################################
-      - name: SCA - Multi-manifest Snyk Scan (fully recursive & save raw)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+      - name: Build project (best effort)
+        run: |
+          cd project
+          mvn -q -DskipTests package || \
+          gradle build -x test || true
+
+      ###########################################################################
+      # TRIVY FS SCAN (SCA + SAST-like)
+      ###########################################################################
+      - name: Trivy filesystem scan
         run: |
           mkdir -p results
-          echo "Running full recursive SCA scan…"
-          snyk test --all-projects --detection-depth=6 --json > results/sca_raw.json || true
-          # Normalize/merge vulnerabilities into a predictable structure `results/sca.json`
-          jq '
-            # handle array or single object Snyk output
-            if (input | length) == 0 then
-              try ( . ) catch . end
-            else .
-            end
-          ' results/sca_raw.json > /dev/null 2>&1 || true
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          trivy fs project \
+            --scanners vuln,secret,misconfig \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_fs.json || true
+
       ###########################################################################
-      # SCA - Cleaned (All real vulns, minimal noise)
+      # TRIVY SBOM GENERATION + SCAN
       ###########################################################################
-      - name: SCA - Cleaned (All Real Vulns, No Noise)
+      - name: Trivy SBOM scan
         run: |
-          # step1: remove ignored/patched, require packageName/version, keep all medium+high+critical, keep low only if CVE exists
-          jq '
-            .vulnerabilities |= map(
-              select(
-                (.isIgnored | not)
-                and (.isPatched | not)
-                and (.packageName != null)
-                and (.packageName != "")
-                and (.version != null)
-                and (.version != "")
-                and (
-                  # LOW: must have identifiers object with CVE array length > 0
-                  ( (.severity|ascii_downcase=="low")
-                    and (.identifiers | type=="object")
-                    and (.identifiers.CVE | type=="array")
-                    and ((.identifiers.CVE | length) > 0)
-                  )
-                  # MEDIUM/HIGH/CRITICAL: keep ALL (these are real)
-                  or (.severity|ascii_downcase=="medium")
-                  or (.severity|ascii_downcase=="high")
-                  or (.severity|ascii_downcase=="critical")
-                )
-              )
-            )
-          ' results/sca.json > results/sca_cleaned_step1.json
-          # step2: remove obvious test/mock/example packages which are normally noise
-          jq '
-            .vulnerabilities |= map(
-              select(
-                (.packageName | test("(^|[-_.\\/])test|test-|-test|mock|sample|example|demo" ; "i") | not)
-              )
-            )
-          ' results/sca_cleaned_step1.json > results/sca_cleaned_step2.json
-          # step3: deduplicate by package + version + vulnerability id (safe with // to avoid nulls)
-          jq '
-            .vulnerabilities |= unique_by( (.packageName // "") + ":" + (.version // "") + ":" + (.id // "") )
-          ' results/sca_cleaned_step2.json > results/sca_cleaned.json
-          # cleanup temps
-          rm -f results/sca_cleaned_step1.json results/sca_cleaned_step2.json || true
+          trivy sbom project \
+            --format cyclonedx \
+            --output results/trivy_sbom.json || true
+
+          trivy sbom results/trivy_sbom.json \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/trivy_sbom_vulns.json || true
+
       ###########################################################################
-      # SAST
+      # OPTIONAL: GRYPE SBOM SCAN (comparison)
       ###########################################################################
-      - name: SAST - Snyk Code
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
+      - name: Grype SBOM scan
         run: |
           mkdir -p results
-          snyk code test --sarif --all-projects > results/sast.sarif || echo '{"runs":[]}' > results/sast.sarif
+          grype sbom:results/trivy_sbom.json -o json > results/grype_sbom.json || true
+
       ###########################################################################
-      # Semgrep
+      # NORMALISE TRIVY RESULTS
       ###########################################################################
-      - name: Semgrep
+      - name: Normalize Trivy results
         run: |
-          mkdir -p results
-          semgrep --config p/ci --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          jq '
+            [.Results[]?.Vulnerabilities[]?]
+            | {
+                vulnerabilities: map({
+                  severity: (.Severity | ascii_downcase),
+                  id: .VulnerabilityID,
+                  packageName: .PkgName,
+                  version: .InstalledVersion
+                })
+              }
+          ' results/trivy_fs.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+
       ###########################################################################
-      # SBOM Scanning + Validation (grype on detected SBOMs)
+      # PACKAGE RESULTS
       ###########################################################################
-      - name: SBOM Scanning (validated)
-        run: |
-          mkdir -p results
-          # update grype DB (best-effort)
-          grype db update || true
-          SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-          STATUS="no_sbom"
-          VALID=false
-          FOUND_VULN=false
-          SBOMS=$(find project -type f \( -iname "*bom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.cdx.json" -o -iname "*.spdx.json" -o -iname "*.spdx" -o -iname "*sbom*.json" \) -print)
-          if [ -z "$SBOMS" ]; then
-            STATUS="no_sbom"
-          else
-            for sb in $SBOMS; do
-              VALID_COUNT=$(jq '[.components[]? | select(.name and .version)] | length' "$sb" 2>/dev/null || echo 0)
-              if [ "$VALID_COUNT" -eq 0 ]; then
-                STATUS="invalid_sbom"
-                continue
-              fi
-              VALID=true
-              TMP=$(mktemp)
-              grype sbom:"$sb" -o json > "$TMP" || { rm -f "$TMP"; continue; }
-              L=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="low")] | length' "$TMP")
-              M=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="medium")] | length' "$TMP")
-              H=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="high")] | length' "$TMP")
-              C=$(jq '[.matches[]? | select(.vulnerability.severity|ascii_downcase=="critical")] | length' "$TMP")
-              SBOM_L=$((SBOM_L+L))
-              SBOM_M=$((SBOM_M+M))
-              SBOM_H=$((SBOM_H+H))
-              SBOM_C=$((SBOM_C+C))
-              if [ $((L+M+H+C)) -gt 0 ]; then FOUND_VULN=true; fi
-              rm -f "$TMP"
-            done
-            if [ "$VALID" = false ]; then
-              STATUS="invalid_sbom"
-            else
-              STATUS=$([ "$FOUND_VULN" = true ] && echo "valid_with_vuln" || echo "valid_no_vuln")
-            fi
-          fi
-          echo "$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C" > results/sbom_counts.txt
-          echo "$STATUS" > results/sbom_status.txt
       - name: Package results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
           echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
-          # ensure results exist
-          mkdir -p results
-          # include raw and cleaned sca files (raw=sca_raw.json, normalized=sca.json, cleaned=sca_cleaned.json)
-          zip -r "$SAFE.zip" results || true
+          zip -r "$SAFE.zip" results
+
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ env.SAFE_NAME }}
@@ -219,7 +145,6 @@ jobs:
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -227,36 +152,29 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           shopt -s globstar
+
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
-            REPO="${SAFE#repo-results-}"
-            mkdir temp
-            unzip -o "$zipfile" -d temp >/dev/null
-            # Use cleaned SCA for summary
-            SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
-            SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
-            SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
-            SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
-            # Semgrep
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' temp/results/semgrep.json)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' temp/results/semgrep.json)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' temp/results/semgrep.json)
-            SEM_C=$(jq '[.results[]? | select(.check_id|test("critical|sql|xss|injection"))] | length' temp/results/semgrep.json)
-            # SBOM
-            if [ -f temp/results/sbom_counts.txt ]; then
-              IFS=',' read SBOM_L SBOM_M SBOM_H SBOM_C < temp/results/sbom_counts.txt
-            else
-              SBOM_L=0; SBOM_M=0; SBOM_H=0; SBOM_C=0
-            fi
-            SBOM_STATUS=$(cat temp/results/sbom_status.txt 2>/dev/null || echo "no_sbom")
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C + SEM_L+SEM_M+SEM_H+SEM_C + SBOM_L+SBOM_M+SBOM_H+SBOM_C))
-            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SBOM_L,$SBOM_M,$SBOM_H,$SBOM_C,$SBOM_STATUS,$TOTAL" >> summary.csv
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+
+            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' temp/results/sca.json)
+            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' temp/results/sca.json)
+            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' temp/results/sca.json)
+            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' temp/results/sca.json)
+
+            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_vulns.json)
+            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sbom_vulns.json)
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
-      - name: Upload summary.csv
-        uses: actions/upload-artifact@v4
+
+      - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
