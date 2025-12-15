@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Reliable)
+name: Top Repos Security Scan (Trivy + Grype)
 
 on:
   workflow_dispatch:
@@ -59,8 +59,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl maven gradle
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Install Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
@@ -85,12 +87,25 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # GENERATE CYCLONEDX SBOM (FOR INVENTORY ONLY)
+      # SBOM Scan (Grype)
       ###########################################################################
-      - name: Generate CycloneDX SBOM
+      - name: SBOM Scan (Grype)
         run: |
           mkdir -p results
-          trivy sbom project --format cyclonedx --output results/trivy_sbom.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/trivy_sbom.json
+          grype db update || true
+          L=0; M=0; H=0; C=0; STATUS="no_sbom"
+          for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
+            TMP=$(mktemp)
+            grype sbom:"$sb" -o json > "$TMP" || continue
+            L=$((L+$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")))
+            M=$((M+$(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$TMP")))
+            H=$((H+$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")))
+            C=$((C+$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")))
+            rm -f "$TMP"
+            STATUS="valid_with_vuln"
+          done
+          echo "$L,$M,$H,$C" > results/sbom_counts.txt
+          echo "$STATUS" > results/sbom_status.txt
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -119,7 +134,7 @@ jobs:
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_present,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
@@ -131,15 +146,15 @@ jobs:
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            # SBOM presence
-            if [ -f temp/results/trivy_sbom.json ]; then
-              SBOM_PRESENT=1
+            # SBOM counts
+            if [ -f temp/results/sbom_counts.txt ]; then
+              read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
             else
-              SBOM_PRESENT=0
+              SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
 
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SBOM_PRESENT,$TOTAL" >> summary.csv
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
