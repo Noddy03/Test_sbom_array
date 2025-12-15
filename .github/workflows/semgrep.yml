@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy Final Merged)
+name: Top Repos Security Scan (Trivy Final Separate Counts)
 
 on:
   workflow_dispatch:
@@ -100,18 +100,10 @@ jobs:
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sbom_vulns.json || true
-          [ -f results/trivy_sbom_vulns.json ] || echo '{"Results":[]}' > results/trivy_sbom_vulns.json
-
-      ###########################################################################
-      # MERGE SCA + SBOM VULNERABILITIES
-      ###########################################################################
-      - name: Merge Trivy SCA + SBOM
-        run: |
-          jq -s '
-            {
-              Results: (.[0].Results + .[1].Results)
-            }
-          ' results/trivy_fs.json results/trivy_sbom_vulns.json > results/trivy_merged.json || echo '{"Results":[]}' > results/trivy_merged.json
+          # Normalize SBOM if top-level "Vulnerabilities" exists
+          jq 'if has("Results") then . else {Results:[{Target:"sbom",Vulnerabilities:.Vulnerabilities}]} end' \
+            results/trivy_sbom_vulns.json > results/trivy_sbom_normalized.json
+          [ -f results/trivy_sbom_normalized.json ] || echo '{"Results":[]}' > results/trivy_sbom_normalized.json
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -140,18 +132,26 @@ jobs:
       ###########################################################################
       - name: Build summary.csv
         run: |
-          echo "repo,low,medium,high,critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           shopt -s globstar
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-            FILE="temp/results/trivy_merged.json"
-            LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$FILE")
-            MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$FILE")
-            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$FILE")
-            CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$FILE")
-            TOTAL=$((LOW+MEDIUM+HIGH+CRITICAL))
-            echo "$SAFE,$LOW,$MEDIUM,$HIGH,$CRITICAL,$TOTAL" >> summary.csv
+
+            # SCA FS counts
+            SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
+            SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
+            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
+            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
+
+            # SBOM counts (normalized)
+            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_sbom_normalized.json)
+            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_sbom_normalized.json)
+            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_sbom_normalized.json)
+            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_sbom_normalized.json)
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
