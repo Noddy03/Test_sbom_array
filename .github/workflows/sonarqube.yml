@@ -84,7 +84,8 @@ jobs:
         run: |
           mkdir -p results
           snyk test --all-projects --json > results/sca_raw.json || true
-          jq '{ vulnerabilities: (.vulnerabilities // []) }' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+          jq '{ vulnerabilities: (.vulnerabilities // []) }' results/sca_raw.json \
+            > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
 
       ###########################################################################
       # SEMGREP
@@ -92,10 +93,11 @@ jobs:
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config p/security-audit --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/security-audit --json > results/semgrep.json \
+            || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # SBOM SCAN
+      # SBOM PLACEHOLDER
       ###########################################################################
       - name: SBOM Scan
         run: |
@@ -109,12 +111,14 @@ jobs:
       - name: Trivy License Scan
         run: |
           mkdir -p results
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
           cd project
-          trivy fs --scanners license --format json --output ../results/trivy_license.json . || true
+          trivy fs --scanners license --format json \
+            --output ../results/trivy_license.json . || true
 
       ###########################################################################
-      # PACKAGE RESULTS (SANITIZED)
+      # PACKAGE RESULTS (SAFE ARTIFACT NAME)
       ###########################################################################
       - name: Package results
         run: |
@@ -136,7 +140,7 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # TRIVY LICENSE SUMMARY (FIXED jq)
+      # TRIVY LICENSE SUMMARY (BULLETPROOF)
       ###########################################################################
       - name: Build trivy_license_summary.csv
         run: |
@@ -151,11 +155,30 @@ jobs:
             if [[ -f "$JSON" ]]; then
               jq -r --arg repo "$REPO" '
                 .Results[]?.Packages[]? as $pkg
-                | if ($pkg.Licenses | length) > 0 then
+                | if ($pkg.Licenses | type) == "array" and ($pkg.Licenses | length) > 0 then
                     $pkg.Licenses[]?
-                    | [ $repo, $pkg.Name, $pkg.Version, .Name, (.Confidence // 0) ]
+                    | if type == "object" then
+                        [ $repo,
+                          $pkg.Name,
+                          $pkg.Version,
+                          (.Name // "UNKNOWN"),
+                          (.Confidence // 0)
+                        ]
+                      elif type == "string" then
+                        [ $repo,
+                          $pkg.Name,
+                          $pkg.Version,
+                          .,
+                          0
+                        ]
+                      else empty end
                   else
-                    [ $repo, $pkg.Name, $pkg.Version, "UNKNOWN", 0 ]
+                    [ $repo,
+                      $pkg.Name,
+                      $pkg.Version,
+                      "UNKNOWN",
+                      0
+                    ]
                   end
                 | @csv
               ' "$JSON" >> trivy_license_summary.csv
