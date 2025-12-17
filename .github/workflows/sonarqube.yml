@@ -168,6 +168,16 @@ jobs:
           echo "$STATUS" > results/sbom_status.txt
 
       ###########################################################################
+      # TRIVY LICENSE SCAN
+      ###########################################################################
+      - name: Trivy License Scan
+        run: |
+          mkdir -p results
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          cd project
+          trivy fs --scanners license --format json --output ../results/trivy_license.json .
+
+      ###########################################################################
       # PACKAGE RESULTS (FIXED ARTIFACT NAME)
       ###########################################################################
       - name: Package results
