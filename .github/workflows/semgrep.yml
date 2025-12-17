@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype + Licenses + Python)
+name: Top Repos Security Scan (Trivy + Grype + Licenses)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
       repos: ${{ steps.set_output.outputs.repos }}
     steps:
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y python3 python3-venv git jq curl
+        run: sudo apt-get update && sudo apt-get install -y python3 git jq curl
 
       - id: set_output
         env:
@@ -58,27 +58,20 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle python3-venv
-          # Install Trivy
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install Grype
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          # Install pip-licenses
-          python3 -m pip install --upgrade pip
-          python3 -m pip install pip-licenses
+          sudo apt-get install -y jq git unzip curl
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
-
-      - name: Build project (best effort)
         run: |
-          cd project
-          mvn -q -DskipTests package || gradle build -x test || true
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA VULNERABILITIES (TRIVY FS)
+      # SCA – Trivy FS Vulnerabilities
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -90,56 +83,29 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # LICENSE SCAN (TRIVY FS for non-Python)
+      # LICENSES – Trivy FS
       ###########################################################################
       - name: Trivy FS scan (Licenses)
         run: |
           mkdir -p results
           trivy fs project \
             --scanners license \
-            --format json \
             --license-full \
+            --format json \
             --output results/trivy_license.json || echo '{"Results":[]}' > results/trivy_license.json
 
           PERM=$(jq '[.Results[]?.Licenses[]? | select(.Category=="permissive")] | length // 0' results/trivy_license.json)
           RESTR=$(jq '[.Results[]?.Licenses[]? | select(.Category=="restricted")] | length // 0' results/trivy_license.json)
           UNK=$(jq '[.Results[]?.Licenses[]? | select(.Category=="unknown")] | length // 0' results/trivy_license.json)
 
-          echo "${PERM},${RESTR},${UNK}" > results/license_counts_trivy.txt
+          echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
 
       ###########################################################################
-      # LICENSE SCAN (Python-specific using pip-licenses)
-      ###########################################################################
-      - name: Python licenses via pip-licenses
-        run: |
-          mkdir -p results
-          cd project
-          python3 -m venv venv
-          source venv/bin/activate
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-          pip install pip-licenses
-          pip-licenses --from=mixed --format=json > ../results/pip_licenses.json
-          cd ..
-
-          PERM=$(jq '[.[] | select(.License | test("MIT|Apache|BSD|ISC"))] | length // 0' results/pip_licenses.json)
-          RESTR=$(jq '[.[] | select(.License | test("GPL|LGPL"))] | length // 0' results/pip_licenses.json)
-          UNK=$(jq '[.[] | select(.License=="" or .License=="UNKNOWN")] | length // 0' results/pip_licenses.json)
-
-          # Combine Trivy + pip-licenses
-          read TPERM TRESTR TUNK < results/license_counts_trivy.txt
-          TOTAL_P=$((TPERM + PERM))
-          TOTAL_R=$((TRESTR + RESTR))
-          TOTAL_U=$((TUNK + UNK))
-
-          echo "${TOTAL_P},${TOTAL_R},${TOTAL_U}" > results/license_counts.txt
-
-      ###########################################################################
-      # SBOM VULNERABILITIES (GRYPE)
+      # SBOM VULNERABILITIES – Grype
       ###########################################################################
       - name: SBOM Scan (Grype)
         run: |
+          mkdir -p results
           grype db update || true
           L=0; M=0; H=0; C=0
           for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
@@ -176,7 +142,7 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # BUILD SUMMARY CSV
+      # SUMMARY CSV (COUNTS)
       ###########################################################################
       - name: Build summary.csv
         run: |
@@ -184,23 +150,19 @@ jobs:
           shopt -s globstar
 
           for zipfile in all_results/**/*.zip; do
-            SAFE=$(basename "$zipfile" .zip)
+            REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
 
-            # SCA
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
 
-            # SBOM
             read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
-
-            # LICENSES
             read LIC_P LIC_R LIC_U < temp/results/license_counts.txt
 
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$LIC_P,$LIC_R,$LIC_U,$TOTAL" >> summary.csv
+            echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$LIC_P,$LIC_R,$LIC_U,$TOTAL" >> summary.csv
             rm -rf temp
           done
 
@@ -210,7 +172,7 @@ jobs:
           path: summary.csv
 
       ###########################################################################
-      # BUILD DETAILED TRIVY LICENSE SUMMARY
+      # DETAILED LICENSE CSV
       ###########################################################################
       - name: Build Trivy License summary.csv
         run: |
@@ -220,20 +182,30 @@ jobs:
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-
             TRIVY_JSON="temp/results/trivy_license.json"
+
             if [[ -f "$TRIVY_JSON" ]]; then
               jq -r --arg repo "$REPO" '
-                .Results[]?.Packages[]? as $pkg |
-                ($repo,
-                 $pkg.Name,
-                 $pkg.Version,
-                 ($pkg.Licenses[]?.Name // "UNKNOWN"),
-                 ($pkg.Licenses[]?.Confidence // 0))
+                .Results[]?
+                | .Packages[]?
+                | . as $pkg
+                | (
+                    if ($pkg.Licenses | length) > 0 then
+                      $pkg.Licenses[]
+                    else
+                      {Name:"UNKNOWN", Confidence:0}
+                    end
+                  ) as $lic
+                | [
+                    $repo,
+                    $pkg.Name,
+                    $pkg.Version,
+                    $lic.Name,
+                    ($lic.Confidence // 0)
+                  ]
                 | @csv
               ' "$TRIVY_JSON" >> trivy_license_summary.csv
             fi
-
             rm -rf temp
           done
 
