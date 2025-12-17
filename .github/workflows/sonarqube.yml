@@ -163,6 +163,10 @@ jobs:
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
       - name: Build trivy_license_summary.csv
         run: |
           echo "repo,package,version,license,confidence" > trivy_license_summary.csv
@@ -212,3 +216,4 @@ jobs:
         with:
           name: trivy-license-summary
           path: trivy_license_summary.csv
+         
