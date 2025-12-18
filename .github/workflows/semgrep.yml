@@ -55,7 +55,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl docker.io
+          sudo apt-get install -y jq git unzip curl
+          # Use pre-installed Docker on ubuntu-latest
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
@@ -196,7 +197,7 @@ jobs:
           path: summary.csv
 
       ###########################################################################
-      # DETAILED LICENSE CSV
+      # DETAILED LICENSE CSV (SAFE)
       ###########################################################################
       - name: Build Trivy License summary.csv
         run: |
