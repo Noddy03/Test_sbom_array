@@ -1,9 +1,9 @@
-name: Top Repos Security Scan (SCA + SBOM + DepScan)
+name: Top Repos Security SCA + SBOM + DepScan
 
 on:
   workflow_dispatch:
     inputs:
-      language:
+      language:  
         description: "Programming language to filter repos"
         required: true
         default: "Java"
