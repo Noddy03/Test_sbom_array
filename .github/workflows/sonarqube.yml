@@ -76,16 +76,25 @@ jobs:
           mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # SCA - Snyk
+      # SCA - Snyk (FIXED)
       ###########################################################################
-      - name: SCA - Snyk
+      - name: SCA - Snyk (schema-safe)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
+
           snyk test --all-projects --json > results/sca_raw.json || true
-          jq '{ vulnerabilities: (.vulnerabilities // []) }' results/sca_raw.json \
-            > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+
+          jq '
+            if .vulnerabilities then
+              { vulnerabilities: .vulnerabilities }
+            elif .projects then
+              { vulnerabilities: [ .projects[].vulnerabilities[]? ] }
+            else
+              { vulnerabilities: [] }
+            end
+          ' results/sca_raw.json > results/sca_cleaned.json
 
       ###########################################################################
       # SEMGREP
@@ -113,13 +122,12 @@ jobs:
             --format json --output ../results/trivy_vuln.json . || true
           cd ..
 
-          LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
-          MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
-          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
-          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
+          LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_vuln.json || echo 0)
+          MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_vuln.json || echo 0)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_vuln.json || echo 0)
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_vuln.json || echo 0)
 
           echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
-
           TOTAL=$((LOW + MED + HIGH + CRIT))
 
           if [ "$TOTAL" -eq 0 ]; then
@@ -172,6 +180,7 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
+
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
@@ -199,53 +208,3 @@ jobs:
         with:
           name: security-summary
           path: summary.csv
-
-      ###########################################################################
-      # TRIVY LICENSE SUMMARY
-      ###########################################################################
-      - name: Build trivy_license_summary.csv
-        run: |
-          echo "repo,package,version,license,confidence" > trivy_license_summary.csv
-          shopt -s globstar
-          for zipfile in all_results/**/*.zip; do
-            REPO=$(basename "$zipfile" .zip)
-            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-            JSON="temp/results/trivy_license.json"
-            if [[ -f "$JSON" ]]; then
-              jq -r --arg repo "$REPO" '
-                .Results[]?.Packages[]? as $pkg
-                | if ($pkg.Licenses | type) == "array" and ($pkg.Licenses | length) > 0 then
-                    $pkg.Licenses[]?
-                    | if type == "object" then
-                        [ $repo,
-                          $pkg.Name,
-                          $pkg.Version,
-                          (.Name // "UNKNOWN"),
-                          (.Confidence // 0)
-                        ]
-                      elif type == "string" then
-                        [ $repo,
-                          $pkg.Name,
-                          $pkg.Version,
-                          .,
-                          0
-                        ]
-                      else empty end
-                  else
-                    [ $repo,
-                      $pkg.Name,
-                      $pkg.Version,
-                      "UNKNOWN",
-                      0
-                    ]
-                  end
-                | @csv
-              ' "$JSON" >> trivy_license_summary.csv
-            fi
-            rm -rf temp
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: trivy-license-summary
-          path: trivy_license_summary.csv
