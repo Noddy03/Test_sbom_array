@@ -2,7 +2,7 @@ name: Top Repos Security Scan (SCA + SBOM + DepScan)
 
 on:
   workflow_dispatch:
-    inputs: 
+    inputs:
       language:
         description: "Programming language to filter repos"
         required: true
@@ -37,9 +37,9 @@ jobs:
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
 
-          # If Java, search for Maven projects (pom.xml)
+          # For Java, fetch repos that likely have pom.xml
           if lang.lower() == "java":
-              query = "language:Java filename:pom.xml"
+              query = "language:Java"
           else:
               query = f"language:{lang}"
 
@@ -47,15 +47,12 @@ jobs:
           res = requests.get(url, headers=headers)
           res.raise_for_status()
           repos = [r["full_name"] for r in res.json()["items"][:top_n]]
-          repos_list = repos if repos else []
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
-              gh.write(f"repos={json.dumps(repos_list)}\n")
+              gh.write(f"repos={json.dumps(repos)}\n")
           EOF
 
       - name: Debug Repos
-        run: |
-          echo "Fetched Repos:"
-          cat $GITHUB_OUTPUT
+        run: cat $GITHUB_OUTPUT
 
   scan_repo:
     needs: fetch_repos
@@ -83,16 +80,37 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # BUILD ALL Maven Modules (multi-module support)
+      # Skip non-Java Maven if Java selected
       ###########################################################################
-      - name: Build all Maven modules
+      - name: Check for Java Maven project
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          if ! find project -name "pom.xml" | grep -q '.'; then
+            echo "No pom.xml found, skipping repo"
+            exit 0
+          fi
+
+      ###########################################################################
+      # BUILD ALL Maven/Gradle Modules
+      ###########################################################################
+      - name: Build project
         run: |
           cd project
-          find . -name "pom.xml" | while read POM; do
+          # Build Maven modules
+          if find . -name "pom.xml" | grep -q '.'; then
+            echo "Found Maven modules, building..."
+            find . -name "pom.xml" | while read POM; do
               DIR=$(dirname "$POM")
-              echo "Building Maven module in $DIR"
               (cd "$DIR" && mvn -q -DskipTests package || true)
-          done
+            done
+          else
+            # Fallback to Gradle
+            if [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+              echo "Found Gradle project, building..."
+              gradle build -x test || true
+            fi
+          fi
+          cd ..
 
       ###########################################################################
       # SCA - SNYK
@@ -124,26 +142,22 @@ jobs:
           semgrep scan --config p/security-audit --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # SBOM + Trivy + DepScan (Docker)
+      # SBOM + Trivy + DepScan
       ###########################################################################
       - name: SBOM + Trivy + DepScan
         run: |
           mkdir -p results
           cd project
-
           # Trivy vulnerability scan
           trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_vuln.json . || true
-
-          # Count Trivy vulnerabilities
+          # Count vulnerabilities
           LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' ../results/trivy_vuln.json || echo 0)
           MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' ../results/trivy_vuln.json || echo 0)
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' ../results/trivy_vuln.json || echo 0)
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' ../results/trivy_vuln.json || echo 0)
           echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
-
           TOTAL=$((LOW+MED+HIGH+CRIT))
-
-          # Generate SBOM if no vulnerabilities
+          # Generate SBOM if missing
           if [ "$TOTAL" -eq 0 ]; then
             echo "clean_sbom_generated" > ../results/sbom_status.txt
             trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
@@ -158,15 +172,13 @@ jobs:
             fi
           fi
           cd ..
-
           # Run DepScan via Docker
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
             owasp/dep-scan:latest scan \
             --input /src/$SBOM --format json --output /results/depscan_vulns.json || true
-
-          # Update counts from DepScan
+          # Update counts
           if [ -f results/depscan_vulns.json ]; then
             LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo $LOW)
             MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo $MED)
@@ -176,7 +188,7 @@ jobs:
           fi
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # Package results
       ###########################################################################
       - name: Package results
         run: |
@@ -201,30 +213,23 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           shopt -s globstar
-
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-
             SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
             SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
             SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
             SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
-
             SEM_L=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="WARNING")] | length' temp/results/semgrep.json)
             SEM_H=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="ERROR")] | length' temp/results/semgrep.json)
             SEM_C=$SEM_H
-
             IFS=',' read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
             STATUS=$(cat temp/results/sbom_status.txt)
-
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
-
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
