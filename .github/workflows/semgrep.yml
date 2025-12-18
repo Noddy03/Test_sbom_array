@@ -5,7 +5,7 @@ on:
     inputs:
       language:
         required: true
-        default: "Python"
+        default: "Java"
       top_n:
         required: false
         default: "5"
@@ -68,7 +68,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl
-          # Use pre-installed Docker on ubuntu-latest
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
@@ -78,7 +77,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA – Trivy FS (unchanged)
+      # SCA – Trivy FS
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -90,7 +89,7 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # LICENSES – Trivy FS (unchanged)
+      # LICENSES – Trivy FS
       ###########################################################################
       - name: Trivy FS scan (Licenses)
         run: |
@@ -112,11 +111,10 @@ jobs:
         run: |
           mkdir -p results
 
-          # Check if repo already has an SBOM
+          # Check if repo already has SBOM
           EXISTING_SBOM=$(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \) | head -n1)
 
           if [ -n "$EXISTING_SBOM" ]; then
-            # Scan existing SBOM for vulnerabilities with Grype
             TMP=$(mktemp)
             grype sbom:"$EXISTING_SBOM" -o json > "$TMP" || echo '{"matches":[]}' > "$TMP"
             L=$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")
@@ -127,7 +125,6 @@ jobs:
 
             TOTAL=$((L+M+H+C))
             if [ "$TOTAL" -eq 0 ]; then
-              # Generate SBOM since no vulnerabilities
               trivy fs --format cyclonedx --output results/sbom.cdx.json project || true
               SBOM_PATH="results/sbom.cdx.json"
               echo "clean_sbom_generated" > results/sbom_status.txt
@@ -136,7 +133,6 @@ jobs:
               echo "vulnerabilities_present_existing_sbom" > results/sbom_status.txt
             fi
           else
-            # No SBOM exists, generate one
             trivy fs --format cyclonedx --output results/sbom.cdx.json project || true
             SBOM_PATH="results/sbom.cdx.json"
             echo "clean_sbom_generated" > results/sbom_status.txt
@@ -149,7 +145,7 @@ jobs:
             owasp/dep-scan:latest scan \
             --input /src/$(basename $SBOM_PATH) --format json --output /results/depscan_vulns.json || true
 
-          # Count vulnerabilities from DepScan
+          # Count DepScan vulnerabilities
           if [ -f results/depscan_vulns.json ]; then
             LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo 0)
             MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo 0)
@@ -182,9 +178,6 @@ jobs:
         with:
           path: all_results
 
-      ###########################################################################
-      # SUMMARY CSV
-      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
@@ -208,9 +201,6 @@ jobs:
           name: security-summary
           path: summary.csv
 
-      ###########################################################################
-      # DETAILED LICENSE CSV (SAFE)
-      ###########################################################################
       - name: Build Trivy License summary.csv
         run: |
           echo "repo,package,version,license,confidence" > trivy_license_summary.csv
