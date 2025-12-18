@@ -97,13 +97,39 @@ jobs:
             || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # SBOM PLACEHOLDER
+      # SBOM (Trivy – only if no vulnerabilities)
       ###########################################################################
-      - name: SBOM Scan
+      - name: SBOM Scan (Trivy conditional)
         run: |
           mkdir -p results
-          echo "0,0,0,0" > results/sbom_counts.txt
-          echo "no_sbom" > results/sbom_status.txt
+
+          if ! command -v trivy >/dev/null 2>&1; then
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+              | sudo sh -s -- -b /usr/local/bin
+          fi
+
+          cd project
+          trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json --output ../results/trivy_vuln.json . || true
+          cd ..
+
+          LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
+          MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
+          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
+          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_vuln.json 2>/dev/null || echo 0)
+
+          echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
+
+          TOTAL=$((LOW + MED + HIGH + CRIT))
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "clean_sbom_generated" > results/sbom_status.txt
+            cd project
+            trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
+            cd ..
+          else
+            echo "vulnerabilities_present_sbom_skipped" > results/sbom_status.txt
+          fi
 
       ###########################################################################
       # TRIVY LICENSE SCAN
@@ -118,7 +144,7 @@ jobs:
             --output ../results/trivy_license.json . || true
 
       ###########################################################################
-      # PACKAGE RESULTS (SAFE ARTIFACT NAME)
+      # PACKAGE RESULTS
       ###########################################################################
       - name: Package results
         run: |
@@ -140,7 +166,7 @@ jobs:
           path: all_results
 
       ###########################################################################
-      # TRIVY LICENSE SUMMARY (BULLETPROOF)
+      # SUMMARY CSV
       ###########################################################################
       - name: Build summary.csv
         run: |
@@ -149,33 +175,41 @@ jobs:
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+
             SCA_L=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="low")] | length' temp/results/sca_cleaned.json)
             SCA_M=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="medium")] | length' temp/results/sca_cleaned.json)
             SCA_H=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="high")] | length' temp/results/sca_cleaned.json)
             SCA_C=$(jq '[.vulnerabilities[]? | select((.severity|ascii_downcase)=="critical")] | length' temp/results/sca_cleaned.json)
+
             SEM_L=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="INFO")] | length' temp/results/semgrep.json)
             SEM_M=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="WARNING")] | length' temp/results/semgrep.json)
             SEM_H=$(jq '[.results[]? | select((.extra.severity//""|ascii_upcase)=="ERROR")] | length' temp/results/semgrep.json)
             SEM_C=$SEM_H
+
             IFS=',' read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
             STATUS=$(cat temp/results/sbom_status.txt)
+
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+
+      ###########################################################################
+      # TRIVY LICENSE SUMMARY
+      ###########################################################################
       - name: Build trivy_license_summary.csv
         run: |
           echo "repo,package,version,license,confidence" > trivy_license_summary.csv
           shopt -s globstar
-
           for zipfile in all_results/**/*.zip; do
             REPO=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
-
             JSON="temp/results/trivy_license.json"
             if [[ -f "$JSON" ]]; then
               jq -r --arg repo "$REPO" '
@@ -208,7 +242,6 @@ jobs:
                 | @csv
               ' "$JSON" >> trivy_license_summary.csv
             fi
-
             rm -rf temp
           done
 
@@ -216,4 +249,3 @@ jobs:
         with:
           name: trivy-license-summary
           path: trivy_license_summary.csv
-         
