@@ -42,7 +42,8 @@ jobs:
           page = 1
 
           while len(repos_with_sbom) < top_n:
-              query = f"filename:sbom.cdx.json language:{lang}"
+              # Search SBOM anywhere in the repo
+              query = f"sbom.cdx.json in:path language:{lang}"
               url = f"https://api.github.com/search/code?q={urllib.parse.quote(query)}&per_page={per_page}&page={page}"
 
               try:
@@ -66,7 +67,7 @@ jobs:
               page += 1
               time.sleep(1)
 
-          # Debug print in logs
+          # Debug print
           print("Fetched repos:", repos_with_sbom)
 
           # GitHub Actions output
