@@ -37,10 +37,7 @@ jobs:
           LANG = os.environ["LANG"]
           TOP_N = int(os.environ["TOP_N"])
           TOKEN = os.environ["TOKEN"]
-          headers = {
-              "Authorization": f"token {TOKEN}",
-              "Accept": "application/vnd.github+json"
-          }
+          headers = {"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"}
           repos = []
           page = 1
           per_page = 30
@@ -93,7 +90,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk maven curl gradle
+          sudo apt-get install -y jq git unzip openjdk-17-jdk curl
           pip3 install --user semgrep cyclonedx-bom
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -104,20 +101,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # BUILD PROJECT (resolve dependencies for Snyk)
-      ###########################################################################
-      - name: Build project
-        run: |
-          cd project
-          if [ -f "pom.xml" ]; then
-            mvn dependency:go-offline -B || true
-          fi
-          if [ -f "gradlew" ]; then
-            ./gradlew build --refresh-dependencies -x test || true
-          fi
-
-      ###########################################################################
-      # SCA - Snyk
+      # SCA - Snyk (unmanaged, no build required)
       ###########################################################################
       - name: SCA - Snyk
         env:
@@ -134,7 +118,7 @@ jobs:
       - name: Semgrep
         run: |
           mkdir -p results
-          semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project/**/*.java || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config=p/java --config=p/owasp-top-ten --config=p/security-audit --json --output results/semgrep.json project || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
       # TRIVY SBOM VULNERABILITIES
