@@ -69,9 +69,8 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           # Install Grype
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Clone and install DepScan from GitHub
-          git clone https://github.com/securego/dep-scan.git /tmp/dep-scan
-          pip3 install /tmp/dep-scan
+          # Install DepScan directly from GitHub
+          pip3 install git+https://github.com/securego/dep-scan.git
 
       - name: Clone repository
         env:
