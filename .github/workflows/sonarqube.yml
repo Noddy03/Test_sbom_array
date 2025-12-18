@@ -31,8 +31,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, json
-
+          import os, requests, urllib.parse, json, time
+          
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
@@ -41,40 +41,30 @@ jobs:
           repos = []
           page = 1
           per_page = 50
-          max_pages = 20  # GitHub search API max
+          max_pages = 20
 
           while len(repos) < top_n and page <= max_pages:
               url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page={per_page}&page={page}"
               res = requests.get(url, headers=headers)
-
-              # Stop if GitHub returns 422 (beyond 1000 results)
               if res.status_code == 422:
                   break
               res.raise_for_status()
-
               items = res.json().get("items", [])
               if not items:
-                  break  # No more results
-
+                  break
+              
               for r in items:
                   full_name = r["full_name"]
 
-                  # Fetch repo tree to check for pom.xml and SBOM
-                  tree_url = f"https://api.github.com/repos/{full_name}/git/trees/HEAD?recursive=1"
-                  tree_res = requests.get(tree_url, headers=headers)
-                  if tree_res.status_code != 200:
-                      continue
-                  files = [f['path'] for f in tree_res.json().get('tree', [])]
-
-                  # Java Maven filter
-                  if lang.lower() == "java" and 'pom.xml' not in files:
+                  # Check for SBOM in root
+                  contents_url = f"https://api.github.com/repos/{full_name}/contents/sbom.cdx.json"
+                  try:
+                      cont_res = requests.get(contents_url, headers=headers)
+                      if cont_res.status_code == 200:
+                          repos.append(full_name)
+                  except:
                       continue
 
-                  # SBOM filter
-                  if 'sbom.cdx.json' not in files:
-                      continue
-
-                  repos.append(full_name)
                   if len(repos) >= top_n:
                       break
 
@@ -86,6 +76,7 @@ jobs:
 
   scan_repo:
     needs: fetch_repos
+    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -97,22 +88,15 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle
+          sudo apt-get install -y jq git unzip curl openjdk-17-jdk python3-pip python3-venv docker.io
           pip3 install semgrep cyclonedx-bom
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           npm install -g snyk
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
-
-      ###########################################################################
-      # BUILD (best-effort)
-      ###########################################################################
-      - name: Build project (best effort)
-        run: |
-          cd project
-          mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
       # SCA - SNYK
@@ -144,34 +128,30 @@ jobs:
           semgrep scan --config p/security-audit --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       ###########################################################################
-      # SBOM + Trivy + DepScan (Docker)
+      # SBOM + Trivy + DepScan
       ###########################################################################
       - name: SBOM + Trivy + DepScan
         run: |
           mkdir -p results
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           cd project
+          # Use existing SBOM
+          if [ -f ./sbom.cdx.json ]; then
+            SBOM="../results/sbom.cdx.json"
+            cp ./sbom.cdx.json $SBOM
+          else
+            trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
+            SBOM="../results/sbom.cdx.json"
+          fi
+          # Trivy vulnerability scan
           trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_vuln.json . || true
           LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' ../results/trivy_vuln.json || echo 0)
           MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' ../results/trivy_vuln.json || echo 0)
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' ../results/trivy_vuln.json || echo 0)
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' ../results/trivy_vuln.json || echo 0)
           echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
-          TOTAL=$((LOW+MED+HIGH+CRIT))
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "clean_sbom_generated" > ../results/sbom_status.txt
-            trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
-            SBOM="../results/sbom.cdx.json"
-          else
-            echo "vulnerabilities_present" > ../results/sbom_status.txt
-            if [ -f ./sbom.cdx.json ]; then
-              SBOM="./sbom.cdx.json"
-            else
-              trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
-              SBOM="../results/sbom.cdx.json"
-            fi
-          fi
+          echo "processed" > ../results/sbom_status.txt
           cd ..
+          # DepScan via Docker
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
@@ -186,14 +166,13 @@ jobs:
           fi
 
       ###########################################################################
-      # PACKAGE RESULTS
+      # Package Results
       ###########################################################################
       - name: Package results
         run: |
           SAFE_NAME=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
           zip -r "$SAFE_NAME.zip" results
-
       - uses: actions/upload-artifact@v4
         with:
           name: repo-results-${{ env.SAFE_NAME }}
@@ -228,7 +207,6 @@ jobs:
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
