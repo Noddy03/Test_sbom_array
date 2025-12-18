@@ -31,7 +31,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, json, time
+          import os, requests, urllib.parse, json
 
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
@@ -53,25 +53,26 @@ jobs:
               for r in items:
                   full_name = r["full_name"]
 
-                  # If Java, check for pom.xml
-                  if lang.lower() == "java":
-                      pom_url = f"https://api.github.com/repos/{full_name}/contents/pom.xml"
-                      pom_res = requests.get(pom_url, headers=headers)
-                      if pom_res.status_code != 200:
-                          continue  # Not a Maven repo
+                  # Fetch repository tree (all files in repo)
+                  tree_url = f"https://api.github.com/repos/{full_name}/git/trees/HEAD?recursive=1"
+                  tree_res = requests.get(tree_url, headers=headers)
+                  if tree_res.status_code != 200:
+                      continue
+                  files = [f['path'] for f in tree_res.json().get('tree', [])]
 
-                  # Check for SBOM
-                  sbom_url = f"https://api.github.com/repos/{full_name}/contents/sbom.cdx.json"
-                  sbom_res = requests.get(sbom_url, headers=headers)
-                  if sbom_res.status_code != 200:
-                      continue  # SBOM not present
+                  # Java Maven filter
+                  if lang.lower() == "java" and 'pom.xml' not in files:
+                      continue
+
+                  # SBOM filter
+                  if 'sbom.cdx.json' not in files:
+                      continue
 
                   repos.append(full_name)
                   if len(repos) >= top_n:
                       break
 
               page += 1
-              time.sleep(1)  # gentle delay to avoid hitting rate limits
 
           with open(os.environ["GITHUB_OUTPUT"], "a") as gh:
               gh.write(f"repos={json.dumps(repos)}\n")
@@ -144,16 +145,13 @@ jobs:
           mkdir -p results
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           cd project
-          # Trivy vulnerability scan
           trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_vuln.json . || true
-          # Count Trivy vulnerabilities
           LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' ../results/trivy_vuln.json || echo 0)
           MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' ../results/trivy_vuln.json || echo 0)
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' ../results/trivy_vuln.json || echo 0)
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' ../results/trivy_vuln.json || echo 0)
           echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
           TOTAL=$((LOW+MED+HIGH+CRIT))
-          # If no vulnerabilities, generate SBOM
           if [ "$TOTAL" -eq 0 ]; then
             echo "clean_sbom_generated" > ../results/sbom_status.txt
             trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
@@ -168,13 +166,11 @@ jobs:
             fi
           fi
           cd ..
-          # Run DepScan via Docker on SBOM
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
             owasp/dep-scan:latest scan \
             --input /src/$SBOM --format json --output /results/depscan_vulns.json || true
-          # Update counts from DepScan
           if [ -f results/depscan_vulns.json ]; then
             LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo $LOW)
             MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo $MED)
