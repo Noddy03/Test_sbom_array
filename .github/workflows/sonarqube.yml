@@ -101,12 +101,12 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # BUILD (best effort)
+      # BUILD PROJECT (best effort)
       ###########################################################################
       - name: Build project
         run: |
           cd project
-          mvn -q -DskipTests package || true
+          mvn -DskipTests package || true
 
       ###########################################################################
       # SCA - Snyk
@@ -116,8 +116,11 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+          cd project
+          # Ensure dependencies are available
+          mvn -DskipTests package || true
+          snyk test --all-projects --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
 
       ###########################################################################
       # SEMGREP
