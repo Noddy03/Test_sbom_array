@@ -65,10 +65,18 @@ jobs:
                   subprocess.run(["git", "clone", "--depth", "1", clone_url, "tmp_repo"], check=True)
 
                   # Check recursively for SBOM
-                  result = subprocess.run(['find', 'tmp_repo', '-name', 'sbom.cdx.json'], capture_output=True, text=True)
+                  sbom_found = subprocess.run(['find', 'tmp_repo', '-name', 'sbom.cdx.json'], capture_output=True, text=True).stdout.strip()
+
+                  # Java Maven filter
+                  if lang.lower() == "java":
+                      maven_file = subprocess.run(['find', 'tmp_repo', '-name', 'pom.xml'], capture_output=True, text=True).stdout.strip()
+                      if not maven_file:
+                          sbom_found = ""  # Skip if no pom.xml
+
                   subprocess.run(['rm', '-rf', 'tmp_repo'])
 
-                  if result.stdout.strip():
+                  if sbom_found:             
+                      print("REPO FOUND") 
                       repos_with_sbom.append(full_name)
                       print(f"Found SBOM in {full_name}")
                       if len(repos_with_sbom) >= top_n:
@@ -151,7 +159,6 @@ jobs:
             trivy fs --format cyclonedx --output sbom.cdx.json . || true
           fi
           cd ..
-          # Run DepScan container using SBOM from project folder
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
