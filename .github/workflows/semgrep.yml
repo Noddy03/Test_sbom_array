@@ -31,31 +31,57 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, urllib.parse, json, time
+
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
           token = os.environ["GITHUB_TOKEN"]
           headers = {"Authorization": f"token {token}"}
 
-          # Search query: if Java, include Maven filter (pom.xml), else just language
-          if lang.lower() == "java":
-              query = "language:Java filename:pom.xml"
-          else:
-              query = f"language:{lang}"
+          repos = []
+          page = 1
+          per_page = 50
+          max_pages = 20  # GitHub Search API limit (1000 results)
 
-          url = f"https://api.github.com/search/repositories?q={urllib.parse.quote(query)}&sort=stars&order=desc&per_page=50"
-          
-          for i in range(3):
+          while len(repos) < top_n and page <= max_pages:
+              if lang.lower() == "java":
+                  query = "language:Java filename:pom.xml"
+              else:
+                  query = f"language:{lang}"
+
+              url = f"https://api.github.com/search/repositories?q={urllib.parse.quote(query)}&sort=stars&order=desc&per_page={per_page}&page={page}"
+
               try:
                   res = requests.get(url, headers=headers, timeout=10)
+                  if res.status_code == 422:
+                      break
                   res.raise_for_status()
-                  break
-              except requests.exceptions.RequestException as e:
-                  print(f"Attempt {i+1} failed: {e}")
+              except requests.exceptions.RequestException:
                   time.sleep(5)
-          else:
-              raise RuntimeError("Failed to fetch repositories after 3 attempts")
+                  continue
 
-          repos = [r["full_name"] for r in res.json()["items"][:top_n]]
+              items = res.json().get("items", [])
+              if not items:
+                  break
+
+              for r in items:
+                  full_name = r["full_name"]
+
+                  # Check for SBOM file in repo tree
+                  tree_url = f"https://api.github.com/repos/{full_name}/git/trees/HEAD?recursive=1"
+                  tree_res = requests.get(tree_url, headers=headers)
+                  if tree_res.status_code != 200:
+                      continue
+                  files = [f['path'] for f in tree_res.json().get('tree', [])]
+
+                  if 'sbom.cdx.json' not in files:
+                      continue  # Only include repos with SBOM
+
+                  repos.append(full_name)
+                  if len(repos) >= top_n:
+                      break
+
+              page += 1
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
@@ -74,10 +100,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip curl openjdk-17-jdk python3-pip python3-venv docker.io
-          # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install Grype
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repository
         env:
@@ -113,37 +136,16 @@ jobs:
           echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
 
       ###########################################################################
-      # SBOM + Trivy + DepScan
+      # SBOM + DepScan
       ###########################################################################
-      - name: SBOM + Trivy + DepScan
+      - name: SBOM + DepScan
         run: |
           mkdir -p results
           cd project
-          # Trivy vulnerability scan
-          trivy fs --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_vuln.json . || true
-          # Count Trivy vulnerabilities
-          LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' ../results/trivy_vuln.json || echo 0)
-          MED=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' ../results/trivy_vuln.json || echo 0)
-          HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' ../results/trivy_vuln.json || echo 0)
-          CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' ../results/trivy_vuln.json || echo 0)
-          echo "$LOW,$MED,$HIGH,$CRIT" > ../results/sbom_counts.txt
-          TOTAL=$((LOW+MED+HIGH+CRIT))
-          # Generate SBOM if no vulnerabilities
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "clean_sbom_generated" > ../results/sbom_status.txt
-            trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
-            SBOM="../results/sbom.cdx.json"
-          else
-            echo "vulnerabilities_present" > ../results/sbom_status.txt
-            if [ -f ./sbom.cdx.json ]; then
-              SBOM="./sbom.cdx.json"
-            else
-              trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
-              SBOM="../results/sbom.cdx.json"
-            fi
-          fi
+          # Always generate SBOM for DepScan
+          trivy fs --format cyclonedx --output ../results/sbom.cdx.json . || true
+          SBOM="../results/sbom.cdx.json"
           cd ..
-          # Run DepScan via Docker
           docker run --rm \
             -v "${{ github.workspace }}/project":/src \
             -v "${{ github.workspace }}/results":/results \
@@ -151,10 +153,10 @@ jobs:
             --input /src/$SBOM --format json --output /results/depscan_vulns.json || true
           # Update counts from DepScan
           if [ -f results/depscan_vulns.json ]; then
-            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo $LOW)
-            MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo $MED)
-            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan_vulns.json || echo $HIGH)
-            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan_vulns.json || echo $CRIT)
+            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo 0)
+            MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo 0)
+            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan_vulns.json || echo 0)
+            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan_vulns.json || echo 0)
             echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
 
       ###########################################################################
