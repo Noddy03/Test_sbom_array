@@ -30,7 +30,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
-          import os, requests, urllib.parse, json, time
+          import os, requests, json, urllib.parse, subprocess, time
 
           lang = os.environ["LANG_FILTER"]
           top_n = int(os.environ["TOP_N"])
@@ -42,14 +42,12 @@ jobs:
           page = 1
 
           while len(repos_with_sbom) < top_n:
-              # Search SBOM anywhere in the repo
-              query = f"sbom.cdx.json in:path language:{lang}"
-              url = f"https://api.github.com/search/code?q={urllib.parse.quote(query)}&per_page={per_page}&page={page}"
-
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&order=desc&per_page={per_page}&page={page}"
               try:
                   res = requests.get(url, headers=headers, timeout=10)
                   res.raise_for_status()
-              except requests.exceptions.RequestException:
+              except requests.exceptions.RequestException as e:
+                  print("Request failed, retrying in 5s...", e)
                   time.sleep(5)
                   continue
 
@@ -57,18 +55,29 @@ jobs:
               if not items:
                   break
 
-              for item in items:
-                  repo_full_name = item["repository"]["full_name"]
-                  if repo_full_name not in repos_with_sbom:
-                      repos_with_sbom.append(repo_full_name)
+              for repo in items:
+                  full_name = repo["full_name"]
+                  if full_name in repos_with_sbom:
+                      continue
+
+                  # Shallow clone
+                  clone_url = repo["clone_url"]
+                  subprocess.run(["git", "clone", "--depth", "1", clone_url, "tmp_repo"], check=True)
+
+                  # Check recursively for SBOM
+                  result = subprocess.run(['find', 'tmp_repo', '-name', 'sbom.cdx.json'], capture_output=True, text=True)
+                  subprocess.run(['rm', '-rf', 'tmp_repo'])
+
+                  if result.stdout.strip():
+                      repos_with_sbom.append(full_name)
+                      print(f"Found SBOM in {full_name}")
                       if len(repos_with_sbom) >= top_n:
                           break
 
               page += 1
               time.sleep(1)
 
-          # Debug print
-          print("Fetched repos:", repos_with_sbom)
+          print("Fetched repos with SBOMs:", repos_with_sbom)
 
           # GitHub Actions output
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
