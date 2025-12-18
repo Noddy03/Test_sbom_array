@@ -2,7 +2,7 @@ name: Top Repos Security Scan (SCA + SBOM + DepScan)
 
 on:
   workflow_dispatch:
-    inputs:
+    inputs: 
       language:
         description: "Programming language to filter repos"
         required: true
