@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype + Licenses FINAL)
+name: Top Repos Security Scan (Trivy + Grype + DepScan + Licenses FINAL)
 
 on:
   workflow_dispatch:
@@ -55,7 +55,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl
+          sudo apt-get install -y jq git unzip curl docker.io
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
 
@@ -65,7 +65,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
       ###########################################################################
-      # SCA – Trivy FS
+      # SCA – Trivy FS (unchanged)
       ###########################################################################
       - name: Trivy FS scan (SCA)
         run: |
@@ -77,7 +77,7 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # LICENSES – Trivy FS
+      # LICENSES – Trivy FS (unchanged)
       ###########################################################################
       - name: Trivy FS scan (Licenses)
         run: |
@@ -87,31 +87,65 @@ jobs:
             --license-full \
             --format json \
             --output results/trivy_license.json || echo '{"Results":[]}' > results/trivy_license.json
-
           PERM=$(jq '[.Results[]?.Licenses[]? | select(.Category=="permissive")] | length // 0' results/trivy_license.json)
           RESTR=$(jq '[.Results[]?.Licenses[]? | select(.Category=="restricted")] | length // 0' results/trivy_license.json)
           UNK=$(jq '[.Results[]?.Licenses[]? | select(.Category=="unknown")] | length // 0' results/trivy_license.json)
-
           echo "$PERM,$RESTR,$UNK" > results/license_counts.txt
 
       ###########################################################################
-      # SBOM – Grype
+      # SBOM + DepScan
       ###########################################################################
-      - name: SBOM Scan (Grype)
+      - name: SBOM + DepScan
         run: |
           mkdir -p results
-          grype db update || true
-          L=0; M=0; H=0; C=0
-          for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
+
+          # Check if repo already has an SBOM
+          EXISTING_SBOM=$(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \) | head -n1)
+
+          if [ -n "$EXISTING_SBOM" ]; then
+            # Scan existing SBOM for vulnerabilities with Grype
             TMP=$(mktemp)
-            grype sbom:"$sb" -o json > "$TMP" || continue
-            L=$((L+$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")))
-            M=$((M+$(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$TMP")))
-            H=$((H+$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")))
-            C=$((C+$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")))
+            grype sbom:"$EXISTING_SBOM" -o json > "$TMP" || echo '{"matches":[]}' > "$TMP"
+            L=$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")
+            M=$(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$TMP")
+            H=$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")
+            C=$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")
             rm -f "$TMP"
-          done
-          echo "$L,$M,$H,$C" > results/sbom_counts.txt
+
+            TOTAL=$((L+M+H+C))
+            if [ "$TOTAL" -eq 0 ]; then
+              # Generate SBOM since no vulnerabilities
+              trivy fs --format cyclonedx --output results/sbom.cdx.json project || true
+              SBOM_PATH="results/sbom.cdx.json"
+              echo "clean_sbom_generated" > results/sbom_status.txt
+            else
+              SBOM_PATH="$EXISTING_SBOM"
+              echo "vulnerabilities_present_existing_sbom" > results/sbom_status.txt
+            fi
+          else
+            # No SBOM exists, generate one
+            trivy fs --format cyclonedx --output results/sbom.cdx.json project || true
+            SBOM_PATH="results/sbom.cdx.json"
+            echo "clean_sbom_generated" > results/sbom_status.txt
+          fi
+
+          # Run DepScan on the SBOM
+          docker run --rm \
+            -v "${{ github.workspace }}/project":/src \
+            -v "${{ github.workspace }}/results":/results \
+            owasp/dep-scan:latest scan \
+            --input /src/$(basename $SBOM_PATH) --format json --output /results/depscan_vulns.json || true
+
+          # Count vulnerabilities from DepScan
+          if [ -f results/depscan_vulns.json ]; then
+            LOW=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan_vulns.json || echo 0)
+            MED=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan_vulns.json || echo 0)
+            HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan_vulns.json || echo 0)
+            CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan_vulns.json || echo 0)
+            echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
+          else
+            echo "0,0,0,0" > results/sbom_counts.txt
+          fi
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -142,19 +176,15 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,license_permissive,license_restricted,license_unknown,total" > summary.csv
           shopt -s globstar
-
           for zip in all_results/**/*.zip; do
             REPO=$(basename "$zip" .zip)
             mkdir temp && unzip -o "$zip" -d temp >/dev/null
-
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
-
             read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
             read LIC_P LIC_R LIC_U < temp/results/license_counts.txt
-
             TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
             echo "$REPO,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$LIC_P,$LIC_R,$LIC_U,$TOTAL" >> summary.csv
             rm -rf temp
@@ -166,18 +196,16 @@ jobs:
           path: summary.csv
 
       ###########################################################################
-      # DETAILED LICENSE CSV (SAFE)
+      # DETAILED LICENSE CSV
       ###########################################################################
       - name: Build Trivy License summary.csv
         run: |
           echo "repo,package,version,license,confidence" > trivy_license_summary.csv
           shopt -s globstar
-
           for zip in all_results/**/*.zip; do
             REPO=$(basename "$zip" .zip)
             mkdir temp && unzip -o "$zip" -d temp >/dev/null
             JSON="temp/results/trivy_license.json"
-
             if [[ -f "$JSON" ]]; then
               jq -r --arg repo "$REPO" '
                 .Results[]?
@@ -202,7 +230,6 @@ jobs:
             fi
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: trivy-license-summary
