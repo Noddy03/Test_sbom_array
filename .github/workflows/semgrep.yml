@@ -126,14 +126,14 @@ jobs:
 ################################################################################
       - name: Package repo results
         run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          SAFE=${{ replace(matrix.repo, '/', '-') }}
           mkdir -p all_results
           zip -r "all_results/$SAFE.zip" results
 
       - name: Upload repo results
         uses: actions/upload-artifact@v4
         with:
-          name: all-results-${{ matrix.repo && matrix.repo.replace('/', '-') }}
+          name: all-results-${{ replace(matrix.repo, '/', '-') }}
           path: all_results/*.zip
 
 ################################################################################
