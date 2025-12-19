@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + Trivy SBOM + DepScan
+name: Security Scan – Trivy SCA + SBOM + DepScan
 
 on:
   workflow_dispatch:
@@ -33,8 +33,8 @@ jobs:
           import os, requests, json, urllib.parse, time
 
           headers = {
-            "Authorization": f"token {os.environ['TOKEN']}",
-            "Accept": "application/vnd.github+json"
+              "Authorization": f"token {os.environ['TOKEN']}",
+              "Accept": "application/vnd.github+json"
           }
 
           repos = []
@@ -42,9 +42,9 @@ jobs:
 
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
               url = (
-                "https://api.github.com/search/repositories"
-                f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                "&sort=stars&order=desc&per_page=30&page=" + str(page)
+                  "https://api.github.com/search/repositories"
+                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
@@ -78,7 +78,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install tools and Docker (conflict-free)
+      - name: Install tools (conflict-free)
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip openjdk-17-jdk docker.io
@@ -106,7 +106,7 @@ jobs:
           mvn -q -DskipTests dependency:resolve || true
 
 ################################################################################
-# TRIVY DEPENDENCY SCA (AUTHORITATIVE)
+# TRIVY DEPENDENCY SCA
 ################################################################################
       - name: Trivy Java Dependency SCA
         run: |
@@ -170,7 +170,7 @@ jobs:
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
 ################################################################################
-# PACKAGE & UPLOAD
+# UPLOAD REPO SUMMARY
 ################################################################################
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -179,7 +179,7 @@ jobs:
           path: repo_summary.csv
 
 ################################################################################
-# FINAL SUMMARY
+# BUILD FINAL SUMMARY
 ################################################################################
   build_summary:
     needs: scan_repo
