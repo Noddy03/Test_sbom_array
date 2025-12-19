@@ -74,8 +74,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle openjdk-17-jdk wget
-          pip3 install semgrep cyclonedx-bom
+          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle openjdk-17-jdk
+          pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
@@ -86,7 +86,7 @@ jobs:
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
 ################################################################################
-# BUILD (best effort)
+# BUILD
 ################################################################################
       - name: Build project
         run: |
@@ -102,17 +102,29 @@ jobs:
         run: |
           mkdir -p results
           snyk test --all-projects --json > results/sca_raw.json || true
-          jq '{vulnerabilities: (.vulnerabilities // [])}' results/sca_raw.json > results/sca_cleaned.json
+
+          jq '
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
+          ' results/sca_raw.json > results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
 ################################################################################
       - name: Semgrep
         run: |
-          semgrep --config p/security-audit --config p/owasp-top-ten --config p/java --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep \
+            --config p/security-audit \
+            --config p/owasp-top-ten \
+            --config p/java \
+            --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# TRIVY SBOM + VULNS
+# TRIVY SBOM
 ################################################################################
       - name: Trivy SBOM
         run: |
@@ -141,7 +153,7 @@ jobs:
           echo "$DL,$DM,$DH,$DC" > results/depscan_counts.txt
 
 ################################################################################
-# MERGE SBOM COUNTS + STATUS
+# MERGE SBOM COUNTS
 ################################################################################
       - name: Merge SBOM counts
         run: |
@@ -152,19 +164,20 @@ jobs:
           echo "generated" > results/sbom_status.txt
 
 ################################################################################
-# PACKAGE
+# UPLOAD RESULTS (NO ZIP)
 ################################################################################
-      - name: Package results
+      - name: Upload results
         run: |
           SAFE=$(echo '${{ matrix.repo }}' | tr '/' '-')
-          zip -r "$SAFE.zip" results
+          echo "SAFE_NAME=$SAFE" >> $GITHUB_ENV
+
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results
-          path: "*.zip"
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: results
 
 ################################################################################
-# SUMMARY
+# SUMMARIZE
 ################################################################################
   summarize:
     needs: scan_repo
@@ -177,16 +190,30 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-          for z in all_results/**/*.zip; do
-            r=$(basename "$z" .zip)
-            unzip -q "$z" -d tmp
-            SCA=$(jq '[.vulnerabilities[]?]' tmp/results/sca_cleaned.json)
-            read SL SM SH SC <<<$(jq -r '[map(select(.severity=="low"))|length, map(select(.severity=="medium"))|length, map(select(.severity=="high"))|length, map(select(.severity=="critical"))|length] | @tsv' <<<"$SCA")
-            read SB_L SB_M SB_H SB_C < tmp/results/sbom_counts.txt
-            STATUS=$(cat tmp/results/sbom_status.txt)
-            TOTAL=$((SL+SM+SH+SC+SB_L+SB_M+SB_H+SB_C))
-            echo "$r,$SL,$SM,$SH,$SC,0,0,0,0,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
-            rm -rf tmp
+
+          for d in all_results/repo-results-*; do
+            REPO=$(basename "$d" | sed 's/^repo-results-//')
+            RESULTS="$d"
+
+            # ---- SCA (Snyk) ----
+            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $RESULTS/sca_cleaned.json)
+            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $RESULTS/sca_cleaned.json)
+            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $RESULTS/sca_cleaned.json)
+            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $RESULTS/sca_cleaned.json)
+
+            # ---- Semgrep ----
+            SEM_L=$(jq '[.results[]? | select((.extra.severity // "")=="INFO")] | length' $RESULTS/semgrep.json)
+            SEM_M=$(jq '[.results[]? | select((.extra.severity // "")=="WARNING")] | length' $RESULTS/semgrep.json)
+            SEM_H=$(jq '[.results[]? | select((.extra.severity // "")=="ERROR")] | length' $RESULTS/semgrep.json)
+            SEM_C=$(jq '[.results[]? | select((.extra.severity // "")=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $RESULTS/semgrep.json)
+
+            # ---- SBOM (Trivy + DepScan merged) ----
+            IFS=',' read SB_L SB_M SB_H SB_C < $RESULTS/sbom_counts.txt
+            STATUS=$(cat $RESULTS/sbom_status.txt)
+
+            TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+
+            echo "$REPO,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
 
       - uses: actions/upload-artifact@v4
