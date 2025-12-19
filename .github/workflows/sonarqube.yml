@@ -123,10 +123,11 @@ jobs:
 
       - name: Semgrep
         run: |
+          LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep \
             --config p/security-audit \
             --config p/owasp-top-ten \
-            --config p/${{ toLower(inputs.language) }} \
+            --config p/$LANG_LOWER \
             --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Trivy SBOM
