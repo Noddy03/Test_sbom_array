@@ -59,7 +59,7 @@ jobs:
           EOF
 
 ################################################################################
-# SCAN REPOS
+# SCAN REPOS (MATRIX)
 ################################################################################
   scan_repo:
     needs: fetch_repos
@@ -78,9 +78,6 @@ jobs:
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-
-      - name: Verify Docker
-        run: docker --version
 
       - name: Clone repo
         env:
@@ -109,10 +106,8 @@ jobs:
 
           FOUND_SBOM=$(find project -iname '*sbom*.json' -o -iname '*cyclonedx*.json' | head -n 1)
           if [ -n "$FOUND_SBOM" ]; then
-            echo "Using existing SBOM: $FOUND_SBOM"
             cp "$FOUND_SBOM" results/sbom.cdx.json
           else
-            echo "No SBOM found, generating one"
             trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           fi
 
@@ -128,17 +123,60 @@ jobs:
           HIGH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json 2>/dev/null || echo 0)
           CRIT=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json 2>/dev/null || echo 0)
 
-          echo "$LOW,$MED,$HIGH,$CRIT" > results/sbom_counts.txt
+          echo "$LOW $MED $HIGH $CRIT" > results/sbom_counts.txt
 
 ################################################################################
-# PACKAGE RESULTS
+# PACKAGE (INTERNAL ONLY)
 ################################################################################
-      - name: Package results
+      - name: Package repo results
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          zip -r "$SAFE.zip" results
+          mkdir -p all_results
+          zip -r "all_results/$SAFE.zip" results
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ matrix.repo }}
-          path: "*.zip"
+          name: all-results-${{ matrix.repo }}
+          path: all_results/*.zip
+
+################################################################################
+# BUILD FINAL SUMMARY
+################################################################################
+  build_summary:
+    needs: scan_repo
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all repo artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_results
+
+      - name: Build summary.csv
+        run: |
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          shopt -s globstar
+          for zipfile in all_results/**/*.zip; do
+            SAFE=$(basename "$zipfile" .zip)
+            mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+
+            SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
+            SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
+            SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
+            SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
+
+            if [ -f temp/results/sbom_counts.txt ]; then
+              read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
+            else
+              SB_L=0; SB_M=0; SB_H=0; SB_C=0
+            fi
+
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
+            rm -rf temp
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: security-summary
+          path: summary.csv
