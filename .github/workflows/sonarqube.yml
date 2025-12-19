@@ -14,10 +14,10 @@ permissions:
   contents: read
   security-events: write
 
-################################################################################
-# FETCH TOP JAVA MAVEN REPOS
-################################################################################
 jobs:
+################################################################################
+# FETCH REPOS
+################################################################################
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -31,12 +31,10 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-
           headers = {
             "Authorization": f"token {os.environ['TOKEN']}",
             "Accept": "application/vnd.github+json"
           }
-
           repos = []
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
@@ -48,27 +46,23 @@ jobs:
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
-
               for repo in r.json().get("items", []):
                   pom = f"https://api.github.com/repos/{repo['full_name']}/contents/pom.xml"
                   if requests.get(pom, headers=headers).status_code == 200:
                       repos.append(repo["full_name"])
                       if len(repos) >= int(os.environ["TOP_N"]):
                           break
-
               page += 1
               time.sleep(1)
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
 ################################################################################
-# SCAN REPOS
+# SCAN
 ################################################################################
   scan_repo:
     needs: fetch_repos
-    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -89,23 +83,18 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
 ################################################################################
-# SAFE BUILD (SKIP DOCKER)
+# DEPENDENCY RESOLUTION (NO DOCKER)
 ################################################################################
-      - name: Resolve dependencies (NO Docker)
+      - name: Resolve deps safely
         run: |
           cd project
-          if [ -f pom.xml ]; then
-            mvn -q -DskipTests -DskipDockerBuild dependency:tree || true
-          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
-            gradle dependencies || true
-          fi
+          mvn -q -DskipTests -Ddocker.skip=true dependency:tree || true
 
 ################################################################################
-# SNYK SCA (REAL)
+# 🔥 SNYK SCA (FIXED)
 ################################################################################
       - name: Snyk SCA
         env:
@@ -115,16 +104,15 @@ jobs:
           cd project
           snyk auth "$SNYK_TOKEN"
 
-          if [ -f pom.xml ]; then
-            snyk test --maven --all-projects --json > ../results/sca_raw.json || true
-          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
-            snyk test --gradle --all-projects --json > ../results/sca_raw.json || true
-          else
-            echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
-          fi
+          snyk test --maven --all-projects --json > ../results/sca_raw.json || true
 
-          jq '{ vulnerabilities: (.vulnerabilities // []) }' \
-            ../results/sca_raw.json > ../results/sca_cleaned.json
+          jq '
+            if type=="array" then
+              { vulnerabilities: (map(.vulnerabilities // []) | add) }
+            else
+              { vulnerabilities: (.vulnerabilities // []) }
+            end
+          ' ../results/sca_raw.json > ../results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -136,7 +124,7 @@ jobs:
             > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# TRIVY SBOM + LICENSE
+# TRIVY SBOM
 ################################################################################
       - name: Trivy SBOM
         run: |
@@ -151,15 +139,9 @@ jobs:
           C=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_vuln.json)
 
           echo "$L,$M,$H,$C" > results/sbom_counts.txt
-          echo "generated" > results/sbom_status.txt
-
-      - name: Trivy License
-        run: |
-          trivy fs project --scanners license --format json \
-            --output results/trivy_license.json || true
 
 ################################################################################
-# PACKAGE RESULTS
+# PACKAGE
 ################################################################################
       - name: Package results
         run: |
@@ -171,42 +153,3 @@ jobs:
         with:
           name: repo-results-${{ env.SAFE_NAME }}
           path: "${{ env.SAFE_NAME }}.zip"
-
-################################################################################
-# SUMMARY
-################################################################################
-  summarize:
-    needs: scan_repo
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: all_results
-
-      - name: Build summary.csv
-        run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_total,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          shopt -s globstar
-
-          for zip in all_results/**/*.zip; do
-            R=$(basename "$zip" .zip)
-            mkdir temp && unzip -o "$zip" -d temp >/dev/null
-
-            SCA_L=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' temp/results/sca_cleaned.json)
-            SCA_M=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' temp/results/sca_cleaned.json)
-            SCA_H=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' temp/results/sca_cleaned.json)
-            SCA_C=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' temp/results/sca_cleaned.json)
-
-            SEM=$(jq '.results | length' temp/results/semgrep.json)
-
-            IFS=',' read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SEM+SB_L+SB_M+SB_H+SB_C))
-
-            echo "$R,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
-            rm -rf temp
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: security-summary
-          path: summary.csv
