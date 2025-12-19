@@ -74,10 +74,13 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle openjdk-17-jdk
+          sudo apt-get install -y jq git npm python3-pip unzip curl maven gradle openjdk-17-jdk wget apt-transport-https gnupg lsb-release
           pip3 install semgrep cyclonedx-bom
           npm install -g snyk
+          # Install Grype (optional)
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           # OWASP DepScan CLI
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
