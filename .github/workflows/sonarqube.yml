@@ -126,7 +126,7 @@ jobs:
           semgrep \
             --config p/security-audit \
             --config p/owasp-top-ten \
-            --config p/${{ inputs.language | lower }} \
+            --config p/${{ toLower(inputs.language) }} \
             --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Trivy SBOM
