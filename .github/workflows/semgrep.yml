@@ -59,11 +59,10 @@ jobs:
           EOF
 
 ################################################################################
-# SCAN REPOS (MATRIX)
+# SCAN REPOS 
 ################################################################################
   scan_repo:
     needs: fetch_repos
-    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -75,15 +74,20 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sudo sh -s -- -b /usr/local/bin
-
-      - name: Clone repo
+          sudo apt-get install -y jq git unzip curl maven gradle
+          # Install Trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          # Install Grype
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+      - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+
+      - name: Build project (optional)
         run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+          cd project
+          mvn -q -DskipTests package || gradle build -x test || true
 
 ################################################################################
 # TRIVY FS SCAN
@@ -124,30 +128,27 @@ jobs:
 ################################################################################
 # PACKAGE (INTERNAL ONLY)
 ################################################################################
-      - name: Package repo results
+      - name: Package results
         run: |
-          SAFE=${{ replace(matrix.repo, '/', '-') }}
-          mkdir -p all_results
-          zip -r "all_results/$SAFE.zip" results
-
-      - name: Upload repo results
-        uses: actions/upload-artifact@v4
+          SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+          zip -r "$SAFE_NAME.zip" results
+      - uses: actions/upload-artifact@v4
         with:
-          name: all-results-${{ replace(matrix.repo, '/', '-') }}
-          path: all_results/*.zip
+          name: repo-results-${{ env.SAFE_NAME }}
+          path: "${{ env.SAFE_NAME }}.zip"
 
-################################################################################
-# BUILD FINAL SUMMARY
-################################################################################
-  build_summary:
+  summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
-      - name: Download all repo artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: all_results
 
+      ###########################################################################
+      # BUILD SUMMARY CSV
+      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
@@ -155,10 +156,12 @@ jobs:
           for zipfile in all_results/**/*.zip; do
             SAFE=$(basename "$zipfile" .zip)
             mkdir temp && unzip -o "$zipfile" -d temp >/dev/null
+            # SCA counts
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' temp/results/trivy_fs.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' temp/results/trivy_fs.json)
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
+            # SBOM counts
             if [ -f temp/results/sbom_counts.txt ]; then
               read SB_L SB_M SB_H SB_C < temp/results/sbom_counts.txt
             else
@@ -168,7 +171,6 @@ jobs:
             echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
