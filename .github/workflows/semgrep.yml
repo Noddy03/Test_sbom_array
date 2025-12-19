@@ -91,8 +91,14 @@ jobs:
         run: |
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+      - name: Sanitize repo name
+        id: sanitize
+        run: |
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+          echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
+
 ################################################################################
-# FORCE DEPENDENCY RESOLUTION (CRITICAL)
+# FORCE DEPENDENCY RESOLUTION
 ################################################################################
       - name: Resolve Maven dependencies
         run: |
@@ -100,7 +106,7 @@ jobs:
           mvn -q -DskipTests dependency:resolve || true
 
 ################################################################################
-# TRIVY JAVA SCA (CORRECT MODE)
+# TRIVY JAVA SCA
 ################################################################################
       - name: Trivy Java Dependency Scan
         run: |
@@ -113,7 +119,7 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
 ################################################################################
-# SBOM (COMPLIANCE ONLY – NO VULN COUNTING)
+# SBOM (COMPLIANCE ONLY)
 ################################################################################
       - name: Generate SBOM
         run: |
@@ -121,18 +127,17 @@ jobs:
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
 
 ################################################################################
-# PACKAGE RESULTS
+# PACKAGE & UPLOAD
 ################################################################################
       - name: Package repo results
         run: |
-          SAFE="${{ replace(matrix.repo, '/', '-') }}"
           mkdir -p all_results
-          zip -r "all_results/$SAFE.zip" results
+          zip -r "all_results/${{ steps.sanitize.outputs.safe }}.zip" results
 
       - name: Upload repo artifact
         uses: actions/upload-artifact@v4
         with:
-          name: repo-results-${{ replace(matrix.repo, '/', '-') }}
+          name: repo-results-${{ steps.sanitize.outputs.safe }}
           path: all_results/*.zip
 
 ################################################################################
