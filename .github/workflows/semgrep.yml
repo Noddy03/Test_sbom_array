@@ -1,5 +1,4 @@
-name: Top Java Maven Repos Security Scan (SBOM Optional)
-
+name: Security Scan full Trivy 
 on:
   workflow_dispatch:
     inputs:
