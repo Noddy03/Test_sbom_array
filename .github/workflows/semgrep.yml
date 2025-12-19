@@ -21,64 +21,39 @@ jobs:
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repos: ${{ steps.set_output.outputs.repos }}
+      repos: ${{ steps.fetch.outputs.repos }}
     steps:
-      - name: Fetch top Java Maven repos
-        id: set_output
+      - id: fetch
         env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LANG: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-
-          LANG = os.environ["LANG"]
-          TOP_N = int(os.environ["TOP_N"])
-          TOKEN = os.environ["TOKEN"]
-
           headers = {
-              "Authorization": f"token {TOKEN}",
-              "Accept": "application/vnd.github+json"
+            "Authorization": f"token {os.environ['TOKEN']}",
+            "Accept": "application/vnd.github+json"
           }
-
           repos = []
           page = 1
-          per_page = 30
-          max_pages = 10
-
-          def has_pom(repo):
-              url = f"https://api.github.com/repos/{repo}/contents/pom.xml"
-              r = requests.get(url, headers=headers)
-              return r.status_code == 200
-
-          while len(repos) < TOP_N and page <= max_pages:
-              search_url = (
-                  "https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(LANG)}"
-                  "&sort=stars&order=desc"
-                  f"&per_page={per_page}&page={page}"
+          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+              url = (
+                "https://api.github.com/search/repositories"
+                f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
-
-              res = requests.get(search_url, headers=headers)
-              if res.status_code != 200:
+              r = requests.get(url, headers=headers)
+              if r.status_code != 200:
                   break
-
-              items = res.json().get("items", [])
-              if not items:
-                  break
-
-              for repo in items:
-                  full = repo["full_name"]
-
-                  if has_pom(full):
-                      repos.append(full)
-                      if len(repos) >= TOP_N:
+              for repo in r.json().get("items", []):
+                  pom = f"https://api.github.com/repos/{repo['full_name']}/contents/pom.xml"
+                  if requests.get(pom, headers=headers).status_code == 200:
+                      repos.append(repo["full_name"])
+                      if len(repos) >= int(os.environ["TOP_N"]):
                           break
-
               page += 1
               time.sleep(1)
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
