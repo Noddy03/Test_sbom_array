@@ -60,8 +60,8 @@ jobs:
           # Install latest Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           trivy --version
-          # Install Dependency-Check CLI
-          curl -L https://github.com/jeremylong/DependencyCheck/releases/download/v8.6.2/dependency-check-8.6.2-release.zip -o dependency-check.zip
+          # Download Dependency-Check CLI (fixed URL)
+          curl -L -o dependency-check.zip https://github.com/jeremylong/DependencyCheck/releases/download/v8.6.2/dependency-check-8.6.2-release.zip
           unzip dependency-check.zip -d dependency-check
 
       - name: Clone repo
@@ -86,13 +86,9 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            # Resolve dependencies for multi-module projects
             mvn dependency:resolve -DskipTests || true
-            # Trivy SCA scan
             trivy maven --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-            # Generate SBOM
             trivy maven --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
-            # Run Dependency-Check
             ./../dependency-check/dependency-check/bin/dependency-check.sh --project "Java-${{ matrix.repo }}" --scan . --out results --format JSON || echo '{}' > results/dependencycheck.json
           else
             echo '{"Results":[]}' > results/trivy_sca.json
@@ -112,11 +108,8 @@ jobs:
           pip install --upgrade pip setuptools wheel
           [ -f requirements.txt ] && pip install -r requirements.txt
           [ -f pyproject.toml ] && pip install .
-          # Trivy SCA
           trivy fs .venv project --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-          # SBOM
           trivy fs .venv project --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
-          # Dependency-Check
           ./../dependency-check/dependency-check/bin/dependency-check.sh --project "Python-${{ matrix.repo }}" --scan . --out results --format JSON || echo '{}' > results/dependencycheck.json
 
 ################################################################################
