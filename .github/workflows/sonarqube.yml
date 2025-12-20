@@ -5,32 +5,32 @@ on:
     inputs:
       language:
         required: true
-        default: "Java"
+        type: choice
+        options: [Python, Java]
+        default: Java
       top_n:
         required: false
-        default: "5"
+        default: "10"
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
 ################################################################################
-# FETCH REPOSITORIES (LANGUAGE ONLY – NO FILTERING)
+# FETCH REPOSITORIES (LANGUAGE ONLY — NO FILTERING)
 ################################################################################
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
       repos: ${{ steps.fetch.outputs.repos }}
     steps:
-      - name: Fetch repositories
-        id: fetch
+      - id: fetch
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LANG: ${{ inputs.language }}
           TOP_N: ${{ inputs.top_n }}
         run: |
-          python3 << 'EOF'
+          python3 <<'EOF'
           import os, requests, json, urllib.parse, time
 
           headers = {
@@ -46,9 +46,9 @@ jobs:
 
           while len(repos) < top_n and page <= 10:
               url = (
-                  f"https://api.github.com/search/repositories"
+                  "https://api.github.com/search/repositories"
                   f"?q=language:{urllib.parse.quote(language)}"
-                  f"&sort=stars&order=desc&per_page=30&page={page}"
+                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
@@ -63,125 +63,99 @@ jobs:
               page += 1
               time.sleep(1)
 
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
-
           print("Fetched repos:", repos)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("repos=" + json.dumps(repos) + "\n")
           EOF
 
-      - name: Debug fetched repos
-        run: echo "Repos:${{ steps.fetch.outputs.repos }}"
-
 ################################################################################
-# SCAN REPOSITORIES (LOOP – NO MATRIX)
+# SCAN REPOSITORIES (SINGLE JOB, LOOP BASED — NO MATRIX)
 ################################################################################
   scan_repos:
     needs: fetch_repos
     runs-on: ubuntu-latest
-    continue-on-error: true
+    env:
+      REPOS: ${{ needs.fetch_repos.outputs.repos }}
+
     steps:
+      - name: Validate repos
+        run: |
+          echo "Repos received:"
+          echo "$REPOS"
+          if ! echo "$REPOS" | jq -e '. | length > 0' >/dev/null; then
+            echo "❌ No repositories to scan"
+            exit 0
+          fi
+
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip maven openjdk-17-jdk python3-venv
-          pip3 install semgrep poetry
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
+          pip3 install --upgrade pip semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
-      - name: Scan repositories
+      - name: Scan loop
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-          LANGUAGE: ${{ inputs.language }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
           mkdir -p all_results
-          REPOS='${{ needs.fetch_repos.outputs.repos }}'
-
-          if [ "$(echo "$REPOS" | jq length)" -eq 0 ]; then
-            echo "No repositories to scan"
-            exit 0
-          fi
-
-          for repo in $(echo "$REPOS" | jq -r '.[]'); do
+          echo "$REPOS" | jq -r '.[]' | while read repo; do
             SAFE=$(echo "$repo" | tr '/' '-')
-            OUT="all_results/repo-results-$SAFE"
-            mkdir -p "$OUT"
+            DIR="all_results/repo-results-$SAFE"
+            mkdir -p "$DIR"
 
-            echo "==== Scanning $repo ===="
-            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project
-            cd project
+            echo "🔍 Scanning $repo"
 
-            ########################
-            # BUILD / INSTALL
-            ########################
-            if [ -f "pom.xml" ]; then
+            git clone --depth 1 https://x-access-token:${TOKEN}@github.com/$repo project || continue
+            cd project || continue
+
+            #######################################
+            # Detect project type
+            #######################################
+            IS_MAVEN=false
+            IS_PYTHON=false
+
+            [ -f pom.xml ] && IS_MAVEN=true
+            [ -f requirements.txt ] || [ -f pyproject.toml ] && IS_PYTHON=true
+
+            #######################################
+            # Build (best effort)
+            #######################################
+            if $IS_MAVEN; then
               mvn -q -DskipTests package || true
-            elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then
-              python3 -m venv venv
-              source venv/bin/activate
-              pip install --upgrade pip
-              if [ -f "requirements.txt" ]; then pip install -r requirements.txt; fi
-              if [ -f "pyproject.toml" ]; then poetry install || true; fi
             fi
 
-            ########################
-            # SNYK
-            ########################
-            snyk test \
-              --all-projects \
-              --detection-depth=20 \
-              --scan-unmanaged \
-              --json > ../$OUT/sca_raw.json || true
+            if $IS_PYTHON; then
+              python3 -m pip install -r requirements.txt 2>/dev/null || true
+            fi
 
-            jq 'if type=="array"
-                then map(.vulnerabilities // []) | add
-                else .vulnerabilities // []
-                end | {vulnerabilities:.}' \
-              ../$OUT/sca_raw.json > ../$OUT/sca_cleaned.json
+            #######################################
+            # SNYK SCA
+            #######################################
+            snyk test --all-projects --json > "$DIR/sca.json" || echo '{"vulnerabilities":[]}' > "$DIR/sca.json"
 
-            ########################
+            #######################################
             # SEMGREP
-            ########################
-            LANG_LOWER=$(echo "$LANGUAGE" | tr '[:upper:]' '[:lower:]')
-            semgrep \
-              --config p/security-audit \
-              --config p/owasp-top-ten \
-              --config p/$LANG_LOWER \
-              --json > ../$OUT/semgrep.json || echo '{"results":[]}' > ../$OUT/semgrep.json
+            #######################################
+            semgrep --config p/security-audit --config p/owasp-top-ten --json > "$DIR/semgrep.json" || echo '{"results":[]}' > "$DIR/semgrep.json"
 
-            ########################
-            # TRIVY
-            ########################
-            trivy fs . --format cyclonedx --output ../$OUT/sbom.cdx.json || true
-            trivy fs . --scanners vuln --format json --output ../$OUT/sbom_vuln.json || true
+            #######################################
+            # TRIVY SBOM
+            #######################################
+            trivy fs . --format json --output "$DIR/trivy.json" || echo '{}' > "$DIR/trivy.json"
 
-            jq '[.Results[].Vulnerabilities[]?]
-                | group_by(.Severity)
-                | map({(.[0].Severity): length})
-                | add' ../$OUT/sbom_vuln.json > ../$OUT/trivy_tmp.json || echo '{}' > ../$OUT/trivy_tmp.json
-
-            ########################
-            # DEP-SCAN
-            ########################
-            java -jar ../dep-scan-cli.jar --scan . --format json --output ../$OUT/dep-scan.json || true
-
-            ########################
-            # MERGE SBOM COUNTS
-            ########################
-            TL=$(jq '.LOW // 0' ../$OUT/trivy_tmp.json)
-            TM=$(jq '.MEDIUM // 0' ../$OUT/trivy_tmp.json)
-            TH=$(jq '.HIGH // 0' ../$OUT/trivy_tmp.json)
-            TC=$(jq '.CRITICAL // 0' ../$OUT/trivy_tmp.json)
-
-            DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' ../$OUT/dep-scan.json 2>/dev/null || echo 0)
-            DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' ../$OUT/dep-scan.json 2>/dev/null || echo 0)
-            DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' ../$OUT/dep-scan.json 2>/dev/null || echo 0)
-            DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' ../$OUT/dep-scan.json 2>/dev/null || echo 0)
-
-            echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > ../$OUT/sbom_counts.txt
-            echo "generated" > ../$OUT/sbom_status.txt
+            #######################################
+            # OWASP DEP-SCAN (JAVA ONLY)
+            #######################################
+            if $IS_MAVEN; then
+              java -jar ../dep-scan-cli.jar --scan . --format json --output "$DIR/dep-scan.json" || echo '{}' > "$DIR/dep-scan.json"
+            else
+              echo '{}' > "$DIR/dep-scan.json"
+            fi
 
             cd ..
             rm -rf project
@@ -189,7 +163,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: all-repo-results
+          name: scan-results
           path: all_results
 
 ################################################################################
@@ -201,37 +175,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: scan-results
           path: all_results
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
-
+          echo "repo,sca_total,semgrep_total,trivy_total,depscan_total,total" > summary.csv
           shopt -s nullglob
-          DIRS=(all_results/repo-results-*)
-
-          if [ ${#DIRS[@]} -eq 0 ]; then
-            echo "No scan results found"
-            exit 0
-          fi
-
-          for d in "${DIRS[@]}"; do
+          for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
-            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
-            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
-            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json)
-
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json)
-
-            IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
-            STATUS=$(cat $d/sbom_status.txt)
-
-            TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$R,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+            SCA=$(jq '.vulnerabilities | length' "$d/sca.json")
+            SEM=$(jq '.results | length' "$d/semgrep.json")
+            TRI=$(jq '[.Results[].Vulnerabilities[]?] | length' "$d/trivy.json" 2>/dev/null || echo 0)
+            DEP=$(jq '.vulnerabilities | length' "$d/dep-scan.json" 2>/dev/null || echo 0)
+            TOTAL=$((SCA+SEM+TRI+DEP))
+            echo "$R,$SCA,$SEM,$TRI,$DEP,$TOTAL" >> summary.csv
           done
 
       - uses: actions/upload-artifact@v4
