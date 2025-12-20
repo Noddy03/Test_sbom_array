@@ -83,19 +83,21 @@ jobs:
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
 ################################################################################
-# DEPENDENCY RESOLUTION AND TRIVY SCAN
+# CREATE RESULTS FOLDER AND PLACEHOLDER FILES
+################################################################################
+      - name: Prepare results folder
+        run: |
+          mkdir -p results
+          touch results/trivy_sca.json results/sbom.cdx.json results/depscan.json
+
+################################################################################
+# SCAN JAVA MAVEN PROJECT
 ################################################################################
       - name: Scan Java Maven Project
         if: contains(inputs.language, 'Java')
         run: |
           cd project
-          # Resolve and copy dependencies
           mvn clean package -DskipTests dependency:copy-dependencies || true
-
-          mkdir -p results
-
-          # Ensure SCA file exists
-          touch results/trivy_sca.json
 
           # Trivy SCA
           trivy fs target/dependency \
@@ -116,6 +118,9 @@ jobs:
             --format json \
             --output /results/depscan.json || echo '{}' > results/depscan.json
 
+################################################################################
+# SCAN PYTHON PROJECT
+################################################################################
       - name: Scan Python Project
         if: contains(inputs.language, 'Python')
         run: |
@@ -125,9 +130,6 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install .; fi
-
-          mkdir -p results
-          touch results/trivy_sca.json results/sbom.cdx.json results/depscan.json
 
           # Trivy SCA
           trivy fs .venv \
@@ -153,9 +155,6 @@ jobs:
 ################################################################################
       - name: Build repo summary row
         run: |
-          [ ! -f results/trivy_sca.json ] && echo '{"Results":[]}' > results/trivy_sca.json
-          [ ! -f results/sbom.cdx.json ] && echo '{"Results":[]}' > results/sbom.cdx.json
-
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
