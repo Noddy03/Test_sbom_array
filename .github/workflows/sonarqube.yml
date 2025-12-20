@@ -20,13 +20,9 @@ jobs:
     outputs:
       repos: ${{ steps.fetch.outputs.repos }}
     steps:
-      - id: fetch
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LANG: ${{ inputs.language }}
-          TOP_N: ${{ inputs.top_n }}
+      - name: Write fetch_repos.py script
         run: |
-          python3 <<'EOF'
+          cat << 'PYTHON' > fetch_repos.py
           import os, requests, json, urllib.parse, time
           
           headers = {
@@ -65,7 +61,14 @@ jobs:
           
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
-          EOF
+          PYTHON
+
+      - name: Run fetch_repos.py
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LANG: ${{ inputs.language }}
+          TOP_N: ${{ inputs.top_n }}
+        run: python3 fetch_repos.py
 
   scan_repo:
     needs: fetch_repos
