@@ -84,13 +84,16 @@ jobs:
           cd project
           mvn -q -DskipTests package || gradle build -x test || true
 
-      - name: Snyk SCA (deep discovery, full dependency tree)
+      - name: Snyk SCA (deep discovery)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
           snyk test \
             --all-projects \
+            --file=requirements.txt \
+            --file=pyproject.toml \
+            --dev \
             --detection-depth=50 \
             --scan-unmanaged \
             --prune-repeated-subdependencies=false \
@@ -101,20 +104,24 @@ jobs:
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca_cleaned.json
 
-      - name: Semgrep (more extensive rules)
+      - name: Semgrep
         run: |
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep \
             --config p/security-audit \
             --config p/owasp-top-ten \
             --config p/$LANG_LOWER \
+            --config https://semgrep.dev/p/python/ci-cd-security \
             --timeout 600 \
             --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: Trivy SBOM (enhanced scans)
+      - name: Trivy SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs project --scanners vuln,config,secret --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL --format json --output results/sbom_vuln.json || true
+          trivy fs project --scanners vuln,config,secret,license \
+            --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format json --output results/sbom_vuln.json || true
           jq -r '
             [.Results[].Vulnerabilities[]?] |
             group_by(.Severity) |
@@ -122,13 +129,18 @@ jobs:
             add
           ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
-      - name: OWASP DepScan (full depth)
+      - name: OWASP DepScan
         run: |
-          java -jar dep-scan-cli.jar --scan project --format json --fail-on-high --exclude target,build,node_modules,__pycache__ --output results/dep-scan.json || true
+          java -jar dep-scan-cli.jar \
+            --scan project \
+            --format json \
+            --fail-on-high \
+            --exclude target,build,node_modules,__pycache__ \
+            --output results/dep-scan.json || true
 
       - name: Merge SBOM counts
         run: |
-          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
+          TL=$(( $(jq '.LOW // 0 + .UNKNOWN // 0' results/trivy_tmp.json) ))
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
           TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
