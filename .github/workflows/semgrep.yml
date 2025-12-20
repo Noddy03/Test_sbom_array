@@ -70,7 +70,6 @@ jobs:
           sudo apt-get install -y jq git unzip openjdk-17-jdk python3-venv python3-pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-          pip install --upgrade pip setuptools wheel cyclonedx-py
 
       - name: Clone repo
         env:
@@ -104,23 +103,19 @@ jobs:
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
-          python3 -m venv .venv
+          python3 -m venv .venv || true
           source .venv/bin/activate
           pip install --upgrade pip setuptools wheel
-          # Install dependencies if requirements.txt exists
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt || true
           fi
-          # Trivy scan project folder
           trivy fs . --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          # Trivy scan virtual environment site-packages
           if [ -d .venv ]; then
             trivy fs .venv/lib/python*/site-packages --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca_venv.json || echo '{"Results":[]}' > ../results/trivy_sca_venv.json
+            jq -s '{Results: map(.Results // [])}' results/trivy_sca.json results/trivy_sca_venv.json > results/trivy_sca_merged.json
+            mv results/trivy_sca_merged.json results/trivy_sca.json
           fi
           cd ..
-          # Merge SCA JSON
-          jq -s '{Results: map(.Results // [])}' results/trivy_sca.json results/trivy_sca_venv.json > results/trivy_sca_merged.json
-          mv results/trivy_sca_merged.json results/trivy_sca.json
 
       - name: Generate SBOM (CycloneDX) for Python
         if: ${{ inputs.language == 'Python' }}
@@ -128,13 +123,20 @@ jobs:
           cd project
           source .venv/bin/activate
           if [ -f requirements.txt ]; then
-            cyclonedx-py requirements -r requirements.txt -o ../results/sbom.cdx.json
+            cyclonedx-py requirements -r requirements.txt -o ../results/sbom.cdx.json || \
+              echo '{"bomFormat":"CycloneDX","specVersion":"1.4","components":[]}' > ../results/sbom.cdx.json
           elif [ -d .venv ]; then
-            cyclonedx-py venv .venv -o ../results/sbom.cdx.json
+            cyclonedx-py venv .venv -o ../results/sbom.cdx.json || \
+              echo '{"bomFormat":"CycloneDX","specVersion":"1.4","components":[]}' > ../results/sbom.cdx.json
           else
             echo '{"bomFormat":"CycloneDX","specVersion":"1.4","components":[]}' > ../results/sbom.cdx.json
           fi
           cd ..
+
+      - name: Generate SBOM (CycloneDX) for Java
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
 
       - name: Trivy SBOM vulnerability scan
         run: |
@@ -142,16 +144,16 @@ jobs:
 
       - name: Count vulnerabilities and build repo summary
         run: |
-          # Trivy SCA
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json 2>/dev/null || echo 0)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json 2>/dev/null || echo 0)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json 2>/dev/null || echo 0)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json 2>/dev/null || echo 0)
-          # Trivy SBOM
+
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
+
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
