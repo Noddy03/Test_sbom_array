@@ -38,9 +38,9 @@ jobs:
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
-              files_to_check = ["pom.xml"]
+              files_to_check = ["pom.xml","build.gradle","build.gradle.kts"]
           elif language == "python":
-              files_to_check = ["requirements.txt", "pyproject.toml"]
+              files_to_check = ["requirements.txt","pyproject.toml","Pipfile"]
           else:
               files_to_check = []
           repos = []
@@ -112,15 +112,25 @@ jobs:
           cd project
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
 
+          # Java detection
           if [[ "$LANG_LOWER" == "java" ]]; then
-            snyk test --all-projects --json --exclude=test,tests,target,build > ../results/sca_raw.json || true
-          elif [[ "$LANG_LOWER" == "python" ]]; then
-            if [ -f "requirements.txt" ]; then
-              snyk test --file=requirements.txt --json > ../results/sca_raw.json || true
-            elif [ -f "pyproject.toml" ]; then
-              snyk test --file=pyproject.toml --json > ../results/sca_raw.json || true
+            if [ -f "pom.xml" ] || [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+              snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || true
             else
               echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+            fi
+          fi
+
+          # Python detection
+          if [[ "$LANG_LOWER" == "python" ]]; then
+            if [ -f "requirements.txt" ]; then
+              snyk test --file=requirements.txt --scan-unmanaged --json > ../results/sca_raw.json || true
+            elif [ -f "pyproject.toml" ]; then
+              snyk test --file=pyproject.toml --scan-unmanaged --json > ../results/sca_raw.json || true
+            elif [ -f "Pipfile" ]; then
+              snyk test --file=Pipfile --scan-unmanaged --json > ../results/sca_raw.json || true
+            else
+              snyk test --all-projects --scan-unmanaged --json > ../results/sca_raw.json || true
             fi
           fi
 
@@ -165,7 +175,6 @@ jobs:
           if curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar; then
             echo "Downloaded dep-scan-cli.jar successfully"
           else
-            echo "Failed to download dep-scan-cli.jar, skipping DepScan"
             echo '{}' > results/dep-scan_filtered.json
             exit 0
           fi
