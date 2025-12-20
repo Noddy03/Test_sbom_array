@@ -89,20 +89,17 @@ jobs:
         run: |
           cd project
           # Skip Docker builds to prevent CI failures
-          mvn clean package -DskipTests -Pskip-docker dependency:copy-dependencies || true
+          mvn clean package -DskipTests -Pskip-docker || true
 
           mkdir -p results
 
-          # Trivy SCA
-          trivy fs target/dependency \
-            --scanners vuln,license \
-            --pkg-types library \
+          # Trivy Maven scan
+          trivy maven --scanners vuln,license \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
           # Trivy SBOM
-          trivy fs target/dependency --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
+          trivy maven --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
 
           # DepScan
           docker run --rm \
