@@ -143,7 +143,6 @@ jobs:
           else
             echo '[]' > ../results/pip_audit.json
             echo '[]' > ../results/safety.json
-          fi
 
 ################################################################################
 # SEMGREP
@@ -159,6 +158,7 @@ jobs:
 ################################################################################
       - name: Build repo summary
         run: |
+          # sanitize repo name for artifact
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
 
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
@@ -177,7 +177,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-summary-${{ matrix.repo }}
+          name: repo-summary-${SAFE}
           path: repo_summary.csv
 
 ################################################################################
