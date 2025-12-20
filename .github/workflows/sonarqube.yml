@@ -236,21 +236,62 @@ jobs:
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
-            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
-            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
-            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json)
-            IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
-            STATUS=$(cat $d/sbom_status.txt)
+
+            # ----- SCA counts (Snyk) -----
+            SC_FILE="$d/sca_cleaned.json"
+            if [ -f "$SC_FILE" ]; then
+              SL=$(jq '[.. | objects | .vulnerabilities? // [] | .[] | select(.severity=="low")] | length' "$SC_FILE")
+              SM=$(jq '[.. | objects | .vulnerabilities? // [] | .[] | select(.severity=="medium")] | length' "$SC_FILE")
+              SH=$(jq '[.. | objects | .vulnerabilities? // [] | .[] | select(.severity=="high")] | length' "$SC_FILE")
+              SC=$(jq '[.. | objects | .vulnerabilities? // [] | .[] | select(.severity=="critical")] | length' "$SC_FILE")
+            else
+              SL=0
+              SM=0
+              SH=0
+              SC=0
+            fi
+
+            # ----- Semgrep counts -----
+            SEM_FILE="$d/semgrep.json"
+            if [ -f "$SEM_FILE" ]; then
+              SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$SEM_FILE")
+              SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$SEM_FILE")
+              SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$SEM_FILE")
+              SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$SEM_FILE")
+            else
+              SEM_L=0
+              SEM_M=0
+              SEM_H=0
+              SEM_C=0
+            fi
+
+            # ----- SBOM counts (Trivy + DepScan) -----
+            SB_FILE="$d/sbom_counts.txt"
+            if [ -f "$SB_FILE" ]; then
+              IFS=',' read SB_L SB_M SB_H SB_C < "$SB_FILE"
+            else
+              SB_L=0
+              SB_M=0
+              SB_H=0
+              SB_C=0
+            fi
+            STATUS_FILE="$d/sbom_status.txt"
+            if [ -f "$STATUS_FILE" ]; then
+              STATUS=$(cat "$STATUS_FILE")
+            else
+              STATUS="missing"
+            fi
+
+            # ----- Total vulnerabilities -----
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+
+            # ----- Append to CSV -----
             echo "$R,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
