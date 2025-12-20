@@ -86,6 +86,12 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+      - name: Set up Python 3.14 (for Poetry projects)
+        if: ${{ inputs.language == 'Python' }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.14
+
       - name: Build / Install dependencies
         run: |
           cd project
@@ -100,7 +106,6 @@ jobs:
               python3 -m venv venv
               source venv/bin/activate
               poetry install
-          fi
 
       - name: Snyk SCA
         env:
