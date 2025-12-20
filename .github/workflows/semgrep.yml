@@ -28,29 +28,18 @@ jobs:
         run: |
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
-          headers = {
-              "Authorization": f"token {os.environ['TOKEN']}",
-              "Accept": "application/vnd.github+json"
-          }
-          repos = []
-          page = 1
+          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
+          repos, page = [], 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = (
-                  "https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
-              )
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
-              if r.status_code != 200:
-                  break
+              if r.status_code != 200: break
               for repo in r.json().get("items", []):
                   repos.append(repo["full_name"])
-                  if len(repos) >= int(os.environ["TOP_N"]):
-                      break
+                  if len(repos) >= int(os.environ["TOP_N"]): break
               page += 1
               time.sleep(1)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f: f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
   scan_repo:
@@ -81,70 +70,54 @@ jobs:
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
+      - name: Prepare results folder
+        run: mkdir -p project/results
+
 ################################################################################
 # JAVA MAVEN SCAN
 ################################################################################
-      - name: Scan Java Maven Project
+      - name: Java Maven Trivy Scan
         if: contains(inputs.language, 'Java')
         run: |
           cd project
-          # Skip Docker builds to prevent CI failures
-          mvn clean package -DskipTests -Pskip-docker || true
-
-          mkdir -p results
-
-          # Trivy Maven scan
+          # Resolve dependencies for Trivy
+          mvn dependency:resolve -DskipTests || true
+          # SCA scan
           trivy maven --scanners vuln,license \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-
-          # Trivy SBOM
-          trivy maven --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
-
-          # DepScan
-          docker run --rm \
-            -v "${{ github.workspace }}/project/results":/results \
-            owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json \
             --format json \
-            --output /results/depscan.json || echo '{}' > results/depscan.json
+            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+          # SBOM generation
+          trivy maven --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
+          # DepScan
+          docker run --rm -v "${{ github.workspace }}/project/results":/results owasp/dep-scan:latest scan \
+            --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{}' > results/depscan.json
 
 ################################################################################
 # PYTHON SCAN
 ################################################################################
-      - name: Scan Python Project
+      - name: Python Trivy Scan
         if: contains(inputs.language, 'Python')
         run: |
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install .; fi
-
-          mkdir -p results
-
-          # Trivy SCA
-          trivy fs .venv \
-            --scanners vuln,license \
-            --pkg-types library \
+          [ -f requirements.txt ] && pip install -r requirements.txt
+          [ -f pyproject.toml ] && pip install .
+          # SCA scan
+          trivy fs .venv project --scanners vuln,license \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
-
-          # Trivy SBOM
-          trivy fs .venv --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
-
+          # SBOM generation
+          trivy fs .venv project --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
           # DepScan
-          docker run --rm \
-            -v "${{ github.workspace }}/project/results":/results \
-            owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json \
-            --format json \
-            --output /results/depscan.json || echo '{}' > results/depscan.json
+          docker run --rm -v "${{ github.workspace }}/project/results":/results owasp/dep-scan:latest scan \
+            --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{}' > results/depscan.json
 
 ################################################################################
-# BUILD SUMMARY
+# BUILD REPO SUMMARY
 ################################################################################
       - name: Build repo summary row
         run: |
@@ -152,14 +125,11 @@ jobs:
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' project/results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' project/results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' project/results/trivy_sca.json)
-
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' project/results/sbom.cdx.json 2>/dev/null || echo 0)
-
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
