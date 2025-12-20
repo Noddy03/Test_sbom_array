@@ -1,4 +1,4 @@
-name: Security Scan – SCA + Semgrep + SBOM
+name: Security Scan – Full SCA + Semgrep + SBOM
 
 on:
   workflow_dispatch:
@@ -80,18 +80,48 @@ jobs:
           mvn -q -DskipTests package || true
 
 ################################################################################
-# SCA – Snyk cleaned
+# SCA – SNYK
 ################################################################################
       - name: SCA – Snyk
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          snyk test --all-projects --detection-depth=15 --scan-unmanaged --json > results/sca_raw.json || true
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          snyk test --all-projects --detection-depth=15 --scan-unmanaged --json > results/sca_snyk.json || echo '{"vulnerabilities":[]}' > results/sca_snyk.json
+
+################################################################################
+# SCA – Python (Safety + pip-audit)
+################################################################################
+      - name: SCA – Python extra
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          cd project
+          REQ=requirements.txt
+          [ -f pyproject.toml ] && poetry export -f requirements.txt --without-hashes -o req.txt && REQ=req.txt || true
+          safety check --file=$REQ --json > ../results/safety.json || echo '{"vulnerabilities":[]}' > ../results/safety.json
+          pip-audit -f json > ../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit.json
+          cd ..
+
+################################################################################
+# MERGE ALL SCA
+################################################################################
+      - name: Merge SCA results
+        run: |
+          jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_snyk.json > results/sca_tmp.json
+          if [ -f results/safety.json ]; then
+            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/safety.json > results/safety_tmp.json
+            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/pip_audit.json > results/pip_tmp.json
+            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_tmp.json results/safety_tmp.json results/pip_tmp.json > results/sca_merged.json
+          else
+            mv results/sca_tmp.json results/sca_merged.json
+          fi
+
+################################################################################
+# CLEAN SCA (ALL SEVERITIES, KEEP ALL)
+################################################################################
       - name: SCA – Cleaned
         run: |
-          jq '.vulnerabilities |= map(select((.isIgnored|not) and (.isPatched|not) and (.packageName!=null) and (.packageName!="") and ((.severity|ascii_downcase)=="low" or (.severity|ascii_downcase)=="medium" or (.severity|ascii_downcase)=="high" or (.severity|ascii_downcase)=="critical")))' results/sca.json > results/sca_cleaned.json
+          jq '.vulnerabilities |= map(select((.isIgnored|not) and (.isPatched|not) and (.packageName!=null) and (.packageName!="") and ((.severity|ascii_downcase)=="low" or (.severity|ascii_downcase)=="medium" or (.severity|ascii_downcase)=="high" or (.severity|ascii_downcase)=="critical")))' results/sca_merged.json > results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -101,7 +131,7 @@ jobs:
           semgrep --config p/security-audit --config p/owasp-top-ten --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# TRIVY SBOM
+# SBOM – Trivy
 ################################################################################
       - name: Trivy SBOM
         run: |
@@ -161,10 +191,10 @@ jobs:
           for d in all_results/*; do
             R=$(basename "$d")
 
-            SL=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="low")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SM=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="medium")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SH=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="high")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-            SC=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="critical")]|length' $d/sca_cleaned.json 2>/dev/null || echo 0)
+            SL=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="low")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
+            SM=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="medium")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
+            SH=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="high")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
+            SC=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="critical")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
 
             IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
 
