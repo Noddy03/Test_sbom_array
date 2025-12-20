@@ -1,4 +1,4 @@
-name: Security Scan – Java & Python SCA + SBOM + Semgrep
+name: Security Scan – Trivy SCA + SBOM (Java & Python)
 
 on:
   workflow_dispatch:
@@ -8,13 +8,16 @@ on:
         required: true
         default: "Java"
       top_n:
-        description: "Number of top repos to scan"
+        description: "Top N repos"
         required: false
         default: "5"
 
 permissions:
   contents: read
 
+################################################################################
+# FETCH REPOS
+################################################################################
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
@@ -41,13 +44,17 @@ jobs:
           headers = {"Authorization": f"token {os.environ['TOKEN']}"}
           repos = []
           page = 1
+
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = ("https://api.github.com/search/repositories"
-                     f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                     "&sort=stars&order=desc&per_page=30&page=" + str(page))
+              url = (
+                  "https://api.github.com/search/repositories"
+                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
+              )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
+
               for repo in r.json().get("items", []):
                   for f in files:
                       check = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
@@ -56,6 +63,7 @@ jobs:
                           break
                   if len(repos) >= int(os.environ["TOP_N"]):
                       break
+
               page += 1
               time.sleep(1)
 
@@ -63,6 +71,9 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
+################################################################################
+# SCAN REPOS
+################################################################################
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -81,85 +92,74 @@ jobs:
           pip3 install pip-audit safety
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-          curl -sSfL https://semgrep.dev/install.sh | sh
+          curl -sSfL https://semgrep.dev/install.sh | bash
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: |
+          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Trivy FS Scan
+################################################################################
+# TRIVY FS (SCA)
+################################################################################
+      - name: Trivy FS scan
         run: |
           mkdir -p results
-          trivy fs project --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json \
+          trivy fs project \
+            --scanners vuln \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
-      - name: Generate SBOM
-        run: trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
-
-      - name: Java SBOM + DepScan
-        if: inputs.language == 'Java'
+################################################################################
+# SBOM GENERATION + SCAN (TRIVY)
+################################################################################
+      - name: Trivy SBOM + SBOM scan
         run: |
-          cd project
-          mvn -B dependency:tree -DoutputFile=deps.txt -DoutputType=text || true
-          cd ..
-          docker run --rm -v "$PWD/results":/results owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"vulnerabilities":[]}' > results/depscan.json
-          trivy sbom results/sbom.cdx.json --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          trivy sbom results/sbom.cdx.json \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --format json \
+            --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
-      - name: Python SBOM + Trivy Python Scan
-        if: inputs.language == 'Python'
+################################################################################
+# SEMGREP
+################################################################################
+      - name: Semgrep
         run: |
-          cd project
-          python3 -m venv .venv
-          source .venv/bin/activate
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install build[deps]; fi
-          pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
-          if [ -f requirements.txt ]; then
-            safety check -r requirements.txt --json --full-report > ../results/safety.json || echo '[]' > ../results/safety.json
-          else
-            echo '[]' > ../results/safety.json
-          fi
-          trivy fs project --scanners vuln --vuln-type python --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_python.json || echo '{"Results":[]}' > ../results/trivy_python.json
+          semgrep --config p/ci --json project \
+            > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-      - name: Semgrep scan
-        run: semgrep --config p/ci --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-
+################################################################################
+# BUILD PER-REPO SUMMARY
+################################################################################
       - name: Build repo summary
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
+
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_fs.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_fs.json)
 
-          SEM_L=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="INFO"] | length' results/semgrep.json)
-          SEM_M=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="WARNING"] | length' results/semgrep.json)
-          SEM_H=$(jq '[.results[]? | select(.extra.severity//""|ascii_upcase)=="ERROR"] | length' results/semgrep.json)
-          SEM_C=$SEM_H
+          SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/sbom_vuln.json)
+          SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/sbom_vuln.json)
+          SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/sbom_vuln.json)
+          SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_vuln.json)
 
-          if [ "${{ inputs.language }}" = "Java" ]; then
-            SB_L=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json)
-            SB_M=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan.json)
-            SB_H=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json)
-            SB_C=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json)
-          else
-            jq -s 'flatten | unique_by(.id)' results/pip_audit.json results/safety.json results/trivy_python.json > results/python_sbom_combined.json
-            SB_L=$(jq '[.[] | select(.severity=="LOW")] | length' results/python_sbom_combined.json)
-            SB_M=$(jq '[.[] | select(.severity=="MEDIUM")] | length' results/python_sbom_combined.json)
-            SB_H=$(jq '[.[] | select(.severity=="HIGH")] | length' results/python_sbom_combined.json)
-            SB_C=$(jq '[.[] | select(.severity=="CRITICAL")] | length' results/python_sbom_combined.json)
-          fi
+          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
 
-          TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C+SEM_L+SEM_M+SEM_H+SEM_C))
-          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
+          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-${{ matrix.repo }}
+          name: repo-summary-${{ matrix.repo }}
           path: repo_summary.csv
 
+################################################################################
+# FINAL SUMMARY
+################################################################################
   summary:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -170,7 +170,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           find rows -name "*.csv" -exec cat {} \; >> summary.csv
 
       - uses: actions/upload-artifact@v4
