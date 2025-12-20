@@ -1,9 +1,10 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan
+name: Security Scan – Trivy SCA + SBOM (Java & Python)
 
 on:
   workflow_dispatch:
     inputs:
       language:
+        description: "Java or Python"
         required: true
         default: "Java"
       top_n:
@@ -12,10 +13,9 @@ on:
 
 permissions:
   contents: read
-  security-events: write
 
 ################################################################################
-# FETCH TOP REPOS
+# FETCH REPOS
 ################################################################################
 jobs:
   fetch_repos:
@@ -32,73 +32,68 @@ jobs:
           python3 <<'EOF'
           import os, requests, json, urllib.parse, time
 
-          language = os.environ["LANG"].lower()
+          lang = os.environ["LANG"].lower()
           headers = {
               "Authorization": f"token {os.environ['TOKEN']}",
               "Accept": "application/vnd.github+json"
           }
 
-          # Select dependency files based on language
-          if language == "java":
-              files_to_check = ["pom.xml"]
-          elif language == "python":
-              files_to_check = ["requirements.txt", "pyproject.toml"]
+          if lang == "java":
+              files = ["pom.xml"]
+          elif lang == "python":
+              files = ["requirements.txt", "pyproject.toml"]
           else:
-              files_to_check = []
+              files = []
 
           repos = []
           page = 1
+
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
               url = (
-                  "https://api.github.com/search/repositories"
-                  f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
-                  "&sort=stars&order=desc&per_page=30&page=" + str(page)
+                "https://api.github.com/search/repositories"
+                f"?q=language:{urllib.parse.quote(os.environ['LANG'])}"
+                "&sort=stars&order=desc&per_page=30&page=" + str(page)
               )
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
 
               for repo in r.json().get("items", []):
-                  # Include repo only if it has at least one dependency file
-                  include = False
-                  for file_name in files_to_check:
-                      file_url = f"https://api.github.com/repos/{repo['full_name']}/contents/{file_name}"
-                      if requests.get(file_url, headers=headers).status_code == 200:
-                          include = True
+                  for f in files:
+                      check = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
+                      if requests.get(check, headers=headers).status_code == 200:
+                          repos.append(repo["full_name"])
                           break
-                  if include:
-                      repos.append(repo["full_name"])
-                      if len(repos) >= int(os.environ["TOP_N"]):
-                          break
+                  if len(repos) >= int(os.environ["TOP_N"]):
+                      break
+
               page += 1
               time.sleep(1)
 
-          # Always output a JSON array
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
 ################################################################################
-# SCAN EACH REPO (MATRIX)
+# SCAN REPOS
 ################################################################################
   scan_repo:
     needs: fetch_repos
-    if: ${{ needs.fetch_repos.outputs.repos != '[]' && needs.fetch_repos.outputs.repos != '' }}
+    if: needs.fetch_repos.outputs.repos != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-    continue-on-error: true
 
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
+          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk
+          pip3 install pip-audit
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-          pip3 install --upgrade pip
 
       - name: Clone repo
         env:
@@ -106,63 +101,47 @@ jobs:
         run: |
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Sanitize repo name
-        id: sanitize
-        run: |
-          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
-
 ################################################################################
-# RESOLVE DEPENDENCIES
+# TRIVY SCA (ALL LANGUAGES)
 ################################################################################
-      - name: Resolve dependencies
-        run: |
-          cd project
-          if [ "${{ inputs.language }}" == "Java" ]; then
-            mvn -q -DskipTests dependency:resolve || true
-          elif [ "${{ inputs.language }}" == "Python" ]; then
-            pip3 install --upgrade pip
-            if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
-          fi
-
-################################################################################
-# TRIVY SCA
-################################################################################
-      - name: Trivy Dependency SCA
+      - name: Trivy SCA
         run: |
           mkdir -p results
           trivy fs project \
             --scanners vuln \
-            --pkg-types library \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
 ################################################################################
-# TRIVY SBOM
+# SBOM GENERATION (ALL)
 ################################################################################
       - name: Generate SBOM
         run: |
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+
+################################################################################
+# JAVA: TRIVY SBOM VULNS
+################################################################################
+      - name: Java SBOM scan
+        if: inputs.language == 'Java'
+        run: |
           trivy sbom results/sbom.cdx.json \
             --severity LOW,MEDIUM,HIGH,CRITICAL \
             --format json \
-            --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+            --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
 ################################################################################
-# DEP-SCAN
+# PYTHON: pip-audit SBOM VULNS
 ################################################################################
-      - name: OWASP DepScan
+      - name: Python SBOM scan
+        if: inputs.language == 'Python'
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}/results":/results \
-            owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json \
-            --format json \
-            --output /results/depscan.json || true
+          cd project
+          pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
 
 ################################################################################
-# BUILD PER-REPO SUMMARY
+# BUILD SUMMARY ROW
 ################################################################################
       - name: Build repo summary
         run: |
@@ -171,26 +150,32 @@ jobs:
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
 
-          SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
-          SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
-          SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
-          SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
+          if [ "${{ inputs.language }}" = "Java" ]; then
+            SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/sbom_vuln.json)
+            SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/sbom_vuln.json)
+            SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/sbom_vuln.json)
+            SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom_vuln.json)
+          else
+            SB_L=$(jq '[.[] | select(.severity=="LOW")] | length' results/pip_audit.json)
+            SB_M=$(jq '[.[] | select(.severity=="MEDIUM")] | length' results/pip_audit.json)
+            SB_H=$(jq '[.[] | select(.severity=="HIGH")] | length' results/pip_audit.json)
+            SB_C=$(jq '[.[] | select(.severity=="CRITICAL")] | length' results/pip_audit.json)
+          fi
 
+          SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
 
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
-          echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
+          echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > "$SAFE.csv"
 
-      - name: Upload repo summary
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: repo-summary-${{ steps.sanitize.outputs.safe }}
-          path: repo_summary.csv
+          name: repo-${{ matrix.repo }}
+          path: "*.csv"
 
 ################################################################################
 # FINAL SUMMARY
 ################################################################################
-  build_summary:
+  summary:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
@@ -198,10 +183,10 @@ jobs:
         with:
           path: rows
 
-      - name: Build final summary.csv
+      - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
-          find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
+          find rows -name "*.csv" -exec cat {} \; >> summary.csv
 
       - uses: actions/upload-artifact@v4
         with:
