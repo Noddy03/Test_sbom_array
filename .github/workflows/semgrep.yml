@@ -75,7 +75,7 @@ jobs:
         run: mkdir -p project/results
 
 ################################################################################
-# JAVA MAVEN SCAN (improved)
+# JAVA MAVEN SCAN (enhanced)
 ################################################################################
       - name: Java Maven Trivy Scan
         if: contains(inputs.language, 'Java')
@@ -84,8 +84,13 @@ jobs:
           if [ -f pom.xml ]; then
             # Download all dependencies including transitive
             mvn clean install -DskipTests -DskipITs || true
-            # Scan the project directory
+            # Scan project directory
             trivy fs . --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+            # Scan local Maven repository (~/.m2/repository)
+            trivy fs ~/.m2/repository --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca_m2.json || echo '{"Results":[]}' > results/trivy_sca_m2.json
+            # Merge results
+            jq -s '{Results: map(.Results[])}' results/trivy_sca.json results/trivy_sca_m2.json > results/trivy_sca_merged.json
+            mv results/trivy_sca_merged.json results/trivy_sca.json
             # Generate SBOM
             trivy fs . --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
           else
@@ -94,7 +99,7 @@ jobs:
           fi
 
 ################################################################################
-# PYTHON SCAN
+# PYTHON SCAN (enhanced)
 ################################################################################
       - name: Python Trivy Scan
         if: contains(inputs.language, 'Python')
@@ -105,7 +110,14 @@ jobs:
           pip install --upgrade pip setuptools wheel
           [ -f requirements.txt ] && pip install -r requirements.txt
           [ -f pyproject.toml ] && pip install .
+          # Scan project directory
           trivy fs . --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+          # Scan site-packages
+          trivy fs .venv/lib/python*/site-packages --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sca_venv.json || echo '{"Results":[]}' > results/trivy_sca_venv.json
+          # Merge results
+          jq -s '{Results: map(.Results[])}' results/trivy_sca.json results/trivy_sca_venv.json > results/trivy_sca_merged.json
+          mv results/trivy_sca_merged.json results/trivy_sca.json
+          # Generate SBOM
           trivy fs . --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
 
 ################################################################################
