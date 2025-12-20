@@ -1,4 +1,4 @@
-name: Top Repos Security Scan (Trivy + Grype)
+name: Top Repos Security Scan (Trivy + DepScan)
 
 on:
   workflow_dispatch:
@@ -58,11 +58,11 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip curl maven gradle python3-venv python3-pip
+          sudo apt-get install -y jq git unzip curl maven gradle default-jdk python3-venv python3-pip docker
           # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install Grype
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          # Pull OWASP Dependency-Check Docker image
+          docker pull ghcr.io/owasp/dependency-check:latest || true
 
       - name: Clone repository
         env:
@@ -73,7 +73,7 @@ jobs:
         run: |
           cd project
           mvn -q -DskipTests package || gradle build -x test || true
-          # Create Python venv if requirements exist
+          # Python environment
           if [ -f requirements.txt ]; then
             python3 -m venv .venv
             source .venv/bin/activate
@@ -95,27 +95,23 @@ jobs:
             --output results/trivy_fs.json || true
 
       ###########################################################################
-      # SBOM Scan (Grype)
+      # DEPENDENCY-CHECK (SBOM) SCAN
       ###########################################################################
-      - name: SBOM Scan (Grype)
+      - name: Dependency-Check Scan (SBOM)
         run: |
           mkdir -p results
           echo "0 0 0 0" > results/sbom_counts.txt
           echo "no_sbom" > results/sbom_status.txt
-          grype db update || true
-          L=0; M=0; H=0; C=0; STATUS="no_sbom"
-          for sb in $(find project -type f \( -iname "*sbom*.json" -o -iname "*cyclonedx*.json" -o -iname "*.spdx.json" \)); do
-            TMP=$(mktemp)
-            grype sbom:"$sb" -o json > "$TMP" || continue
-            L=$((L+$(jq '[.matches[]? | select(.vulnerability.severity=="Low")] | length' "$TMP")))
-            M=$((M+$(jq '[.matches[]? | select(.vulnerability.severity=="Medium")] | length' "$TMP")))
-            H=$((H+$(jq '[.matches[]? | select(.vulnerability.severity=="High")] | length' "$TMP")))
-            C=$((C+$(jq '[.matches[]? | select(.vulnerability.severity=="Critical")] | length' "$TMP")))
-            rm -f "$TMP"
-            STATUS="valid_with_vuln"
-          done
-          echo "$L $M $H $C" > results/sbom_counts.txt
-          echo "$STATUS" > results/sbom_status.txt
+          docker run --rm -v "$PWD/project:/src" -v "$PWD/results:/results" ghcr.io/owasp/dependency-check:latest \
+            --scan /src --format JSON --out /results/depscan.json || true
+          if [ -f results/depscan.json ]; then
+            L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json)
+            M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/depscan.json)
+            H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json)
+            C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json)
+            echo "$L $M $H $C" > results/sbom_counts.txt
+            echo "valid_with_vuln" > results/sbom_status.txt
+          fi
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -124,7 +120,7 @@ jobs:
         run: |
           SAFE_NAME=$(echo '${{ matrix.repo }}' | tr '/' '-')
           export SAFE_NAME
-          zip -r "${SAFE_NAME}.zip" results
+          zip -r "${SAFE_NAME}.zip" results || true
 
       - uses: actions/upload-artifact@v4
         with:
