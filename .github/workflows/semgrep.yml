@@ -67,7 +67,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-venv python3-pip docker.io
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-venv python3-pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
 
       - name: Clone repo
@@ -100,21 +100,16 @@ jobs:
         run: |
           cd project
           if [ "${{ inputs.language }}" = "Java" ]; then
-            if [ -d ~/.m2/repository ]; then
-              trivy fs ~/.m2/repository \
-                --format json \
-                --severity LOW,MEDIUM,HIGH,CRITICAL \
-                --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            else
-              echo '{"Results":[]}' > ../results/trivy_sca.json
-            fi
+            trivy fs ~/.m2/repository \
+              --format json \
+              --severity LOW,MEDIUM,HIGH,CRITICAL \
+              --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           else
             . .venv/bin/activate
             trivy fs .venv \
               --format json \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
               --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          fi
 
       - name: Generate SBOM
         run: |
@@ -130,12 +125,8 @@ jobs:
 
       - name: OWASP DepScan
         run: |
-          if docker pull owasp/dep-scan:latest; then
-            docker run --rm -v "${{ github.workspace }}/results":/results owasp/dep-scan:latest scan \
-              --input /results/sbom.cdx.json --format json --output /results/depscan.json || true
-          else
-            echo '{"Results":[]}' > results/depscan.json
-          fi
+          docker run --rm -v "${{ github.workspace }}/results":/results owasp/dep-scan:latest scan \
+            --input /results/sbom.cdx.json --format json --output /results/depscan.json || true
 
       - name: Build repo summary row
         run: |
