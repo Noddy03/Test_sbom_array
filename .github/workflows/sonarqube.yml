@@ -35,8 +35,11 @@ jobs:
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
               url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(lang)}&sort=stars&per_page=30&page={page}"
-              r = requests.get(url, headers=headers).json()
-              for repo in r.get("items", []):
+              r = requests.get(url, headers=headers)
+              if r.status_code != 200:
+                  break
+              data = r.json()
+              for repo in data.get("items", []):
                   for f in files:
                       chk = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
                       if requests.get(chk, headers=headers).status_code == 200:
@@ -77,44 +80,44 @@ jobs:
         run: mkdir -p results
 
 ################################################################################
-# Java build if files exist
+# Java – recursive SCA
 ################################################################################
-      - name: Build Java (best effort)
+      - name: SCA – Java (Snyk)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           cd project
-          if [ -f "pom.xml" ]; then
-            mvn -q -DskipTests package || true
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
-            gradle build -x test || true
+          mkdir -p ../../results
+          JAVA_FILES=$(find . -name "pom.xml" -o -name "build.gradle" -o -name "build.gradle.kts")
+          if [ -n "$JAVA_FILES" ]; then
+            for f in $JAVA_FILES; do
+              snyk test --file="$f" --json --all-projects --detection-depth=20 --scan-unmanaged --severity-threshold=low >> ../../results/sca_snyk.json || echo '{}' >> ../../results/sca_snyk.json
+            done
           else
-            echo "No Java build file found, skipping build."
+            echo '{"vulnerabilities":[]}' > ../../results/sca_snyk.json
           fi
           cd ..
 
 ################################################################################
-# SCA – Snyk
+# Python – recursive SCA
 ################################################################################
-      - name: SCA – Snyk
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
-        run: snyk test --all-projects --detection-depth=20 --scan-unmanaged --prune-repeated-subdependencies=false --json > results/sca_snyk.json || echo '{"vulnerabilities":[]}' > results/sca_snyk.json
-
-################################################################################
-# SCA – Python
-################################################################################
-      - name: SCA – Python
+      - name: SCA – Python (Snyk + pip-audit + Safety)
         run: |
           cd project
           mkdir -p ../../results
-          if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+          PY_FILES=$(find . -name "requirements.txt" -o -name "pyproject.toml" -o -name "setup.py")
+          if [ -n "$PY_FILES" ]; then
             python3 -m venv venv
             source venv/bin/activate
-            if [ -f "requirements.txt" ]; then pip install -r requirements.txt || true; fi
-            pip-audit -f json > ../../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../../results/pip_audit.json
-            safety check --file=requirements.txt --json > ../../results/safety.json || echo '{"vulnerabilities":[]}' > ../../results/safety.json
+            for f in $PY_FILES; do
+              if [[ $f == *"requirements.txt"* ]]; then pip install -r "$f" || true; fi
+              snyk test --file="$f" --json --all-projects --scan-unmanaged --severity-threshold=low >> ../../results/sca_snyk.json || true
+              pip-audit -f json > ../../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../../results/pip_audit.json
+              safety check --file="$f" --json > ../../results/safety.json || echo '{"vulnerabilities":[]}' > ../../results/safety.json
+            done
             deactivate
           else
-            echo "No Python dependency file found, skipping Python SCA."
+            echo '{"vulnerabilities":[]}' > ../../results/sca_snyk.json
             echo '{"vulnerabilities":[]}' > ../../results/pip_audit.json
             echo '{"vulnerabilities":[]}' > ../../results/safety.json
           fi
@@ -125,12 +128,7 @@ jobs:
 ################################################################################
       - name: Merge all SCA
         run: |
-          jq 'if type=="array" then map(.vulnerabilities // []) | add | {vulnerabilities: .} else . end' results/sca_snyk.json > results/sca_norm.json
-          if [ -f results/pip_audit.json ]; then
-            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_norm.json results/safety.json results/pip_audit.json > results/sca_cleaned.json
-          else
-            mv results/sca_norm.json results/sca_cleaned.json
-          fi
+          jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_snyk.json results/pip_audit.json results/safety.json > results/sca_cleaned.json
 
 ################################################################################
 # Semgrep
