@@ -72,7 +72,7 @@ jobs:
         run: python3 fetch_repos.py
 
       - name: Debug fetched repos
-        run: echo "Fetched repos: ${{ needs.fetch_repos.outputs.repos }}"
+        run: echo "Fetched repos:${{ needs.fetch_repos.outputs.repos }}"
 
   scan_repo:
     needs: fetch_repos
