@@ -159,9 +159,9 @@ jobs:
 ################################################################################
       - name: Build repo summary
         run: |
-          # sanitize repo name and add timestamp suffix for uniqueness
+          # sanitize repo name and create unique artifact name
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          SUFFIX=$(date +%s)
+          ARTIFACT_NAME="repo-summary-${SAFE}-${{ github.run_id }}-${{ matrix.repo_index }}"
 
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
@@ -179,7 +179,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: repo-summary-${SAFE}-${SUFFIX}
+          name: $ARTIFACT_NAME
           path: repo_summary.csv
 
 ################################################################################
