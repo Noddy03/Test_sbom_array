@@ -69,7 +69,7 @@ jobs:
       - name: Show fetched repos
         run: |
           echo "=== Repositories fetched ==="
-          echo "${{ steps.fetch.outputs.repos }}"
+          echo '${{ steps.fetch.outputs.repos }}' | jq -r '.[]'
 
 ################################################################################
 # SCAN REPOS
@@ -82,6 +82,11 @@ jobs:
       TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
     steps:
+      - name: Print repos before scanning
+        run: |
+          echo "=== Repositories to scan ==="
+          echo "$REPOS" | jq -r '.[]'
+
       - name: Install tools
         run: |
           sudo apt-get update
@@ -96,7 +101,7 @@ jobs:
           echo "$REPOS" | jq -r '.[]' | while read repo; do
             SAFE=$(echo "$repo" | tr '/' '-')
             DIR="all_results/repo-results-$SAFE"
-            mkdir -p "$DIR"
+            mkdir -p "$DIR"   # ✅ create directory first
 
             echo "🔍 Scanning $repo"
 
@@ -116,31 +121,22 @@ jobs:
               pip install -r requirements.txt 2>/dev/null || true
             fi
 
-            # Snyk SCA (deep)
-            mkdir -p "../$DIR"
+            # Snyk SCA
             snyk test --all-projects --detection-depth=20 --scan-unmanaged --json > "../$DIR/sca_raw.json" || echo '{"vulnerabilities":[]}' > "../$DIR/sca_raw.json"
-
-            # Clean SCA JSON
-            jq '
-              if type=="array" then
-                map(.vulnerabilities // []) | add
-              else
-                .vulnerabilities // []
-              end
-              | { vulnerabilities: . }
-            ' "../$DIR/sca_raw.json" > "../$DIR/sca_cleaned.json"
+            # Clean JSON
+            jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' "../$DIR/sca_raw.json" > "../$DIR/sca_cleaned.json"
 
             # Semgrep
             semgrep --config p/security-audit --config p/owasp-top-ten --json > "../$DIR/semgrep.json" || echo '{"results":[]}' > "../$DIR/semgrep.json"
 
-            # OWASP DepScan (Java only)
+            # DepScan for Java
             if $IS_MAVEN; then
               java -jar ../dep-scan-cli.jar --scan . --format json --output "../$DIR/dep-scan.json" || echo '{"vulnerabilities":[]}' > "../$DIR/dep-scan.json"
             else
               echo '{"vulnerabilities":[]}' > "../$DIR/dep-scan.json"
             fi
 
-            # SBOM counts (Trivy only for counting dependencies)
+            # SBOM placeholders
             echo "0,0,0,0" > "../$DIR/sbom_counts.txt"
             echo "generated" > "../$DIR/sbom_status.txt"
 
@@ -169,6 +165,11 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
+            [ -f "$d/sca_cleaned.json" ] || echo '{"vulnerabilities":[]}' > "$d/sca_cleaned.json"
+            [ -f "$d/semgrep.json" ] || echo '{"results":[]}' > "$d/semgrep.json"
+            [ -f "$d/sbom_counts.txt" ] || echo "0,0,0,0" > "$d/sbom_counts.txt"
+            [ -f "$d/sbom_status.txt" ] || echo "generated" > "$d/sbom_status.txt"
+
             SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
             SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
             SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
