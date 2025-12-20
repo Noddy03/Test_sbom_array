@@ -1,4 +1,4 @@
-name: Security Scan – Full SCA + SBOM (Java & Python)
+name: Security Scan – Java & Python SCA + SBOM
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ on:
         required: true
         default: "Java"
       top_n:
+        description: "Number of top repos to scan"
         required: false
         default: "5"
 
@@ -76,7 +77,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven
+          sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven docker.io
           pip3 install pip-audit safety
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
@@ -86,16 +87,15 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Trivy FS SCA
+      - name: Trivy FS Scan
         run: |
           mkdir -p results
           trivy fs project --scanners vuln --severity LOW,MEDIUM,HIGH,CRITICAL --format json \
-            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+            --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       - name: Generate SBOM
         run: trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
 
-      # Java: DepScan + Trivy SBOM vulns
       - name: Java SBOM + DepScan
         if: inputs.language == 'Java'
         run: |
@@ -105,33 +105,34 @@ jobs:
           docker run --rm -v "$PWD/results":/results owasp/dep-scan:latest scan --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"vulnerabilities":[]}' > results/depscan.json
           trivy sbom results/sbom.cdx.json --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
-      # Python: install dependencies in venv + SBOM scan (avoid building package)
-      - name: Python SBOM vulns
+      - name: Python SBOM + Trivy Python Scan
         if: inputs.language == 'Python'
         run: |
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
-          # Install dependencies only
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install build[deps]; fi
-          # Run vulnerability scanners
+          # pip-audit
           pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
+          # safety
           if [ -f requirements.txt ]; then
             safety check -r requirements.txt --json --full-report > ../results/safety.json || echo '[]' > ../results/safety.json
           else
             echo '[]' > ../results/safety.json
           fi
+          # Trivy FS Python scan for extra coverage
+          trivy fs project --scanners vuln --vuln-type python --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_python.json || echo '{"Results":[]}' > ../results/trivy_python.json
 
       - name: Build repo summary
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "SAFE_REPO=$SAFE" >> $GITHUB_ENV
 
-          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
-          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
-          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
-          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+          SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
+          SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
+          SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_fs.json)
+          SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_fs.json)
 
           if [ "${{ inputs.language }}" = "Java" ]; then
             SB_L=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/depscan.json)
@@ -139,7 +140,8 @@ jobs:
             SB_H=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/depscan.json)
             SB_C=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/depscan.json)
           else
-            jq -s 'flatten | unique_by(.id)' results/pip_audit.json results/safety.json > results/python_sbom_combined.json
+            # combine pip-audit, safety, and trivy python results
+            jq -s 'flatten | unique_by(.id)' results/pip_audit.json results/safety.json results/trivy_python.json > results/python_sbom_combined.json
             SB_L=$(jq '[.[] | select(.severity=="LOW")] | length' results/python_sbom_combined.json)
             SB_M=$(jq '[.[] | select(.severity=="MEDIUM")] | length' results/python_sbom_combined.json)
             SB_H=$(jq '[.[] | select(.severity=="HIGH")] | length' results/python_sbom_combined.json)
