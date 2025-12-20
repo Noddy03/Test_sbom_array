@@ -102,8 +102,7 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
 ################################################################################
 # TRIVY FS (SCA)
@@ -143,7 +142,6 @@ jobs:
           else
             echo '[]' > ../results/pip_audit.json
             echo '[]' > ../results/safety.json
-          fi
 
 ################################################################################
 # SEMGREP
@@ -155,20 +153,15 @@ jobs:
             || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# UNIQUE ID STEP
+# BUILD SUMMARY & SET ARTIFACT NAME
 ################################################################################
-      - id: unique_id
-        run: |
-          echo "uuid=$(uuidgen)" >> $GITHUB_OUTPUT
-
-################################################################################
-# SUMMARY ROW & UPLOAD
-################################################################################
-      - name: Build repo summary and upload
+      - id: build_summary
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          ARTIFACT_NAME="repo-summary-${SAFE}-${{ steps.unique_id.outputs.uuid }}"
+          UUID=$(uuidgen)
+          ARTIFACT_NAME="repo-summary-${SAFE}-${UUID}"
 
+          # Compute vulnerabilities
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_fs.json)
@@ -181,11 +174,18 @@ jobs:
 
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
 
+          # Write summary CSV
           echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" > repo_summary.csv
 
+          # Export artifact name as step output
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+################################################################################
+# UPLOAD ARTIFACT
+################################################################################
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ ARTIFACT_NAME }}
+          name: ${{ steps.build_summary.outputs.artifact_name }}
           path: repo_summary.csv
 
 ################################################################################
