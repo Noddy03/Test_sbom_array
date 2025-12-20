@@ -105,17 +105,23 @@ jobs:
           docker run --rm -v "$PWD/results":/results owasp/dep-scan:latest scan --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"vulnerabilities":[]}' > results/depscan.json
           trivy sbom results/sbom.cdx.json --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
-      # Python: install dependencies in venv + SBOM scan
+      # Python: install dependencies in venv + SBOM scan (avoid building package)
       - name: Python SBOM vulns
         if: inputs.language == 'Python'
         run: |
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
+          # Install dependencies only
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          if [ -f pyproject.toml ]; then pip install .; fi
+          if [ -f pyproject.toml ]; then pip install build[deps]; fi
+          # Run vulnerability scanners
           pip-audit --format json --output ../results/pip_audit.json || echo '[]' > ../results/pip_audit.json
-          safety check --full-report --json > ../results/safety.json || echo '[]' > ../results/safety.json
+          if [ -f requirements.txt ]; then
+            safety check -r requirements.txt --json --full-report > ../results/safety.json || echo '[]' > ../results/safety.json
+          else
+            echo '[]' > ../results/safety.json
+          fi
 
       - name: Build repo summary
         run: |
