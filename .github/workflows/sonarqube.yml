@@ -109,15 +109,28 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
+          cd project
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
+
           if [[ "$LANG_LOWER" == "java" ]]; then
-            snyk test --all-projects --json --exclude=test,tests,target,build > results/sca_raw.json || true
+            snyk test --all-projects --json --exclude=test,tests,target,build > ../results/sca_raw.json || true
           elif [[ "$LANG_LOWER" == "python" ]]; then
-            snyk test --all-projects --file=requirements.txt --json > results/sca_raw.json || true
+            if [ -f "requirements.txt" ]; then
+              snyk test --file=requirements.txt --json > ../results/sca_raw.json || true
+            elif [ -f "pyproject.toml" ]; then
+              snyk test --file=pyproject.toml --json > ../results/sca_raw.json || true
+            else
+              echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+            fi
           fi
 
-          # Normalize to always have top-level "vulnerabilities"
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+          # Normalize JSON to always have top-level vulnerabilities array
+          jq 'def extract_vulns:
+                if type=="array" then map(.vulnerabilities // []) | add
+                elif type=="object" then .vulnerabilities // []
+                else []
+                end;
+              {vulnerabilities: extract_vulns}' ../results/sca_raw.json > ../results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > ../results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
