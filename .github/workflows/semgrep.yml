@@ -96,7 +96,7 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
-          # Semgrep via pip (reliable in CI)
+          # Semgrep via pip
           pip3 install semgrep==1.40.0
 
       - name: Clone repo
@@ -155,14 +155,19 @@ jobs:
             || echo '{"results":[]}' > results/semgrep.json
 
 ################################################################################
-# SUMMARY ROW
+# UNIQUE ID STEP
 ################################################################################
-      - name: Build repo summary
+      - id: unique_id
         run: |
-          # sanitize repo name and create unique artifact name using UUID
+          echo "uuid=$(uuidgen)" >> $GITHUB_OUTPUT
+
+################################################################################
+# SUMMARY ROW & UPLOAD
+################################################################################
+      - name: Build repo summary and upload
+        run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          UUID=$(uuidgen)
-          ARTIFACT_NAME="repo-summary-${SAFE}-${UUID}"
+          ARTIFACT_NAME="repo-summary-${SAFE}-${{ steps.unique_id.outputs.uuid }}"
 
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
@@ -180,7 +185,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: $ARTIFACT_NAME
+          name: ${{ ARTIFACT_NAME }}
           path: repo_summary.csv
 
 ################################################################################
