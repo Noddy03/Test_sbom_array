@@ -94,11 +94,9 @@ jobs:
           if [ -f pom.xml ]; then
             mvn -q -B dependency:go-offline || true
 
-            # Generate CycloneDX SBOM
+            # Generate CycloneDX SBOM (Java)
             mvn -q org.cyclonedx:cyclonedx-maven-plugin:2.7.9:makeBom \
-              -DskipTests \
-              -DincludeLicenseText=false \
-              -DoutputFormat=json || true
+              -DskipTests -DincludeLicenseText=false -DoutputFormat=json || true
 
             if [ -f target/bom.json ]; then
               cp target/bom.json ../results/sbom.cdx.json
@@ -106,11 +104,8 @@ jobs:
           fi
           cd ..
 
-          # Filesystem SCA scan fallback
-          trivy fs project \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+          # Filesystem SCA scan
+          trivy fs project --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
       # ---------------- PYTHON ----------------
       - name: Setup Python environment and scan
@@ -129,48 +124,40 @@ jobs:
 
           pip freeze > requirements.lock || true
 
-          trivy fs . \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          # SCA scan project
+          trivy fs . --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
 
-          trivy fs .venv/lib \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output ../results/trivy_sca_venv.json || echo '{"Results":[]}' > ../results/trivy_sca_venv.json
+          # SCA scan installed packages
+          trivy fs .venv/lib/python*/site-packages --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_sca_venv.json || echo '{"Results":[]}' > ../results/trivy_sca_venv.json
 
           cd ..
-
-          jq -s '{Results: map(.Results // [])}' \
-            results/trivy_sca.json \
-            results/trivy_sca_venv.json \
-            > results/trivy_sca_merged.json
-
+          jq -s '{Results: map(.Results // [])}' results/trivy_sca.json results/trivy_sca_venv.json > results/trivy_sca_merged.json
           mv results/trivy_sca_merged.json results/trivy_sca.json
 
-      # ---------------- SBOM + DEP-SCAN ----------------
-      - name: Generate SBOM (fallback if missing)
+      # ---------------- SBOM ----------------
+      - name: Generate SBOM (CycloneDX) and scan vulnerabilities
         run: |
           if [ ! -f results/sbom.cdx.json ]; then
-            trivy fs project --format cyclonedx --output results/sbom.cdx.json \
-              || echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+            trivy fs project --format cyclonedx --output results/sbom.cdx.json --scanners vuln || echo '{"Results":[]}' > results/sbom.cdx.json
           fi
 
-      - name: Trivy SBOM vulnerability scan
-        run: |
-          trivy sbom results/sbom.cdx.json \
-            --severity LOW,MEDIUM,HIGH,CRITICAL \
-            --format json \
-            --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+          # Normalize SBOM JSON to always have Results array
+          jq 'if has("Results") then . else {Results:[.] } end' results/sbom.cdx.json > results/sbom_normalized.json
+          mv results/sbom_normalized.json results/sbom.cdx.json
 
+          # SBOM vulnerability scan
+          trivy sbom results/sbom.cdx.json --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
+
+      # ---------------- DEPSCAN (optional) ----------------
       - name: OWASP DepScan
         run: |
-          docker run --rm \
-            -v "${{ github.workspace }}/results":/results \
-            owasp/dep-scan:latest scan \
-            --input /results/sbom.cdx.json \
-            --format json \
-            --output /results/depscan.json || echo '{"results":[]}' > results/depscan.json
+          if docker pull ghcr.io/owasp/dependency-check:latest; then
+            docker run --rm -v "${{ github.workspace }}/results":/results ghcr.io/owasp/dependency-check:latest scan \
+              --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"results":[]}' > results/depscan.json
+          else
+            echo "DepScan skipped: Docker image not found"
+            echo '{"results":[]}' > results/depscan.json
+          fi
 
       # ---------------- CSV ----------------
       - name: Count vulnerabilities and build repo summary
@@ -185,7 +172,7 @@ jobs:
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json 2>/dev/null || echo 0)
 
-          # Unique total CVEs (avoid double counting)
+          # Unique total CVEs
           TOTAL=$(jq -s '[.[].Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique | length' results/trivy_sca.json results/trivy_sbom_vuln.json)
 
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
