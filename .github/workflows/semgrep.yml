@@ -58,33 +58,30 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y openjdk-17-jdk maven gradle jq unzip git python3-venv python3-pip curl
+          sudo apt-get install -y jq git unzip curl maven gradle python3-venv python3-pip
           # Install Trivy
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          # Install CycloneDX for Python SBOM
-          pip install cyclonedx-bom
           # Install Dependency-Check
-          curl -sSL https://github.com/jeremylong/DependencyCheck/releases/download/v8.5.0/dependency-check-8.5.0-release.zip -o /tmp/dependency-check.zip
-          unzip -q /tmp/dependency-check.zip -d /tmp
+          DC_VERSION="8.5.0"
+          DC_ZIP="/tmp/dependency-check.zip"
+          curl -L -o "$DC_ZIP" "https://github.com/jeremylong/DependencyCheck/releases/download/v$DC_VERSION/dependency-check-$DC_VERSION-release.zip"
+          unzip -q "$DC_ZIP" -d /tmp
+          chmod +x /tmp/dependency-check/bin/dependency-check.sh
 
       - name: Clone repository
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build project (Java)
+      - name: Build project (optional)
         run: |
           cd project
-          if [ -f "pom.xml" ]; then
-            mvn -q -DskipTests package || true
-          elif [ -f "build.gradle" ]; then
-            gradle build -x test || true
-          fi
+          mvn -q -DskipTests package || gradle build -x test || true
 
       ###########################################################################
-      # TRIVY FS SCAN (SCA)
+      # TRIVY FILESYSTEM SCAN (SCA)
       ###########################################################################
-      - name: Trivy FS scan (SCA)
+      - name: Trivy FS scan
         run: |
           mkdir -p results
           trivy fs project \
@@ -94,22 +91,22 @@ jobs:
             --output results/trivy_fs.json || echo '{"Results":[]}' > results/trivy_fs.json
 
       ###########################################################################
-      # DEPENDENCY-CHECK SBOM / SCA
+      # DEPENDENCY-CHECK SBOM SCAN
       ###########################################################################
-      - name: Dependency-Check scan
+      - name: Dependency-Check SBOM scan
         run: |
           mkdir -p results
-          cd project
-          # Python SBOM generation
-          if [ -f "requirements.txt" ]; then
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install -r requirements.txt
-            cyclonedx-py -r -o sbom.json
-            /tmp/dependency-check/dependency-check/bin/dependency-check.sh --scan sbom.json --format JSON --out ../results || true
-          # Java scan
-          elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then
-            /tmp/dependency-check/dependency-check/bin/dependency-check.sh --scan . --format JSON --out ../results || true
+          /tmp/dependency-check/bin/dependency-check.sh \
+            --project "${{ matrix.repo }}" \
+            --scan project \
+            --format JSON \
+            --out results/dependency-check.json || echo '{"dependencies":[]}' > results/dependency-check.json
+          # Count vulnerabilities by severity
+          L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Low")] | length' results/dependency-check.json)
+          M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Medium")] | length' results/dependency-check.json)
+          H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="High")] | length' results/dependency-check.json)
+          C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="Critical")] | length' results/dependency-check.json)
+          echo "$L,$M,$H,$C" > results/depscan_counts.txt
 
       ###########################################################################
       # PACKAGE RESULTS
@@ -132,9 +129,6 @@ jobs:
         with:
           path: all_results
 
-      ###########################################################################
-      # BUILD SUMMARY CSV
-      ###########################################################################
       - name: Build summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,depscan_low,depscan_medium,depscan_high,depscan_critical,total" > summary.csv
@@ -148,18 +142,16 @@ jobs:
             SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' temp/results/trivy_fs.json)
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' temp/results/trivy_fs.json)
             # Dependency-Check counts
-            if [ -f temp/results/dependency-check-report.json ]; then
-              DEPSCAN_L=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="LOW")] | length' temp/results/dependency-check-report.json)
-              DEPSCAN_M=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' temp/results/dependency-check-report.json)
-              DEPSCAN_H=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="HIGH")] | length' temp/results/dependency-check-report.json)
-              DEPSCAN_C=$(jq '[.dependencies[]?.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' temp/results/dependency-check-report.json)
+            if [ -f temp/results/depscan_counts.txt ]; then
+              read DEP_L DEP_M DEP_H DEP_C < temp/results/depscan_counts.txt
             else
-              DEPSCAN_L=0; DEPSCAN_M=0; DEPSCAN_H=0; DEPSCAN_C=0
+              DEP_L=0; DEP_M=0; DEP_H=0; DEP_C=0
             fi
-            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEPSCAN_L+DEPSCAN_M+DEPSCAN_H+DEPSCAN_C))
-            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEPSCAN_L,$DEPSCAN_M,$DEPSCAN_H,$DEPSCAN_C,$TOTAL" >> summary.csv
+            TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+DEP_L+DEP_M+DEP_H+DEP_C))
+            echo "$SAFE,$SCA_L,$SCA_M,$SCA_H,$SCA_C,$DEP_L,$DEP_M,$DEP_H,$DEP_C,$TOTAL" >> summary.csv
             rm -rf temp
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
