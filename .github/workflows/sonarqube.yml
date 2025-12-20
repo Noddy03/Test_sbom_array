@@ -62,7 +62,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git maven openjdk-17-jdk
+          sudo apt-get install -y jq git maven openjdk-17-jdk python3-pip
           pip3 install semgrep safety pip-audit
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -80,7 +80,7 @@ jobs:
           mvn -q -DskipTests package || true
 
 ################################################################################
-# SCA – SNYK
+# SCA – Snyk
 ################################################################################
       - name: SCA – Snyk
         env:
@@ -92,36 +92,33 @@ jobs:
 ################################################################################
 # SCA – Python (Safety + pip-audit)
 ################################################################################
-      - name: SCA – Python extra
+      - name: SCA – Python normalization
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
           REQ=requirements.txt
           [ -f pyproject.toml ] && poetry export -f requirements.txt --without-hashes -o req.txt && REQ=req.txt || true
-          safety check --file=$REQ --json > ../results/safety.json || echo '{"vulnerabilities":[]}' > ../results/safety.json
-          pip-audit -f json > ../results/pip_audit.json || echo '{"vulnerabilities":[]}' > ../results/pip_audit.json
+          safety check --file=$REQ --json > ../results/safety_raw.json || echo '{"vulnerabilities":[]}' > ../results/safety_raw.json
+          pip-audit -f json > ../results/pip_raw.json || echo '{"vulnerabilities":[]}' > ../results/pip_raw.json
+          # Normalize Safety
+          jq '{vulnerabilities: [.vulnerabilities[]? | {packageName:.package_name, version:.installed_version, severity:(.vuln_type|ascii_downcase)}]}' ../results/safety_raw.json > ../results/safety.json
+          # Normalize pip-audit
+          jq '{vulnerabilities: [.vulnerabilities[]? | {packageName:.name, version:.version, severity:(.fix_version|if .=="" then "low" else "high" end)}]}' ../results/pip_raw.json > ../results/pip_audit.json
           cd ..
 
 ################################################################################
-# MERGE ALL SCA
+# Merge all SCA (Snyk + Python)
 ################################################################################
-      - name: Merge SCA results
+      - name: Merge all SCA
         run: |
-          jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_snyk.json > results/sca_tmp.json
+          # Normalize Snyk array/object
+          jq 'if type=="array" then map(.vulnerabilities // []) | add | {vulnerabilities: .} else . end' results/sca_snyk.json > results/sca_norm.json
+          # Merge Python SCA if exists
           if [ -f results/safety.json ]; then
-            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/safety.json > results/safety_tmp.json
-            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/pip_audit.json > results/pip_tmp.json
-            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_tmp.json results/safety_tmp.json results/pip_tmp.json > results/sca_merged.json
+            jq -s '{vulnerabilities: map(.vulnerabilities // []) | add}' results/sca_norm.json results/safety.json results/pip_audit.json > results/sca_cleaned.json
           else
-            mv results/sca_tmp.json results/sca_merged.json
+            mv results/sca_norm.json results/sca_cleaned.json
           fi
-
-################################################################################
-# CLEAN SCA (ALL SEVERITIES, KEEP ALL)
-################################################################################
-      - name: SCA – Cleaned
-        run: |
-          jq '.vulnerabilities |= map(select((.isIgnored|not) and (.isPatched|not) and (.packageName!=null) and (.packageName!="") and ((.severity|ascii_downcase)=="low" or (.severity|ascii_downcase)=="medium" or (.severity|ascii_downcase)=="high" or (.severity|ascii_downcase)=="critical")))' results/sca_merged.json > results/sca_cleaned.json
 
 ################################################################################
 # SEMGREP
@@ -163,7 +160,7 @@ jobs:
           echo "generated" > results/sbom_status.txt
 
 ################################################################################
-# UPLOAD ARTIFACT
+# Upload artifact
 ################################################################################
       - name: Upload results
         run: |
@@ -190,14 +187,11 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
-
             SL=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="low")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
             SM=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="medium")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
             SH=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="high")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
             SC=$(jq '[.vulnerabilities[]?|select((.severity|ascii_downcase)=="critical")] | length' $d/sca_cleaned.json 2>/dev/null || echo 0)
-
             IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
-
             TOTAL=$((SL+SM+SH+SC+SB_L+SB_M+SB_H+SB_C))
             echo "$R,$SL,$SM,$SH,$SC,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> summary.csv
           done
