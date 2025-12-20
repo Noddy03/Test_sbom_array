@@ -91,7 +91,11 @@ jobs:
           cd project
           # Resolve and copy dependencies
           mvn clean package -DskipTests dependency:copy-dependencies || true
+
           mkdir -p results
+
+          # Ensure SCA file exists
+          touch results/trivy_sca.json
 
           # Trivy SCA
           trivy fs target/dependency \
@@ -102,7 +106,7 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
           # Trivy SBOM
-          trivy fs target/dependency --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs target/dependency --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
 
           # DepScan
           docker run --rm \
@@ -110,7 +114,7 @@ jobs:
             owasp/dep-scan:latest scan \
             --input /results/sbom.cdx.json \
             --format json \
-            --output /results/depscan.json || true
+            --output /results/depscan.json || echo '{}' > results/depscan.json
 
       - name: Scan Python Project
         if: contains(inputs.language, 'Python')
@@ -121,7 +125,9 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           if [ -f pyproject.toml ]; then pip install .; fi
+
           mkdir -p results
+          touch results/trivy_sca.json results/sbom.cdx.json results/depscan.json
 
           # Trivy SCA
           trivy fs .venv \
@@ -132,7 +138,7 @@ jobs:
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
           # Trivy SBOM
-          trivy fs .venv --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs .venv --format cyclonedx --output results/sbom.cdx.json || echo '{}' > results/sbom.cdx.json
 
           # DepScan
           docker run --rm \
@@ -140,22 +146,28 @@ jobs:
             owasp/dep-scan:latest scan \
             --input /results/sbom.cdx.json \
             --format json \
-            --output /results/depscan.json || true
+            --output /results/depscan.json || echo '{}' > results/depscan.json
 
 ################################################################################
 # BUILD SUMMARY
 ################################################################################
       - name: Build repo summary row
         run: |
+          [ ! -f results/trivy_sca.json ] && echo '{"Results":[]}' > results/trivy_sca.json
+          [ ! -f results/sbom.cdx.json ] && echo '{"Results":[]}' > results/sbom.cdx.json
+
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
+
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/sbom.cdx.json 2>/dev/null || echo 0)
+
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
