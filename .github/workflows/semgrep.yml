@@ -78,9 +78,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip python3-pip openjdk-17-jdk maven
-          pip3 install pip-audit safety semgrep
+          pip3 install pip-audit safety
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
+          curl -sSfL https://semgrep.dev/install.sh | sh
 
       - name: Clone repo
         env:
@@ -102,7 +103,8 @@ jobs:
           cd project
           mvn -B dependency:tree -DoutputFile=deps.txt -DoutputType=text || true
           cd ..
-          docker run --rm -v "$PWD/results":/results owasp/dep-scan:latest scan --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"vulnerabilities":[]}' > results/depscan.json
+          docker run --rm -v "$PWD/results":/results owasp/dep-scan:latest scan \
+            --input /results/sbom.cdx.json --format json --output /results/depscan.json || echo '{"vulnerabilities":[]}' > results/depscan.json
           trivy sbom results/sbom.cdx.json --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
 
       - name: Python SBOM + Trivy Python Scan
@@ -122,14 +124,11 @@ jobs:
           trivy fs project --scanners vuln --vuln-type python --severity LOW,MEDIUM,HIGH,CRITICAL --format json --output ../results/trivy_python.json || echo '{"Results":[]}' > ../results/trivy_python.json
 
       - name: Semgrep scan
-        run: |
-          semgrep --config p/ci --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+        run: semgrep --config p/ci --json project > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
       - name: Build repo summary
         run: |
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
-          echo "$SAFE" > results/repo_name.txt
-          
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_fs.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_fs.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_fs.json)
