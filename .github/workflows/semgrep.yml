@@ -85,7 +85,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip
           pip3 install --upgrade pip
-          pip3 install semgrep
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
@@ -128,15 +127,6 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-      # ---------------- SEMGREP ----------------
-      - name: Semgrep
-        run: |
-          mkdir -p results
-          semgrep --config p/security-audit \
-                  --config p/owasp-top-ten \
-                  --config p/${{ inputs.language.toLower() }} \
-                  --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-
       # ---------------- SBOM - DEPSCAN ----------------
       - name: OWASP DepScan SBOM Scan
         run: |
@@ -148,6 +138,15 @@ jobs:
           DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           echo "$DL,$DM,$DH,$DC" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
+
+      # ---------------- SBOM LICENSES - Trivy ----------------
+      - name: Trivy SBOM + licenses
+        run: |
+          mkdir -p results
+          cd project
+          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || true
+          trivy fs . --scanners license --format json --output ../results/sbom_licenses.json || echo '{"Results":[]}' > ../results/sbom_licenses.json
+          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' ../results/sbom_licenses.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
 
       - name: Set artifact name
         id: set_artifact
@@ -174,7 +173,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
@@ -182,21 +181,37 @@ jobs:
             SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
             if [ -f "$d/sbom_counts.txt" ]; then
               IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
             else
               SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+          done
+
+      - name: Build summary_licenses.csv
+        run: |
+          echo "repo,license_name,count" > summary_licenses.csv
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+            if [ -f "$d/licenses_tmp.json" ]; then
+              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+              while IFS=',' read -r license count; do
+                license=$(echo $license | tr -d '"')
+                echo "$R,$license,$count" >> summary_licenses.csv
+              done
+            fi
           done
 
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses-summary
+          path: summary_licenses.csv
