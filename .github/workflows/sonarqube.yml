@@ -3,9 +3,6 @@ name: Security Scan – Snyk + Semgrep + Trivy SBOM + OWASP DepScan + Licenses
 on:
   workflow_dispatch:
     inputs:
-      language:
-        required: false
-        default: "all"
       top_n:
         required: false
         default: "5"
@@ -22,19 +19,17 @@ jobs:
       python_repos: ${{ steps.fetch_python.outputs.repos }}
     steps:
       - id: fetch_java
-        if: ${{ inputs.language == 'all' || inputs.language == 'Java' }}
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LANG: Java
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
+          import os, requests, json, time
           headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
           repos = []
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
+              url = f"https://api.github.com/search/repositories?q=language:java&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
@@ -50,26 +45,23 @@ jobs:
           EOF
 
       - id: fetch_python
-        if: ${{ inputs.language == 'all' || inputs.language == 'Python' }}
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LANG: Python
           TOP_N: ${{ inputs.top_n }}
         run: |
           python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
+          import os, requests, json, time
           headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
           repos = []
           page = 1
           while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
+              url = f"https://api.github.com/search/repositories?q=language:python&sort=stars&order=desc&per_page=30&page={page}"
               r = requests.get(url, headers=headers)
               if r.status_code != 200:
                   break
               for repo in r.json().get("items", []):
                   for f in ["requirements.txt", "pyproject.toml", "setup.py"]:
-                      check = f"https://api.github.com/repos/{repo['full_name']}/contents/{f}"
-                      if requests.get(check, headers=headers).status_code == 200:
+                      if requests.get(f"https://api.github.com/repos/{repo['full_name']}/contents/{f}", headers=headers).status_code == 200:
                           repos.append(repo["full_name"])
                           break
                   if len(repos) >= int(os.environ["TOP_N"]):
@@ -85,95 +77,154 @@ jobs:
     if: ${{ needs.fetch_repos.outputs.java_repos != '[]' }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.java_repos) }}
-      fail-fast: false
+    continue-on-error: true
+    timeout-minutes: 10
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl openjdk-17-jdk maven
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
           npm install -g snyk
+          pip3 install semgrep
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: SCA - Snyk Java
+      - name: SCA - Java Maven
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
           cd project
-          timeout 600s snyk test --file=pom.xml --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          snyk test --maven-aggregate-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           cd ..
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          # minimal cleaning
+          jq '.vulnerabilities // [] | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json
 
-      - name: SCA - Cleaned
+      - name: Semgrep
         run: |
-          jq '
-            .vulnerabilities |= map(select((.packageName != null) and (.packageName != "") ))
-          ' results/sca.json > results/sca_cleaned.json
+          mkdir -p results
+          semgrep --config p/security-audit --config p/owasp-top-ten --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+
+      - name: Trivy SBOM + vulnerabilities + licenses
+        run: |
+          mkdir -p results
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          # remove duplicates
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + ":" + (.InstalledVersion // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+
+      - name: OWASP DepScan
+        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+
+      - name: Merge SBOM counts
+        run: |
+          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
+          TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
+          TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
+          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
+          DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
+
+      - name: Set artifact name
+        id: set_artifact
+        run: |
+          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set_artifact.outputs.artifact_name }}
+          path: results
 
   scan_python:
     needs: fetch_repos
     if: ${{ needs.fetch_repos.outputs.python_repos != '[]' }}
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.python_repos) }}
-      fail-fast: false
+    continue-on-error: true
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git python3-venv
-          pip install --upgrade pip
-          pip install semgrep snyk
+          sudo apt-get install -y jq git curl unzip
+          pip3 install semgrep snyk
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
 
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Python deps (best effort)
-        run: |
-          cd project
-          python3 -m venv .venv
-          source .venv/bin/activate
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          if [ -f pyproject.toml ]; then pip install . || true; fi
-
-      - name: SCA - Snyk Python
+      - name: SCA - Python
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
           cd project
-          snyk test --all-projects --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+          snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           cd ..
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          # minimal cleaning
+          jq '.vulnerabilities // [] | {vulnerabilities: .}' results/sca_raw.json > results/sca_cleaned.json
 
-      - name: SCA - Cleaned
+      - name: Semgrep
         run: |
-          jq '
-            .vulnerabilities |= map(select((.packageName != null) and (.packageName != "") ))
-          ' results/sca.json > results/sca_cleaned.json
+          mkdir -p results
+          semgrep --config p/security-audit --config p/owasp-top-ten --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+
+      - name: Trivy SBOM + vulnerabilities + licenses
+        run: |
+          mkdir -p results
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          # remove duplicates
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + ":" + (.InstalledVersion // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+
+      - name: OWASP DepScan
+        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+
+      - name: Merge SBOM counts
+        run: |
+          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
+          TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
+          TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
+          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
+          DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
+          echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
+
+      - name: Set artifact name
+        id: set_artifact
+        run: |
+          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.set_artifact.outputs.artifact_name }}
+          path: results
 
   summarize:
     needs: [scan_java, scan_python]
@@ -185,7 +236,7 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
@@ -193,11 +244,41 @@ jobs:
             SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC))
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$TOTAL" >> summary.csv
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            if [ -f "$d/sbom_counts.txt" ]; then
+              IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
+            else
+              SB_L=0; SB_M=0; SB_H=0; SB_C=0
+            fi
+            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+          done
+
+      - name: Build summary_licenses.csv
+        run: |
+          echo "repo,license_name,count" > summary_licenses.csv
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+            if [ -f "$d/licenses_tmp.json" ]; then
+              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+              while IFS=',' read -r license count; do
+                license=$(echo $license | tr -d '"')
+                echo "$R,$license,$count" >> summary_licenses.csv
+              done
+            fi
           done
 
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses-summary
+          path: summary_licenses.csv
