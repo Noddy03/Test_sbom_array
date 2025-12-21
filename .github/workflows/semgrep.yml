@@ -121,27 +121,31 @@ jobs:
       
           if [ "${{ inputs.language }}" == "Java" ]; then
             if [ -f pom.xml ]; then
-              # Resolve and copy dependencies to a local folder
-              mvn -q -DskipTests dependency:resolve dependency:copy-dependencies -DoutputDirectory=target/dependency || true
-              
-              # Scan dependencies if they exist, fallback to pom.xml
-              if [ -d target/dependency ] && [ "$(ls -A target/dependency)" ]; then
-                trivy fs target/dependency --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
-                || echo '{"Results":[]}' > ../results/trivy_sca.json
-              else
-                trivy fs pom.xml --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
-                || echo '{"Results":[]}' > ../results/trivy_sca.json
-              fi
+              # Scan pom.xml directly using Trivy with Maven dependency tree
+              trivy fs pom.xml \
+                --format json \
+                --scanners vuln \
+                --ignore-unfixed \
+                --maven-goals "dependency:tree" \
+                --output ../results/trivy_sca.json \
+              || echo '{"Results":[]}' > ../results/trivy_sca.json
             else
+              # No pom.xml, produce empty result
               echo '{"Results":[]}' > ../results/trivy_sca.json
             fi
       
           elif [ "${{ inputs.language }}" == "Python" ]; then
             source venv/bin/activate
-            trivy fs . --format json --scanners vuln --ignore-unfixed --output ../results/trivy_sca.json \
+            # Scan the installed Python packages in the repo
+            trivy fs . \
+              --format json \
+              --scanners vuln \
+              --ignore-unfixed \
+              --output ../results/trivy_sca.json \
             || echo '{"Results":[]}' > ../results/trivy_sca.json
             deactivate
           fi
+
 
 
 
