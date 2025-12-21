@@ -201,6 +201,7 @@ jobs:
             STATUS=$(cat $d/sbom_status.txt)
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
             echo "$R,$SL,$SM,$SH,$SC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
+          done
 
       - name: Build summary_licenses.csv
         run: |
