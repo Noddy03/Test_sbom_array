@@ -164,7 +164,7 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/*; do
-            R=$(basename "$d" | sed 's/_/\\//g')
+            R=$(basename "$d" | sed 's#_#/#g')
             SCAL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
