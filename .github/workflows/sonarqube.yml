@@ -83,6 +83,15 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+      - name: Build / Resolve Java dependencies
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          cd project
+          if [ -f mvnw ]; then ./mvnw -q -DskipTests dependency:resolve || true
+          elif [ -f pom.xml ]; then mvn -q -DskipTests dependency:resolve || true
+          elif [ -f gradlew ]; then ./gradlew dependencies || true
+          fi
+
       - name: Python deps (best effort)
         if: ${{ inputs.language == 'Python' }}
         run: |
@@ -105,6 +114,8 @@ jobs:
             snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || true
           fi
           cd ..
+
+          # Flatten all vulnerabilities into a single array
           jq '
             [
               .vulnerabilities[]?,
@@ -126,14 +137,23 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          # Aggregate licenses
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
-      - name: Merge SBOM counts
+      - name: Merge SBOM counts (deduplicated)
         run: |
+          # Deduplicate CVEs by VulnerabilityID
+          jq '[.Results[].Vulnerabilities[]? | {cve: .VulnerabilityID, severity: .Severity}] 
+              | unique_by(.cve) 
+              | map(.severity |= ascii_upcase) 
+              | group_by(.severity) 
+              | map({(.[0].severity): length}) 
+              | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+
+          # Merge with OWASP DepScan counts
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
