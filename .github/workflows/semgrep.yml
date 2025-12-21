@@ -175,20 +175,23 @@ jobs:
 # ---------------- SUMMARY PER REPO ----------------
       - name: Build repo summary
         run: |
+          # -------- SCA (unchanged, occurrence-based) --------
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
-
-          SB_L=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
-          SB_M=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
-          SB_H=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
-          SB_C=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
-
+      
+          # -------- SBOM (UNIQUE CVEs) --------
+          SB_L=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="LOW") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
+          SB_M=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="MEDIUM") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
+          SB_H=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="HIGH") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
+          SB_C=$(jq '[.Results[] | .Vulnerabilities[]? | select(.Severity=="CRITICAL") | .VulnerabilityID] | unique | length' results/trivy_sbom_vuln.json)
+      
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-
+      
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
+      
 
       - uses: actions/upload-artifact@v4
         with:
