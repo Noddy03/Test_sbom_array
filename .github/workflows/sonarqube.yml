@@ -100,13 +100,20 @@ jobs:
           mkdir -p results
           cd project
           if [ "${{ inputs.language }}" = "Java" ]; then
-            snyk test --maven-aggregate-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+            snyk test --maven-aggregate-projects --detection-depth=20 --json > ../results/sca_raw.json || true
           else
-            snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
+            snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || true
           fi
           cd ..
-          # Flatten all vulnerabilities recursively and normalize severities
-          jq '[.. | .vulnerabilities? // empty | .[] | .severity |= ascii_downcase]' results/sca_raw.json > results/sca_cleaned.json
+          jq '
+            [
+              .vulnerabilities[]?,
+              .issues.vulnerabilities[]?,
+              .projects[]?.vulnerabilities[]?,
+              .projects[]?.issues.vulnerabilities[]?
+            ]
+            | map(.severity |= ascii_downcase)
+          ' results/sca_raw.json > results/sca_cleaned.json
 
       - name: Semgrep
         run: |
