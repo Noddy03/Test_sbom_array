@@ -189,7 +189,8 @@ jobs:
         run: |
           echo "repo,license_name,count" > summary_licenses.csv
           for d in all_results/*; do
-            R=$(basename "$d" | sed 's/_/\\//g')
+            R=$(basename "$d")
+            R=${R//_//}
             if [ -f "$d/licenses_tmp.json" ]; then
               jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
               while IFS=',' read -r license count; do
@@ -198,6 +199,7 @@ jobs:
               done
             fi
           done
+
 
       - uses: actions/upload-artifact@v4
         with:
