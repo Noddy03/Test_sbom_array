@@ -90,13 +90,20 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+      - name: Install Java dependencies
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          cd project
+          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
+          if [ -f build.gradle ]; then ./gradlew build || true; fi
+
       - name: Python deps (best effort)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
           python3 -m venv .venv
           source .venv/bin/activate
-          pip install --upgrade pip
+          pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
@@ -104,6 +111,7 @@ jobs:
       # SCA - Snyk (optimised for all languages)
       ###########################################################################
       - name: SCA - Snyk (optimised)
+        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
@@ -114,6 +122,7 @@ jobs:
             --scan-unmanaged \
             --detection-depth=15 \
             --json \
+            --skip-unresolved \
             > results/sca_raw.json || echo "Snyk scan failed or timed out"          
           jq '
             if type=="array" then
@@ -150,8 +159,6 @@ jobs:
             )
           ' results/sca_tmp.json > results/sca_cleaned.json      
           rm -f results/sca_tmp.json
-
-
 
       - name: Semgrep
         run: |
