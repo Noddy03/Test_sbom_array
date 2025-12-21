@@ -34,7 +34,11 @@ jobs:
           }
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
-          files_to_check = {"java": ["pom.xml", "build.gradle"], "python": ["requirements.txt", "pyproject.toml"]}.get(language, [])
+          # Include all common dependency files
+          files_to_check = {
+              "java": ["pom.xml", "build.gradle"],
+              "python": ["requirements.txt", "pyproject.toml", "Pipfile", "poetry.lock"]
+          }.get(language, [])
           repos, page = [], 1
           while len(repos) < top_n and page <= 10:
               url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(language)}&sort=stars&order=desc&per_page=30&page={page}"
@@ -43,7 +47,12 @@ jobs:
                   break
               for repo in r.json().get("items", []):
                   for f in files_to_check:
-                      if requests.get(f"https://api.github.com/repos/{repo['full_name']}/contents/{f}", headers=headers).status_code == 200:
+                      # Check root and src/ folder
+                      check_urls = [
+                          f"https://api.github.com/repos/{repo['full_name']}/contents/{f}",
+                          f"https://api.github.com/repos/{repo['full_name']}/contents/src/{f}"
+                      ]
+                      if any(requests.get(url, headers=headers).status_code == 200 for url in check_urls):
                           repos.append(repo["full_name"])
                           break
                   if len(repos) >= top_n:
@@ -97,6 +106,8 @@ jobs:
               pip install --upgrade pip setuptools wheel
               [ -f project/requirements.txt ] && pip install -r project/requirements.txt
               [ -f project/pyproject.toml ] && pip install -e project
+              [ -f project/Pipfile ] && pip install pipenv && pipenv install --dev --system
+              [ -f project/poetry.lock ] && pip install poetry && poetry install --no-root
           fi
 
       - name: Snyk SCA (deep discovery)
@@ -110,10 +121,7 @@ jobs:
             [ -z "$FILES" ] && FILES="project"
             snyk test --all-projects --detection-depth=50 --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,target,build --json $FILES > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
           elif [ "$LANG_LOWER" = "python" ]; then
-            FILES=""
-            [ -f project/requirements.txt ] && FILES="$FILES --file=project/requirements.txt"
-            [ -f project/pyproject.toml ] && FILES="$FILES --file=project/pyproject.toml"
-            snyk test --all-projects $FILES --dev --detection-depth=50 --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,build,__pycache__ --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
+            snyk test --all-projects --dev --scan-unmanaged --prune-repeated-subdependencies=false --exclude=test,tests,build,__pycache__ --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
           else
             snyk test --all-projects --json > results/sca_raw.json || echo '{"vulnerabilities":[]}' > results/sca_raw.json
           fi
