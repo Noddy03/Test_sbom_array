@@ -115,17 +115,9 @@ jobs:
           if [ "${{ inputs.language }}" == "Java" ]; then
             trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            # Scan only declared dependencies for Python
-            if [ -f requirements.txt ]; then
-              trivy python requirements.txt --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            elif [ -f pyproject.toml ]; then
-              trivy python pyproject.toml --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            elif [ -f setup.py ]; then
-              trivy python setup.py --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            else
-              echo '{"Results":[]}' > ../results/trivy_sca.json
-            fi
+            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
+
 
 
       - name: Generate SBOM (CycloneDX)
