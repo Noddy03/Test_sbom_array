@@ -14,9 +14,6 @@ permissions:
   contents: read
   security-events: write
 
-################################################################################
-# FETCH REPOS
-################################################################################
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
@@ -68,9 +65,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-################################################################################
-# SCAN REPOS
-################################################################################
   scan_repo:
     needs: fetch_repos
     if: ${{ needs.fetch_repos.outputs.repos != '[]' }}
@@ -80,13 +74,12 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
-
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle python3-venv
-          pip3 install --upgrade pip semgrep
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle
+          pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
@@ -96,10 +89,7 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-################################################################################
-# PYTHON DEPENDENCIES (BEST EFFORT)
-################################################################################
-      - name: Python deps
+      - name: Python deps (best effort)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
@@ -109,69 +99,44 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-################################################################################
-# SNYK SCA
-################################################################################
       - name: Snyk SCA
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
           cd project
-
           if [ "${{ inputs.language }}" = "Java" ]; then
-            snyk test \
-              --all-projects \
-              --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+            snyk test --maven-aggregate-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           else
-            snyk test \
-              --all-projects \
-              --json > ../results/sca_raw.json || echo '{"vulnerabilities":[]}' > ../results/sca_raw.json
+            snyk test --all-projects --detection-depth=20 --json > ../results/sca_raw.json || echo '{}' > ../results/sca_raw.json
           fi
-
           cd ..
           jq '
-            .vulnerabilities // []
+            if type=="array" then
+              map(.vulnerabilities // []) | add
+            else
+              .vulnerabilities // []
+            end
+            | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca_cleaned.json
 
-################################################################################
-# SEMGREP
-################################################################################
       - name: Semgrep
         run: |
           mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          semgrep \
-            --config p/security-audit \
-            --config p/owasp-top-ten \
-            --config p/$LANG_LOWER \
-            --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
-################################################################################
-# TRIVY SBOM
-################################################################################
       - name: Trivy SBOM
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln --format json --output results/sbom_vuln.json || true
-          jq '
-            [.Results[].Vulnerabilities[]?] |
-            group_by(.Severity) |
-            map({(.[0].Severity): length}) |
-            add
-          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Vulnerabilities[]?] | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
-################################################################################
-# OWASP DEP-SCAN
-################################################################################
       - name: OWASP DepScan
         run: |
           java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
-################################################################################
-# MERGE SBOM COUNTS
-################################################################################
       - name: Merge SBOM counts
         run: |
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
@@ -185,19 +150,12 @@ jobs:
           echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
-################################################################################
-# UPLOAD RESULTS
-################################################################################
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.repo || '' | replace('/', '_') }}
+          name: ${{ matrix.repo.replace('/', '_') }}
           path: results
 
-
-################################################################################
-# SUMMARY
-################################################################################
   summarize:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -211,14 +169,14 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv
           for d in all_results/repo-results-*; do
             R=$(basename "$d" | sed 's/^repo-results-//')
-            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json || echo 0)
-            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json || echo 0)
-            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json || echo 0)
-            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json || echo 0)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json || echo 0)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json || echo 0)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json || echo 0)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json || echo 0)
+            SL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' $d/sca_cleaned.json)
+            SM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' $d/sca_cleaned.json)
+            SH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' $d/sca_cleaned.json)
+            SC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' $d/sca_cleaned.json)
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' $d/semgrep.json)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' $d/semgrep.json)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' $d/semgrep.json)
+            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' $d/semgrep.json)
             IFS=',' read SB_L SB_M SB_H SB_C < $d/sbom_counts.txt
             STATUS=$(cat $d/sbom_status.txt)
             TOTAL=$((SL+SM+SH+SC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))
