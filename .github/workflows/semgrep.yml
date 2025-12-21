@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan
+name: Security Scan – Trivy SCA + SBOM
 
 on:
   workflow_dispatch:
@@ -14,9 +14,6 @@ permissions:
   contents: read
   security-events: write
 
-################################################################################
-# FETCH TOP REPOS
-################################################################################
 jobs:
   fetch_repos:
     runs-on: ubuntu-latest
@@ -74,9 +71,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-################################################################################
-# SCAN EACH REPO
-################################################################################
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -88,7 +82,7 @@ jobs:
     continue-on-error: true
 
     steps:
-      - name: Install tools (conflict-free)
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
@@ -107,9 +101,6 @@ jobs:
           SAFE=$(echo "${{ matrix.repo }}" | tr '/' '-')
           echo "safe=$SAFE" >> "$GITHUB_OUTPUT"
 
-################################################################################
-# RESOLVE DEPENDENCIES
-################################################################################
       - name: Resolve dependencies
         run: |
           cd project
@@ -117,15 +108,10 @@ jobs:
             mvn -q -DskipTests dependency:resolve || true
           elif [ "${{ inputs.language }}" == "Python" ]; then
             python3 -m pip install --upgrade --user pip
-            if [ -f requirements.txt ]; then
-              python3 -m pip install --user -r requirements.txt || true
-            fi
+            find . -name "requirements.txt" -exec python3 -m pip install --user -r {} \; || true
           fi
 
-################################################################################
-# TRIVY DEPENDENCY SCA
-################################################################################
-      - name: Trivy Java Dependency SCA
+      - name: Trivy Java SCA
         if: ${{ inputs.language == 'Java' }}
         run: |
           mkdir -p results
@@ -139,31 +125,25 @@ jobs:
               --output "$OUTPUT" || echo "{\"Results\":[]}" > "$OUTPUT"
           ' sh {} \;
 
-      - name: Trivy Python Dependency SCA
+      - name: Trivy Python SCA
         if: ${{ inputs.language == 'Python' }}
         run: |
           mkdir -p results
           if [ -f requirements.txt ]; then
-            trivy pip -r requirements.txt \
+            find . -name "requirements.txt" -exec trivy pip -r {} \
               --scanners vuln \
               --severity LOW,MEDIUM,HIGH,CRITICAL \
               --format json \
-              --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+              --output results/trivy_sca.json \; || echo '{"Results":[]}' > results/trivy_sca.json
           else
             echo '{"Results":[]}' > results/trivy_sca.json
           fi
 
-################################################################################
-# TRIVY SBOM GENERATION
-################################################################################
-      - name: Generate SBOM (CycloneDX)
+      - name: Generate SBOM
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
 
-################################################################################
-# TRIVY SBOM VULNERABILITY SCAN
-################################################################################
       - name: Trivy SBOM Scan
         run: |
           mkdir -p results
@@ -173,17 +153,13 @@ jobs:
             --format json \
             --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
 
-################################################################################
-# COUNT VULNERABILITIES
-################################################################################
-      - name: Build repo summary row
+      - name: Build repo summary
         run: |
-          # Aggregate Java SCA (handle Maven output arrays safely)
           if [ "${{ inputs.language }}" == "Java" ]; then
-            SCA_L=$(jq -s '[.[][]? | select(has("Vulnerabilities")) | .Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/*_sca.json)
-            SCA_M=$(jq -s '[.[][]? | select(has("Vulnerabilities")) | .Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/*_sca.json)
-            SCA_H=$(jq -s '[.[][]? | select(has("Vulnerabilities")) | .Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/*_sca.json)
-            SCA_C=$(jq -s '[.[][]? | select(has("Vulnerabilities")) | .Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/*_sca.json)
+            SCA_L=$(jq -s '[.[][]? | (if type=="object" and has("Vulnerabilities") then .Vulnerabilities[]? else empty end) | select(.Severity=="LOW")] | length' results/*_sca.json)
+            SCA_M=$(jq -s '[.[][]? | (if type=="object" and has("Vulnerabilities") then .Vulnerabilities[]? else empty end) | select(.Severity=="MEDIUM")] | length' results/*_sca.json)
+            SCA_H=$(jq -s '[.[][]? | (if type=="object" and has("Vulnerabilities") then .Vulnerabilities[]? else empty end) | select(.Severity=="HIGH")] | length' results/*_sca.json)
+            SCA_C=$(jq -s '[.[][]? | (if type=="object" and has("Vulnerabilities") then .Vulnerabilities[]? else empty end) | select(.Severity=="CRITICAL")] | length' results/*_sca.json)
           else
             SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
             SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
@@ -191,7 +167,6 @@ jobs:
             SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
           fi
 
-          # Trivy SBOM
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
@@ -201,27 +176,19 @@ jobs:
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
 
-################################################################################
-# UPLOAD REPO SUMMARY
-################################################################################
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
         with:
           name: repo-summary-${{ steps.sanitize.outputs.safe }}
           path: repo_summary.csv
 
-################################################################################
-# BUILD FINAL SUMMARY
-################################################################################
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: rows
-
       - name: Build final summary.csv
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
