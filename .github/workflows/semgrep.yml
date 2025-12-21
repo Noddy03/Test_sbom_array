@@ -72,7 +72,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
+          sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip maven
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
 
@@ -93,7 +93,6 @@ jobs:
           cd project
           if [ -f pom.xml ]; then
             mvn -q -DskipTests dependency:resolve || true
-          fi
 
       - name: Install Python dependencies (Python only)
         if: ${{ inputs.language == 'Python' }}
@@ -110,45 +109,38 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          # Scan only dependency files for SCA
-          if [ "${{ inputs.language }}" == "Java" ]; then
-            # Scan pom.xml
-            if [ -f pom.xml ]; then
-              trivy fs pom.xml --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            else
-              echo '{"Results":[]}' > ../results/trivy_sca.json
-            fi
+          if [ "${{ inputs.language }}" == "Java" ] && [ -f pom.xml ]; then
+            trivy fs . --format json --scanners vuln --ignore-unfixed --dependency-list pom.xml --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            DEPFILES=""
             for f in requirements.txt pyproject.toml setup.py; do
-              [ -f "$f" ] && DEPFILES="$DEPFILES $f"
+              if [ -f "$f" ]; then
+                trivy fs . --format json --scanners vuln --ignore-unfixed --dependency-list "$f" --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+                break
+              fi
             done
-            if [ ! -z "$DEPFILES" ]; then
-              trivy fs $DEPFILES --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-            else
-              echo '{"Results":[]}' > ../results/trivy_sca.json
-            fi
+          else
+            echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
-      - name: Trivy License Scan
-        run: |
-          cd project
-          trivy fs . --format json --scanners license --output ../results/trivy_license.json || echo '{"Results":[]}' > ../results/trivy_license.json
 
       - name: Generate SBOM (CycloneDX)
         run: |
           mkdir -p results
           cd project
-          # SBOM scans the full project
           trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || echo '{"components":[]}' > ../results/sbom.cdx.json
 
       - name: Trivy SBOM Scan
         run: |
           if [ -f results/sbom.cdx.json ]; then
-            # Scan SBOM for vulnerabilities separately
             trivy sbom results/sbom.cdx.json --format json --severity LOW,MEDIUM,HIGH,CRITICAL --output results/trivy_sbom_vuln.json || echo '{"Results":[]}' > results/trivy_sbom_vuln.json
           else
             echo '{"Results":[]}' > results/trivy_sbom_vuln.json
           fi
+
+      - name: Trivy License Scan
+        run: |
+          mkdir -p results
+          cd project
+          trivy fs . --format json --scanners license --output ../results/trivy_licenses.json || echo '{"Results":[]}' > ../results/trivy_licenses.json
 
       - name: Build repo summary row
         run: |
@@ -161,13 +153,11 @@ jobs:
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+          # Write SCA + SBOM summary
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
-
-          # Aggregate licenses
-          LICENSES=$(jq -r '.Results[].Licenses[]?.Name // "Unknown"' results/trivy_license.json | sort | uniq -c | awk '{print $2","$1}' | tr '\n' ',' | sed 's/,$//')
-          echo "repo,licenses" > license_summary.csv
-          echo "${{ steps.sanitize.outputs.safe }},$LICENSES" >> license_summary.csv
+          # Write license summary
+          jq -r '.Results[]?.Licenses[]? | [.Name] | @csv' results/trivy_licenses.json > license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -198,9 +188,12 @@ jobs:
           path: summary.csv
       - name: Build final license_summary.csv
         run: |
-          echo "repo,licenses" > license_summary.csv
-          find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
+          echo "repo,license" > license_summary.csv
+          find rows -name license_summary.csv | while read f; do
+            REPO=$(basename "$f" .csv)
+            awk -v repo="$REPO" '{print repo "," $0}' "$f"
+          done >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
-          name: license-summary
+          name: licenses-summary
           path: license_summary.csv
