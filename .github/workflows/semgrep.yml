@@ -115,8 +115,9 @@ jobs:
           if [ "${{ inputs.language }}" == "Java" ]; then
             trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           elif [ "${{ inputs.language }}" == "Python" ]; then
-            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            trivy python . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
+
 
 
 
