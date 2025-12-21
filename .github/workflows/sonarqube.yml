@@ -110,20 +110,35 @@ jobs:
      ###########################################################################
       # SCA - Snyk (optimised for all languages)
       ###########################################################################
+      ###########################################################################
+# SCA - Snyk (optimised with dependency resolution handling)
+###########################################################################
       - name: SCA - Snyk (optimised)
-        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
-          mkdir -p results
+          mkdir -p results     
+          # For Python, attempt to install dependencies first
+          if [ -f project/requirements.txt ]; then
+            python3 -m venv project/.venv
+            source project/.venv/bin/activate
+            pip install --upgrade pip
+            pip install -r project/requirements.txt || echo "Some dependencies failed to install, continuing..."
+          fi
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || echo "Maven dependencies could not be fully resolved, continuing..."
+          fi
+          if [ -f project/build.gradle ]; then
+            gradle -p project build || echo "Gradle build failed, continuing..."
+          fi
           snyk test \
             --all-projects \
             --scan-unmanaged \
             --detection-depth=40 \
             --json \
             --skip-unresolved \
-            > results/sca_raw.json || echo "Snyk scan failed or timed out"          
+            > results/sca_raw.json || echo "Snyk scan failed or timed out"
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -133,7 +148,6 @@ jobs:
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
 
-      
       ###########################################################################
       # SCA - Cleaned (SBOM aligned)
       ###########################################################################
