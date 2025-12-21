@@ -127,11 +127,18 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-      # ---------------- SBOM - DEPSCAN ----------------
-      - name: OWASP DepScan SBOM Scan
+      # ---------------- SBOM - Trivy ----------------
+      - name: Trivy SBOM generation
         run: |
           mkdir -p results
-          java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || echo '{"vulnerabilities":[]}' > results/dep-scan.json
+          cd project
+          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || true
+
+      # ---------------- SBOM Vulnerabilities - OWASP DepScan ----------------
+      - name: OWASP DepScan SBOM analysis
+        run: |
+          mkdir -p results
+          java -jar dep-scan-cli.jar --sbom ../results/sbom.cdx.json --format json --output results/dep-scan.json || echo '{"vulnerabilities":[]}' > results/dep-scan.json
           DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
           DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
@@ -144,7 +151,6 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          trivy fs . --format cyclonedx --output ../results/sbom.cdx.json || true
           trivy fs . --scanners license --format json --output ../results/sbom_licenses.json || echo '{"Results":[]}' > ../results/sbom_licenses.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' ../results/sbom_licenses.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
 
