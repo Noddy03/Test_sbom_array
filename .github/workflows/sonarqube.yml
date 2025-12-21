@@ -35,9 +35,9 @@ jobs:
           language = os.environ["LANG"].lower()
           top_n = int(os.environ["TOP_N"])
           if language == "java":
-              files_to_check = ["pom.xml", "build.gradle"]
+              files_to_check = ["pom.xml"]
           elif language == "python":
-              files_to_check = ["requirements.txt", "pyproject.toml", "Pipfile.lock"]
+              files_to_check = ["requirements.txt", "pyproject.toml"]
           else:
               files_to_check = []
           repos = []
@@ -74,11 +74,12 @@ jobs:
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
     continue-on-error: true
+
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk python3-venv
+          sudo apt-get install -y jq git curl unzip maven gradle openjdk-17-jdk
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
@@ -90,28 +91,38 @@ jobs:
         run: |
           git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build (best effort)
+      - name: Build / Skip for Java
         run: |
-          cd project
-          # Attempt build if Java project
-          if [ -f "pom.xml" ]; then mvn -q -DskipTests package || true; fi
-          if [ -f "build.gradle" ]; then gradle build -x test || true; fi
+          if [ "${{ inputs.language }}" = "Java" ]; then
+            echo "Skipping build to avoid JDK mismatch"
+          else
+            cd project
+            pip3 install --upgrade pip setuptools wheel || true
+            pip3 install . || true
+          fi
 
-      - name: Snyk SCA (deep discovery)
+      - name: Snyk SCA
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
           mkdir -p results
-          cd project
-          snyk test \
-            --all-projects \
-            --detection-depth=20 \
-            --scan-unmanaged \
-            --prune-repeated-subdependencies=false \
-            --exclude=test,tests,target,build \
-            --file=requirements.txt \
-            --json > ../results/sca_raw.json || true
-          cd ..
+          if [ "${{ inputs.language }}" = "Python" ]; then
+            # scan Python requirements / pyproject without installing project
+            for f in project/requirements.txt project/pyproject.toml; do
+              if [ -f "$f" ]; then
+                snyk test --file="$f" --json > results/sca_raw.json || true
+              fi
+            done
+          else
+            cd project
+            snyk test \
+              --all-projects \
+              --detection-depth=20 \
+              --scan-unmanaged \
+              --prune-repeated-subdependencies=false \
+              --exclude=test,tests,target,build \
+              --json > results/sca_raw.json || true
+          fi
           jq '
             if type=="array" then
               map(.vulnerabilities // []) | add
@@ -132,7 +143,7 @@ jobs:
 
       - name: Trivy SBOM
         run: |
-          trivy fs project --scanners vuln,misconfig,license,secret --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln --format json --output results/sbom_vuln.json || true
           jq -r '
             [.Results[].Vulnerabilities[]?] |
