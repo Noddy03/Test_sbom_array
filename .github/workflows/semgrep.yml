@@ -75,7 +75,6 @@ jobs:
           sudo apt-get install -y jq git unzip openjdk-17-jdk python3-pip
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sudo sh -s -- -b /usr/local/bin
-
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -111,7 +110,17 @@ jobs:
           mkdir -p results
           cd project
           if [ "${{ inputs.language }}" == "Python" ]; then
-            trivy python . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            FILES=""
+            for f in requirements.txt pyproject.toml setup.py; do
+              if [ -f "$f" ]; then
+                FILES="$FILES $f"
+              fi
+            done
+            if [ -n "$FILES" ]; then
+              trivy fs $FILES --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+            else
+              echo '{"Results":[]}' > ../results/trivy_sca.json
+            fi
           else
             trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
@@ -147,12 +156,13 @@ jobs:
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
-          # License summary
-          LICENSES=$(jq -r '.Results[]?.Licenses[]?.Name' results/trivy_license.json | sort | uniq | paste -sd "," -)
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
-          echo "repo,licenses" > license_summary.csv
-          echo "${{ steps.sanitize.outputs.safe }},$LICENSES" >> license_summary.csv
+
+          # Build license summary for this repo
+          echo "repo,package,license" > license_summary.csv
+          jq -r '.Results[]?.Components[]? | [.Name, .License] | @csv' results/trivy_license.json | \
+            sed "s/^/$(echo "${{ steps.sanitize.outputs.safe }}"),/" >> license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -183,7 +193,7 @@ jobs:
           path: summary.csv
       - name: Build final license_summary.csv
         run: |
-          echo "repo,licenses" > license_summary.csv
+          echo "repo,package,license" > license_summary.csv
           find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
