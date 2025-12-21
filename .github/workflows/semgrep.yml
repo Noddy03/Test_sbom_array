@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + DepScan + License Scan
+name: Security Scan – Trivy SCA + SBOM + DepScan
 
 on:
   workflow_dispatch:
@@ -92,18 +92,16 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            # Resolve all dependencies including transitive ones
-            mvn -q -DskipTests dependency:resolve dependency:tree || true
+            mvn -q -DskipTests dependency:resolve || true
           fi
 
-      - name: Install Python runtime dependencies (Python only)
+      - name: Install Python dependencies (Python only)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
           for f in requirements.txt pyproject.toml setup.py; do
             if [ -f "$f" ]; then
-              # Install only main dependencies, skip dev/test extras
-              pip install --no-deps -r requirements.txt || true
+              pip install -r requirements.txt || true
               break
             fi
           done
@@ -112,14 +110,11 @@ jobs:
         run: |
           mkdir -p results
           cd project
-          if [ "${{ inputs.language }}" == "Java" ]; then
-            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
-          elif [ "${{ inputs.language }}" == "Python" ]; then
+          if [ "${{ inputs.language }}" == "Python" ]; then
             trivy python . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
+          else
+            trivy fs . --format json --scanners vuln --output ../results/trivy_sca.json || echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
-
-
-
 
       - name: Generate SBOM (CycloneDX)
         run: |
@@ -143,25 +138,21 @@ jobs:
 
       - name: Build repo summary row
         run: |
-          # SCA
           SCA_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sca.json)
           SCA_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sca.json)
           SCA_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sca.json)
           SCA_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sca.json)
-          # SBOM
           SB_L=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' results/trivy_sbom_vuln.json)
           SB_M=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' results/trivy_sbom_vuln.json)
           SB_H=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' results/trivy_sbom_vuln.json)
           SB_C=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' results/trivy_sbom_vuln.json)
           TOTAL=$((SCA_L+SCA_M+SCA_H+SCA_C+SB_L+SB_M+SB_H+SB_C))
+          # License summary
+          LICENSES=$(jq -r '.Results[]?.Licenses[]?.Name' results/trivy_license.json | sort | uniq | paste -sd "," -)
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > repo_summary.csv
           echo "${{ steps.sanitize.outputs.safe }},$SCA_L,$SCA_M,$SCA_H,$SCA_C,$SB_L,$SB_M,$SB_H,$SB_C,$TOTAL" >> repo_summary.csv
-
-      - name: Build license summary row
-        run: |
-          LIC=$(jq -r '[.Results[]?.Licenses[]? | .Name] | join(";")' results/trivy_license.json)
           echo "repo,licenses" > license_summary.csv
-          echo "${{ steps.sanitize.outputs.safe }},\"$LIC\"" >> license_summary.csv
+          echo "${{ steps.sanitize.outputs.safe }},$LICENSES" >> license_summary.csv
 
       - name: Upload repo summary
         uses: actions/upload-artifact@v4
@@ -186,14 +177,14 @@ jobs:
         run: |
           echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,total" > summary.csv
           find rows -name repo_summary.csv -exec tail -n +2 {} \; >> summary.csv
-      - name: Build final license_summary.csv
-        run: |
-          echo "repo,licenses" > license_summary.csv
-          find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+      - name: Build final license_summary.csv
+        run: |
+          echo "repo,licenses" > license_summary.csv
+          find rows -name license_summary.csv -exec tail -n +2 {} \; >> license_summary.csv
       - uses: actions/upload-artifact@v4
         with:
           name: license-summary
