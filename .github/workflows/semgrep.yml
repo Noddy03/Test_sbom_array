@@ -92,16 +92,18 @@ jobs:
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -q -DskipTests dependency:resolve || true
+            # Resolve all dependencies including transitive ones
+            mvn -q -DskipTests dependency:resolve dependency:tree || true
           fi
 
-      - name: Install Python dependencies (Python only)
+      - name: Install Python runtime dependencies (Python only)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
           for f in requirements.txt pyproject.toml setup.py; do
             if [ -f "$f" ]; then
-              pip install -r requirements.txt || true
+              # Install only main dependencies, skip dev/test extras
+              pip install --no-deps -r requirements.txt || true
               break
             fi
           done
