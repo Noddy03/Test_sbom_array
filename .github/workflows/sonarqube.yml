@@ -224,7 +224,20 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+           jq '
+            [
+              .Results[].Vulnerabilities[]?
+              | select(.Severity != "LOW" and .Severity != "UNKNOWN")
+            ]
+            | unique_by(
+                (.VulnID // "")
+                + ":" + (.PkgName // "")
+                + ":" + (.InstalledVersion // "")
+              )
+            | group_by(.Severity)
+            | map({(.[0].Severity): length})
+            | add
+          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: OWASP DepScan
