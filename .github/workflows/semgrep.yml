@@ -17,9 +17,6 @@ permissions:
   security-events: write
 
 jobs:
-  # =========================================================
-  # FETCH REPOSITORIES
-  # =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -66,9 +63,6 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
-  # =========================================================
-  # SCAN EACH REPOSITORY
-  # =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -93,14 +87,12 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      # ---------------- JAVA ----------------
       - name: Resolve Java dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
           if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
 
-      # ---------------- PYTHON ----------------
       - name: Resolve Python dependencies
         if: ${{ inputs.language == 'Python' }}
         run: |
@@ -112,7 +104,6 @@ jobs:
           if [ -f pyproject.toml ]; then pip install . || true; fi
           deactivate
 
-      # ---------------- SCA - Trivy ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
@@ -127,7 +118,6 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
-      # ---------------- SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
@@ -152,27 +142,25 @@ jobs:
               | map({(.[0].LicenseName): length})
               | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      # ---------------- VEX FROM SBOM ----------------
       - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          # Generate VEX using SBOM + vulnerabilities
-          trivy sbom --vex \
-            --format cyclonedx \
+          # Pass the existing sbom_vuln.json for proper VEX generation
+          trivy sbom --vex --format cyclonedx \
             --input results/sbom.cdx.json \
             --vuln results/sbom_vuln.json \
             --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
 
       - name: Summarize VEX states
         run: |
+          # Create JSON summary with CVE, severity, and state
           jq '[.components[]?.vulnerabilities[]? | {cve: .id, severity: .severity, state: .analysis.state}]' results/vex.cdx.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
+          # CSV version for easy inspection
           jq -r '.[] | [.cve, .severity, .state] | @csv' results/vex_summary.json > results/vex_summary.csv || echo '' > results/vex_summary.csv
 
-      # ---------------- OWASP DepScan ----------------
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
-      # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
         run: |
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
@@ -198,9 +186,6 @@ jobs:
           name: ${{ steps.set_artifact.outputs.artifact_name }}
           path: results
 
-  # =========================================================
-  # GLOBAL SUMMARY
-  # =========================================================
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -248,7 +233,6 @@ jobs:
               done
             fi
           done
-
       - uses: actions/upload-artifact@v4
         with:
           name: licenses-summary
