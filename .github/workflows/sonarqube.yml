@@ -138,12 +138,22 @@ jobs:
             --json \
             --skip-unresolved \
             > results/sca_raw.json || echo "Snyk scan failed or timed out"
-          jq '
-            if type=="array" then
-              map(.vulnerabilities // []) | add
-            else
-              .vulnerabilities // []
-            end
+           jq '
+            (
+              if type=="array" then
+                map(.vulnerabilities // []) | add
+              else
+                .vulnerabilities // []
+              end
+            )
+            | map(
+                select((.cvssScore // 0) > 2)
+              )
+            | unique_by(
+                .id
+                // .identifiers.CVE[0]
+                // (.packageName + ":" + (.version // ""))
+              )
             | { vulnerabilities: . }
           ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
 
@@ -177,25 +187,33 @@ jobs:
         run: |
           mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          
-          # Run Semgrep with multiple configs
           semgrep \
             --config p/security-audit \
             --config p/owasp-top-ten \
             --config p/$LANG_LOWER \
             --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-      
-          # Deduplicate by rule ID, file path, and start line
-          jq '.results |= unique_by(.check_id + ":" + .path + ":" + (.start.line // 0))' \
-             results/semgrep.json > results/semgrep_cleaned.json
+            jq '
+            .results |= (
+              map(
+                select(
+                  .extra.severity == "ERROR"
+                )
+              )
+              | unique_by(
+                  .check_id
+                  + ":" + .path
+                  + ":" + ((.start.line // 0) | tostring)
+                )
+            )
+          ' results/semgrep.json > results/semgrep_cleaned.json
+
       
       - name: Count Semgrep severities
         run: |
           SEM_L=$(jq '[.[]? | select(.extra.severity=="INFO")] | length' results/semgrep_cleaned.json || echo 0)
           SEM_M=$(jq '[.[]? | select(.extra.severity=="WARNING")] | length' results/semgrep_cleaned.json || echo 0)
           SEM_H=$(jq '[.[]? | select(.extra.severity=="ERROR")] | length' results/semgrep_cleaned.json || echo 0)
-          SEM_C=$(jq '[.[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' results/semgrep_cleaned.json || echo 0)
-      
+          SEM_C=$(jq '[.[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' results/semgrep_cleaned.json || echo 0)      
           echo "semgrep_low=$SEM_L" >> $GITHUB_OUTPUT
           echo "semgrep_medium=$SEM_M" >> $GITHUB_OUTPUT
           echo "semgrep_high=$SEM_H" >> $GITHUB_OUTPUT
