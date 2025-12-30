@@ -159,11 +159,11 @@ jobs:
         run: |
           mkdir -p results
           trivy sbom \
-            results/sbom.cdx.json \
-            --vex \
-            --scanners vuln \
-            --format cyclonedx \
-            --output results/vex.cdx.json || true
+          --vex \
+          --format cyclonedx \
+          results/sbom.cdx.json \
+          --output results/vex.cdx.json
+
 
       - name: Summarize VEX states
         run: |
