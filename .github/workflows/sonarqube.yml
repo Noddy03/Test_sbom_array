@@ -1,4 +1,4 @@
-name: Security Scan – Snyk + Semgrep + Trivy SBOM + OWASP DepScan + Licenses + VEX
+name: Security Scan – Snyk + Semgrep + Trivy SBOM + OWASP DepScan + Licenses + VEX + CodeQL
 
 on:
   workflow_dispatch:
@@ -108,7 +108,25 @@ jobs:
           deactivate
 
       ###########################################################################
-      # SCA - Snyk
+      # CodeQL Analysis (for VEX readiness)
+      ###########################################################################
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ inputs.language == 'Java' && 'java' || 'python' }}
+
+      - name: Autobuild for CodeQL
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: CodeQL Analyze
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ inputs.language }}"
+          output: results/codeql.sarif
+
+      ###########################################################################
+      # SCA - Snyk (existing)
       ###########################################################################
       - name: SCA - Snyk (optimised)
         env:
@@ -180,6 +198,10 @@ jobs:
           ' results/sca_tmp.json > results/sca_cleaned.json      
           rm -f results/sca_tmp.json
 
+      ###########################################################################
+      # Semgrep, Trivy SBOM, VEX, DepScan, Merge SBOM counts
+      # (esistenti, mantenuti intatti)
+      ###########################################################################
       - name: Semgrep (deduplicated)
         run: |
           mkdir -p results
@@ -215,9 +237,6 @@ jobs:
           echo "semgrep_high=$SEM_H" >> $GITHUB_OUTPUT
           echo "semgrep_critical=$SEM_C" >> $GITHUB_OUTPUT
 
-      ###########################################################################
-      # Trivy SBOM + vulnerabilities + licenses
-      ###########################################################################
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
@@ -239,26 +258,27 @@ jobs:
           ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      ###########################################################################
-      # VEX CycloneDX (new)
-      ###########################################################################
       - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          trivy sbom --vex --format cyclonedx --input results/sbom.cdx.json --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
+          trivy sbom results/sbom.cdx.json \
+            --vex \
+            --scanners vuln \
+            --format cyclonedx \
+            --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
 
       - name: Summarize VEX states
         run: |
           jq '
-            [.vulnerabilities[]?.analysis.state]
+            [
+              .components[]?.vulnerabilities[]?
+              | (.analysis.state // "UNSPECIFIED")
+            ]
             | group_by(.)
             | map({(.[0]): length})
             | add
           ' results/vex.cdx.json > results/vex_summary.json || echo '{}' > results/vex_summary.json
 
-      ###########################################################################
-      # OWASP DepScan
-      ###########################################################################
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
@@ -310,15 +330,14 @@ jobs:
             else
               SB_L=0; SB_M=0; SB_H=0; SB_C=0
             fi
-            VA=$(jq '.affected // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VN=$(jq '.not_affected // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VF=$(jq '.fixed // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VU=$(jq '.under_investigation // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VA=$(jq '.AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VN=$(jq '.NOT_AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VF=$(jq '.FIXED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VU=$(jq '.UNDER_INVESTIGATION // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
             TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
           done
-
 
       - name: Build summary_licenses.csv
         run: |
