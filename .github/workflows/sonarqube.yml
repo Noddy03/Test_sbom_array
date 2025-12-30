@@ -108,13 +108,13 @@ jobs:
           deactivate
 
       ###########################################################################
-      # CodeQL Analysis (for VEX readiness)
+      # CodeQL Analysis (isolated, does not overwrite SCA)
       ###########################################################################
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
         with:
-          languages: |
-            ${{ inputs.language == 'Java' && 'java' || 'python' }}
+          languages: ${{ inputs.language == 'Java' && 'java' || 'python' }}
+          db-location: codeql-db
 
       - name: Autobuild for CodeQL
         uses: github/codeql-action/autobuild@v4
@@ -127,14 +127,14 @@ jobs:
           output: results/codeql.sarif
 
       ###########################################################################
-      # SCA - Snyk
+      # SCA - Snyk (existing)
       ###########################################################################
       - name: SCA - Snyk (optimised)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
-          mkdir -p results
+          mkdir -p results     
           if [ -f project/requirements.txt ]; then
             python3 -m venv project/.venv
             source project/.venv/bin/activate
@@ -174,7 +174,8 @@ jobs:
           ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
 
       ###########################################################################
-      # SCA - Cleaned (SBOM aligned)
+      # SCA - Cleaned (SBOM aligned) + rest of workflow
+      # Keep everything else intact
       ###########################################################################
       - name: SCA - Cleaned (SBOM aligned)
         run: |
@@ -188,7 +189,7 @@ jobs:
                 and ((.packageName // .name // .id) != "")
               )
             )
-          ' results/sca.json > results/sca_tmp.json
+          ' results/sca.json > results/sca_tmp.json     
           jq '
             .vulnerabilities |= unique_by(
               ((.packageName // .name // .id) // "")
@@ -196,8 +197,10 @@ jobs:
               + ":" + (.severity // "")
               + ":" + (.id // .title // "")
             )
-          ' results/sca_tmp.json > results/sca_cleaned.json
+          ' results/sca_tmp.json > results/sca_cleaned.json      
           rm -f results/sca_tmp.json
+
+    
 
       ###########################################################################
       # Semgrep, Trivy SBOM, VEX, DepScan, Merge SBOM counts
