@@ -17,6 +17,9 @@ permissions:
   security-events: write
 
 jobs:
+  # =========================================================
+  # FETCH REPOSITORIES
+  # =========================================================
   fetch_repos:
     runs-on: ubuntu-latest
     outputs:
@@ -63,6 +66,9 @@ jobs:
               f.write(f"repos={json.dumps(repos)}\n")
           EOF
 
+  # =========================================================
+  # SCAN EACH REPOSITORY
+  # =========================================================
   scan_repo:
     needs: fetch_repos
     if: needs.fetch_repos.outputs.repos != '[]'
@@ -87,12 +93,14 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+      # ---------------- JAVA ----------------
       - name: Resolve Java dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
           if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
 
+      # ---------------- PYTHON ----------------
       - name: Resolve Python dependencies
         if: ${{ inputs.language == 'Python' }}
         run: |
@@ -104,6 +112,7 @@ jobs:
           if [ -f pyproject.toml ]; then pip install . || true; fi
           deactivate
 
+      # ---------------- SCA - Trivy ----------------
       - name: Trivy Dependency SCA
         run: |
           mkdir -p results
@@ -118,10 +127,12 @@ jobs:
             echo '{"Results":[]}' > ../results/trivy_sca.json
           fi
 
+      # ---------------- SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          # Use the existing sbom_vuln.json
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
           jq '
             [
@@ -129,7 +140,7 @@ jobs:
               | select(.Severity != "LOW" and .Severity != "UNKNOWN")
             ]
             | unique_by(
-                (.VulnID // "")
+                (.VulnerabilityID // "")
                 + ":" + (.PkgName // "")
                 + ":" + (.InstalledVersion // "")
               )
@@ -142,25 +153,18 @@ jobs:
               | map({(.[0].LicenseName): length})
               | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      - name: Generate VEX from SBOM
+      # ---------------- VEX SUMMARY FROM SBOM_VULN.JSON ----------------
+      - name: Generate VEX summary
         run: |
           mkdir -p results
-          # Pass the existing sbom_vuln.json for proper VEX generation
-          trivy sbom --vex --format cyclonedx \
-            --input results/sbom.cdx.json \
-            --vuln results/sbom_vuln.json \
-            --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
-
-      - name: Summarize VEX states
-        run: |
-          # Create JSON summary with CVE, severity, and state
-          jq '[.components[]?.vulnerabilities[]? | {cve: .id, severity: .severity, state: .analysis.state}]' results/vex.cdx.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
-          # CSV version for easy inspection
+          jq '[.Results[].Vulnerabilities[]? | {cve: .VulnerabilityID, severity: .Severity, state: .Status}]' results/sbom_vuln.json > results/vex_summary.json || echo '[]' > results/vex_summary.json
           jq -r '.[] | [.cve, .severity, .state] | @csv' results/vex_summary.json > results/vex_summary.csv || echo '' > results/vex_summary.csv
 
+      # ---------------- OWASP DepScan ----------------
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
 
+      # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
         run: |
           TL=$(jq '.LOW // 0' results/trivy_tmp.json)
@@ -186,6 +190,9 @@ jobs:
           name: ${{ steps.set_artifact.outputs.artifact_name }}
           path: results
 
+  # =========================================================
+  # GLOBAL SUMMARY
+  # =========================================================
   build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
@@ -205,10 +212,10 @@ jobs:
             SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
             IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt" 2>/dev/null || echo "0,0,0,0"
-            VA=$(jq '[.[] | select(.state=="AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VN=$(jq '[.[] | select(.state=="NOT_AFFECTED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VF=$(jq '[.[] | select(.state=="FIXED")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VU=$(jq '[.[] | select(.state=="UNDER_INVESTIGATION")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VA=$(jq '[.[] | select(.state=="fixed" or .state=="affected")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VN=$(jq '[.[] | select(.state=="not_affected")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VF=$(jq '[.[] | select(.state=="fixed")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            VU=$(jq '[.[] | select(.state=="under_investigation")] | length' "$d/vex_summary.json" 2>/dev/null || echo 0)
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
             TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
@@ -233,6 +240,7 @@ jobs:
               done
             fi
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: licenses-summary
