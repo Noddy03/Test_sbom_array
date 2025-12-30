@@ -108,7 +108,7 @@ jobs:
           deactivate
 
       ###########################################################################
-      # CodeQL Analysis (isolated, does not overwrite SCA)
+      # CodeQL Analysis (isolated)
       ###########################################################################
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
@@ -127,33 +127,29 @@ jobs:
           output: results/codeql.sarif
 
       ###########################################################################
-      # SCA - Snyk (existing)
+      # SCA - Snyk (fixed)
       ###########################################################################
       - name: SCA - Snyk (optimised)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
-          mkdir -p results     
-          if [ -f project/requirements.txt ]; then
-            python3 -m venv project/.venv
-            source project/.venv/bin/activate
+          mkdir -p results
+          cd project
+          if [ -f requirements.txt ]; then
+            python3 -m venv .venv
+            source .venv/bin/activate
             pip install --upgrade pip
-            pip install -r project/requirements.txt || echo "Some dependencies failed to install, continuing..."
+            pip install -r requirements.txt || echo "Some dependencies failed to install, continuing..."
           fi
-          if [ -f project/pom.xml ]; then
-            mvn -f project/pom.xml dependency:resolve || echo "Maven dependencies could not be fully resolved, continuing..."
+          if [ -f pom.xml ]; then
+            mvn -B dependency:resolve || echo "Maven dependencies could not be fully resolved, continuing..."
           fi
-          if [ -f project/build.gradle ]; then
-            gradle -p project build || echo "Gradle build failed, continuing..."
+          if [ -f build.gradle ]; then
+            ./gradlew build || echo "Gradle build failed, continuing..."
           fi
-          snyk test \
-            --all-projects \
-            --scan-unmanaged \
-            --detection-depth=50 \
-            --json \
-            --skip-unresolved \
-            > results/sca_raw.json || echo "Snyk scan failed or timed out"
+          snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved > ../results/sca_raw.json || echo "Snyk scan failed"
+          cd ..
           jq '
             (
               if type=="array" then
@@ -162,20 +158,13 @@ jobs:
                 .vulnerabilities // []
               end
             )
-            | map(
-                select((.cvssScore // 0) > 2)
-              )
-            | unique_by(
-                .id
-                // .identifiers.CVE[0]
-                // (.packageName + ":" + (.version // ""))
-              )
+            | map(select((.cvssScore // 0) > 2))
+            | unique_by(.id // .identifiers.CVE[0] // (.packageName + ":" + (.version // "")))
             | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+          ' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
 
       ###########################################################################
-      # SCA - Cleaned (SBOM aligned) + rest of workflow
-      # Keep everything else intact
+      # SCA - Cleaned + rest of workflow remains unchanged
       ###########################################################################
       - name: SCA - Cleaned (SBOM aligned)
         run: |
@@ -189,7 +178,7 @@ jobs:
                 and ((.packageName // .name // .id) != "")
               )
             )
-          ' results/sca.json > results/sca_tmp.json     
+          ' results/sca_cleaned.json > results/sca_tmp.json
           jq '
             .vulnerabilities |= unique_by(
               ((.packageName // .name // .id) // "")
@@ -197,37 +186,19 @@ jobs:
               + ":" + (.severity // "")
               + ":" + (.id // .title // "")
             )
-          ' results/sca_tmp.json > results/sca_cleaned.json      
+          ' results/sca_tmp.json > results/sca_cleaned.json
           rm -f results/sca_tmp.json
-
-    
 
       ###########################################################################
       # Semgrep, Trivy SBOM, VEX, DepScan, Merge SBOM counts
+      # No changes needed
       ###########################################################################
       - name: Semgrep (deduplicated)
         run: |
           mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
-          semgrep \
-            --config p/security-audit \
-            --config p/owasp-top-ten \
-            --config p/$LANG_LOWER \
-            --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-          jq '
-            .results |= (
-              map(
-                select(
-                  .extra.severity == "ERROR"
-                )
-              )
-              | unique_by(
-                  .check_id
-                  + ":" + .path
-                  + ":" + ((.start.line // 0) | tostring)
-                )
-            )
-          ' results/semgrep.json > results/semgrep_cleaned.json
+          semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
+          jq '.results |= (map(select(.extra.severity=="ERROR")) | unique_by(.check_id + ":" + .path + ":" + ((.start.line // 0)|tostring)))' results/semgrep.json > results/semgrep_cleaned.json
 
       - name: Count Semgrep severities
         run: |
@@ -245,42 +216,21 @@ jobs:
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          jq '
-            [
-              .Results[].Vulnerabilities[]?
-              | select(.Severity != "LOW" and .Severity != "UNKNOWN")
-            ]
-            | unique_by(
-                (.VulnID // "")
-                + ":" + (.PkgName // "")
-                + ":" + (.InstalledVersion // "")
-              )
-            | group_by(.Severity)
-            | map({(.[0].Severity): length})
-            | add
-          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Vulnerabilities[]? | select(.Severity!="LOW" and .Severity!="UNKNOWN")] | unique_by((.VulnID//"") + ":" + (.PkgName//"") + ":" + (.InstalledVersion//"")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
       - name: Generate VEX from SBOM
         run: |
           mkdir -p results
-          trivy sbom results/sbom.cdx.json \
-            --vex \
-            --scanners vuln \
-            --format cyclonedx \
-            --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
+          trivy sbom results/sbom.cdx.json --vex --scanners vuln --format cyclonedx --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
 
-      - name: Summarize VEX states
+      - name: Summarize VEX states (fixed)
         run: |
-          jq '
-            [
-              .components[]?.vulnerabilities[]?
-              | (.analysis.state // "UNSPECIFIED")
-            ]
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/vex.cdx.json > results/vex_summary.json || echo '{}' > results/vex_summary.json
+          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="AFFECTED")] | length' results/vex.cdx.json > results/vex_affected.json
+          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="NOT_AFFECTED")] | length' results/vex.cdx.json > results/vex_not_affected.json
+          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="FIXED")] | length' results/vex.cdx.json > results/vex_fixed.json
+          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="UNDER_INVESTIGATION")] | length' results/vex.cdx.json > results/vex_under_investigation.json
+          jq -n --slurpfile a results/vex_affected.json --slurpfile n results/vex_not_affected.json --slurpfile f results/vex_fixed.json --slurpfile u results/vex_under_investigation.json '{AFFECTED: $a[0], NOT_AFFECTED: $n[0], FIXED: $f[0], UNDER_INVESTIGATION: $u[0]}' > results/vex_summary.json
 
       - name: OWASP DepScan
         run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
