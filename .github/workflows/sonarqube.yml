@@ -308,7 +308,7 @@ jobs:
             SEM_FILE="$d/semgrep_cleaned.json"
             if [ ! -f "$SEM_FILE" ]; then
               echo '{"results":[]}' > "$SEM_FILE"
-            fi 
+            fi
             SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
             SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
             SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$SEM_FILE" 2>/dev/null || echo 0)
@@ -330,6 +330,7 @@ jobs:
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
             TOTAL=$((SCAL+SCAM+SCAH+SCAC + SEM_L+SEM_M+SEM_H+SEM_C + SB_L+SB_M+SB_H+SB_C + VEX_A+VEX_NA+VEX_F+VEX_UI))
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$VEX_A,$VEX_NA,$VEX_F,$VEX_UI,$STATUS,$TOTAL" >> summary.csv
+          done
 
       - name: Build summary_licenses.csv
         run: |
