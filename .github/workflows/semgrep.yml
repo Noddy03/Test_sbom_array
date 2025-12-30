@@ -160,7 +160,8 @@ jobs:
         run: |
           mkdir -p results
           # Use the vulnerability-enriched SBOM for VEX generation
-          trivy sbom --vex --format cyclonedx --input results/sbom_vuln.json --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
+          trivy sbom --vex --format cyclonedx ./project --output results/vex.cdx.json
+
       - name: Summarize VEX states
         run: |
           # Generate JSON with CVE, severity, and state
