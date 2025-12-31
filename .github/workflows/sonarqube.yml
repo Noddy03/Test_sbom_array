@@ -108,25 +108,6 @@ jobs:
           deactivate
 
       ###########################################################################
-      # CodeQL Analysis (isolated)
-      ###########################################################################
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: ${{ inputs.language == 'Java' && 'java' || 'python' }}
-          db-location: codeql-db
-
-      - name: Autobuild for CodeQL
-        uses: github/codeql-action/autobuild@v4
-        continue-on-error: true
-
-      - name: CodeQL Analyze
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: "/language:${{ inputs.language }}"
-          output: results/codeql.sarif
-
-      ###########################################################################
       # SCA - Snyk (fixed)
       ###########################################################################
       - name: SCA - Snyk (optimised)
@@ -219,6 +200,9 @@ jobs:
           jq '[.Results[].Vulnerabilities[]? | select(.Severity!="LOW" and .Severity!="UNKNOWN")] | unique_by((.VulnID//"") + ":" + (.PkgName//"") + ":" + (.InstalledVersion//"")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
+      - name: OWASP DepScan
+        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+
       - name: Generate VEX from SBOM
         run: |
           mkdir -p results
@@ -232,8 +216,63 @@ jobs:
           jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="UNDER_INVESTIGATION")] | length' results/vex.cdx.json > results/vex_under_investigation.json
           jq -n --slurpfile a results/vex_affected.json --slurpfile n results/vex_not_affected.json --slurpfile f results/vex_fixed.json --slurpfile u results/vex_under_investigation.json '{AFFECTED: $a[0], NOT_AFFECTED: $n[0], FIXED: $f[0], UNDER_INVESTIGATION: $u[0]}' > results/vex_summary.json
 
-      - name: OWASP DepScan
-        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
+      
+        ###########################################################################
+      # CodeQL Analysis (isolated)
+      ###########################################################################
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ inputs.language == 'Java' && 'java' || 'python' }}
+          db-location: codeql-db
+
+      - name: Autobuild for CodeQL
+        uses: github/codeql-action/autobuild@v4
+        continue-on-error: true
+
+      - name: CodeQL Analyze
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ inputs.language }}"
+          output: results/codeql.sarif
+
+      ###########################################################################
+# Enrich VEX using CodeQL results (safe, non-destructive)
+###########################################################################
+      - name: Enrich VEX with CodeQL evidence
+        run: |
+          # If CodeQL SARIF does not exist, do nothing
+          if [ ! -f results/codeql.sarif ]; then
+            echo "No CodeQL SARIF found, skipping VEX enrichment"
+            exit 0
+          fi
+          CODEQL_FINDINGS=$(jq '[.runs[].results[]?] | length' results/codeql.sarif || echo 0)
+          if [ "$CODEQL_FINDINGS" -eq 0 ]; then
+            echo "No CodeQL findings, leaving VEX unchanged"
+            exit 0
+          fi
+          echo "CodeQL findings detected: $CODEQL_FINDINGS"
+          echo "Marking SBOM vulnerabilities as UNDER_INVESTIGATION"
+          jq '
+            if .components then
+              .components |= map(
+                if .vulnerabilities then
+                  .vulnerabilities |= map(
+                    .analysis = {
+                      state: "UNDER_INVESTIGATION",
+                      justification: "code_not_present",
+                      response: ["investigate"],
+                      detail: "Static analysis (CodeQL) detected security-relevant code patterns"
+                    }
+                  )
+                else .
+                end
+              )
+            else .
+            end
+          ' results/vex.cdx.json > results/vex_enriched.cdx.json
+          mv results/vex_enriched.cdx.json results/vex.cdx.json
+
 
       - name: Merge SBOM counts
         run: |
