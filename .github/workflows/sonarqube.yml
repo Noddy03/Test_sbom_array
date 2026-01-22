@@ -1,4 +1,4 @@
-name: Security Scan – Snyk + Semgrep + Trivy SBOM + OWASP DepScan + Licenses + VEX + CodeQL
+name: Security Scan – Snyk + Semgrep + Trivy SBOM + OSV-Scanner + Licenses
 
 on:
   workflow_dispatch:
@@ -72,17 +72,19 @@ jobs:
       fail-fast: false
       matrix:
         repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-
+    
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm python3-pip
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm golang
           pip3 install --upgrade pip
           pip3 install semgrep
           npm install -g snyk
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          curl -sSL -o dep-scan-cli.jar https://github.com/owasp-dep-scan/dep-scan/releases/latest/download/dep-scan-cli.jar
+          # Install OSV-Scanner
+          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Clone repo
         env:
@@ -105,190 +107,42 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
-          deactivate
 
-      ###########################################################################
-      # SCA - Snyk (fixed)
-      ###########################################################################
       - name: SCA - Snyk (optimised)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
-          mkdir -p results
-          cd project
-          if [ -f requirements.txt ]; then
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install --upgrade pip
-            pip install -r requirements.txt || echo "Some dependencies failed to install, continuing..."
+          mkdir -p results      
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || echo "Maven resolution failed"
           fi
-          if [ -f pom.xml ]; then
-            mvn -B dependency:resolve || echo "Maven dependencies could not be fully resolved, continuing..."
-          fi
-          if [ -f build.gradle ]; then
-            ./gradlew build || echo "Gradle build failed, continuing..."
-          fi
-          snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved > ../results/sca_raw.json || echo "Snyk scan failed"
-          cd ..
-          jq '
-            (
-              if type=="array" then
-                map(.vulnerabilities // []) | add
-              else
-                .vulnerabilities // []
-              end
-            )
-            | map(select((.cvssScore // 0) > 2))
-            | unique_by(.id // .identifiers.CVE[0] // (.packageName + ":" + (.version // "")))
-            | { vulnerabilities: . }
-          ' results/sca_raw.json > results/sca_cleaned.json || echo '{"vulnerabilities":[]}' > results/sca_cleaned.json
+          snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved > results/sca_raw.json || echo "Snyk scan completed with issues"
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
 
-      ###########################################################################
-      # SCA - Cleaned + rest of workflow remains unchanged
-      ###########################################################################
       - name: SCA - Cleaned (SBOM aligned)
         run: |
-          mkdir -p results
-          jq '
-            .vulnerabilities |= map(
-              select(
-                ((.isIgnored // .ignored // false) | not)
-                and ((.isPatched // .patched // false) | not)
-                and ((.packageName // .name // .id) != null)
-                and ((.packageName // .name // .id) != "")
-              )
-            )
-          ' results/sca_cleaned.json > results/sca_tmp.json
-          jq '
-            .vulnerabilities |= unique_by(
-              ((.packageName // .name // .id) // "")
-              + ":" + (.version // "unknown")
-              + ":" + (.severity // "")
-              + ":" + (.id // .title // "")
-            )
-          ' results/sca_tmp.json > results/sca_cleaned.json
+          jq '.vulnerabilities |= map(select(((.isIgnored // .ignored // false) | not) and ((.isPatched // .patched // false) | not) and ((.packageName // .name // .id) != null)))' results/sca.json > results/sca_tmp.json      
+          jq '.vulnerabilities |= unique_by(((.packageName // .name // .id) // "") + ":" + (.version // "unknown") + ":" + (.severity // "") + ":" + (.id // .title // ""))' results/sca_tmp.json > results/sca_cleaned.json      
           rm -f results/sca_tmp.json
 
-      ###########################################################################
-      # Semgrep, Trivy SBOM, VEX, DepScan, Merge SBOM counts
-      # No changes needed
-      ###########################################################################
-      - name: Semgrep (deduplicated)
+      - name: Semgrep
         run: |
           mkdir -p results
           LANG_LOWER=$(echo "${{ inputs.language }}" | tr '[:upper:]' '[:lower:]')
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
-          jq '.results |= (map(select(.extra.severity=="ERROR")) | unique_by(.check_id + ":" + .path + ":" + ((.start.line // 0)|tostring)))' results/semgrep.json > results/semgrep_cleaned.json
-
-      - name: Count Semgrep severities
-        run: |
-          SEM_L=$(jq '[.[]? | select(.extra.severity=="INFO")] | length' results/semgrep_cleaned.json || echo 0)
-          SEM_M=$(jq '[.[]? | select(.extra.severity=="WARNING")] | length' results/semgrep_cleaned.json || echo 0)
-          SEM_H=$(jq '[.[]? | select(.extra.severity=="ERROR")] | length' results/semgrep_cleaned.json || echo 0)
-          SEM_C=$(jq '[.[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' results/semgrep_cleaned.json || echo 0)
-          echo "semgrep_low=$SEM_L" >> $GITHUB_OUTPUT
-          echo "semgrep_medium=$SEM_M" >> $GITHUB_OUTPUT
-          echo "semgrep_high=$SEM_H" >> $GITHUB_OUTPUT
-          echo "semgrep_critical=$SEM_C" >> $GITHUB_OUTPUT
 
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
           trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
           trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
-          jq '[.Results[].Vulnerabilities[]? | select(.Severity!="LOW" and .Severity!="UNKNOWN")] | unique_by((.VulnID//"") + ":" + (.PkgName//"") + ":" + (.InstalledVersion//"")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      - name: OWASP DepScan
-        run: java -jar dep-scan-cli.jar --scan project --format json --output results/dep-scan.json || true
-
-      - name: Generate VEX from SBOM
+      - name: OSV-Scanner
         run: |
-          mkdir -p results
-          trivy sbom results/sbom.cdx.json --vex --scanners vuln --format cyclonedx --output results/vex.cdx.json || echo '{}' > results/vex.cdx.json
-
-      - name: Summarize VEX states (fixed)
-        run: |
-          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="AFFECTED")] | length' results/vex.cdx.json > results/vex_affected.json
-          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="NOT_AFFECTED")] | length' results/vex.cdx.json > results/vex_not_affected.json
-          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="FIXED")] | length' results/vex.cdx.json > results/vex_fixed.json
-          jq '[.components[]?.vulnerabilities[]?.analysis.state | select(.=="UNDER_INVESTIGATION")] | length' results/vex.cdx.json > results/vex_under_investigation.json
-          jq -n --slurpfile a results/vex_affected.json --slurpfile n results/vex_not_affected.json --slurpfile f results/vex_fixed.json --slurpfile u results/vex_under_investigation.json '{AFFECTED: $a[0], NOT_AFFECTED: $n[0], FIXED: $f[0], UNDER_INVESTIGATION: $u[0]}' > results/vex_summary.json
-
-      
-        ###########################################################################
-      # CodeQL Analysis (isolated)
-      ###########################################################################
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: ${{ inputs.language == 'Java' && 'java' || 'python' }}
-          db-location: codeql-db
-
-      - name: Autobuild for CodeQL
-        uses: github/codeql-action/autobuild@v4
-        continue-on-error: true
-
-      - name: CodeQL Analyze
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: "/language:${{ inputs.language }}"
-          output: results/codeql.sarif
-
-      ###########################################################################
-# Enrich VEX using CodeQL results (safe, non-destructive)
-###########################################################################
-      - name: Enrich VEX with CodeQL evidence
-        run: |
-          # If CodeQL SARIF does not exist, do nothing
-          if [ ! -f results/codeql.sarif ]; then
-            echo "No CodeQL SARIF found, skipping VEX enrichment"
-            exit 0
-          fi
-          CODEQL_FINDINGS=$(jq '[.runs[].results[]?] | length' results/codeql.sarif || echo 0)
-          if [ "$CODEQL_FINDINGS" -eq 0 ]; then
-            echo "No CodeQL findings, leaving VEX unchanged"
-            exit 0
-          fi
-          echo "CodeQL findings detected: $CODEQL_FINDINGS"
-          echo "Marking SBOM vulnerabilities as UNDER_INVESTIGATION"
-          jq '
-            if .components then
-              .components |= map(
-                if .vulnerabilities then
-                  .vulnerabilities |= map(
-                    .analysis = {
-                      state: "UNDER_INVESTIGATION",
-                      justification: "code_not_present",
-                      response: ["investigate"],
-                      detail: "Static analysis (CodeQL) detected security-relevant code patterns"
-                    }
-                  )
-                else .
-                end
-              )
-            else .
-            end
-          ' results/vex.cdx.json > results/vex_enriched.cdx.json
-          mv results/vex_enriched.cdx.json results/vex.cdx.json
-
-      ###########################################################################
-# Re-summarize VEX AFTER CodeQL enrichment (CRITICAL FIX)
-###########################################################################
-      - name: Rebuild VEX summary after CodeQL
-        run: |
-          jq '
-            [
-              .components[]?.vulnerabilities[]?.analysis.state
-              // "UNSPECIFIED"
-            ]
-            | group_by(.)
-            | map({(.[0]): length})
-            | add
-          ' results/vex.cdx.json > results/vex_summary.json
-
-
+          osv-scanner -r project --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
 
       - name: Merge SBOM counts
         run: |
@@ -296,11 +150,12 @@ jobs:
           TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
           TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
           TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
-          DL=$(jq '[.vulnerabilities[]? | select(.severity=="LOW")] | length' results/dep-scan.json 2>/dev/null || echo 0)
-          DM=$(jq '[.vulnerabilities[]? | select(.severity=="MEDIUM")] | length' results/dep-scan.json 2>/dev/null || echo 0)
-          DH=$(jq '[.vulnerabilities[]? | select(.severity=="HIGH")] | length' results/dep-scan.json 2>/dev/null || echo 0)
-          DC=$(jq '[.vulnerabilities[]? | select(.severity=="CRITICAL")] | length' results/dep-scan.json 2>/dev/null || echo 0)
-          echo "$((TL+DL)),$((TM+DM)),$((TH+DH)),$((TC+DC))" > results/sbom_counts.txt
+          # OSV-Scanner JSON parsing logic
+          OL=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="LOW")] | length' results/osv-scan.json 2>/dev/null || echo 0)
+          OM=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="MEDIUM")] | length' results/osv-scan.json 2>/dev/null || echo 0)
+          OH=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="HIGH")] | length' results/osv-scan.json 2>/dev/null || echo 0)
+          OC=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="CRITICAL")] | length' results/osv-scan.json 2>/dev/null || echo 0)
+          echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
 
       - name: Set artifact name
@@ -325,42 +180,28 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,vex_affected,vex_not_affected,vex_fixed,vex_under_investigation,sbom_status,total" > summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv      
           for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
-            if [ -f "$d/sca_cleaned.json" ]; then
-              SCAL=$(jq '[.vulnerabilities[]? | select(.severity=="low")] | length' "$d/sca_cleaned.json")
-              SCAM=$(jq '[.vulnerabilities[]? | select(.severity=="medium")] | length' "$d/sca_cleaned.json")
-              SCAH=$(jq '[.vulnerabilities[]? | select(.severity=="high")] | length' "$d/sca_cleaned.json")
-              SCAC=$(jq '[.vulnerabilities[]? | select(.severity=="critical")] | length' "$d/sca_cleaned.json")
-            else
-              SCAL=0
-              SCAM=0
-              SCAH=0
-              SCAC=0
-            fi
-            if [ -f "$d/sbom_counts.txt" ]; then
-              IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
-            else
-              SB_L=0; SB_M=0; SB_H=0; SB_C=0
-            fi
-            VA=$(jq '.AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VN=$(jq '.NOT_AFFECTED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VF=$(jq '.FIXED // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
-            VU=$(jq '.UNDER_INVESTIGATION // 0' "$d/vex_summary.json" 2>/dev/null || echo 0)
+            R=$(basename "$d"); R=${R//_//}
+            SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+            if [ -f "$d/sbom_counts.txt" ]; then IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"; else SB_L=0; SB_M=0; SB_H=0; SB_C=0; fi 
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C+VA+VN+VF+VU))  
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$VA,$VN,$VF,$VU,$STATUS,$TOTAL" >> summary.csv
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))      
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
-
 
       - name: Build summary_licenses.csv
         run: |
           echo "repo,license_name,count" > summary_licenses.csv
           for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
+            R=$(basename "$d"); R=${R//_//}
             if [ -f "$d/licenses_tmp.json" ]; then
               jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
               while IFS=',' read -r license count; do
