@@ -140,24 +140,41 @@ jobs:
           jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
           jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      - name: OSV-Scanner
+      - name: OSVScanner
         run: |
-          osv-scanner -r project --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
-
+            mkdir -p results
+            osv-scanner -r project --json > results/osv-scan.json 2> results/osv-errors.log || true
+            if [ ! -s results/osv-scan.json ]; then
+              echo '{"results":[]}' > results/osv-scan.json
+            fi
+            echo "OSV-Scanner Summary:"
+            jq '.results | length // 0' results/osv-scan.json || echo "0"
+            
       - name: Merge SBOM counts
         run: |
-          TL=$(jq '.LOW // 0' results/trivy_tmp.json)
-          TM=$(jq '.MEDIUM // 0' results/trivy_tmp.json)
-          TH=$(jq '.HIGH // 0' results/trivy_tmp.json)
-          TC=$(jq '.CRITICAL // 0' results/trivy_tmp.json)
-          # OSV-Scanner JSON parsing logic
-          OL=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="LOW")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OM=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="MEDIUM")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OH=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="HIGH")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          OC=$(jq '[.results[].packages[].vulnerabilities[]? | select(.database_specific.severity=="CRITICAL")] | length' results/osv-scan.json 2>/dev/null || echo 0)
-          echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
-          echo "generated" > results/sbom_status.txt
-
+            mkdir -p results    
+            # 1. Extract Unique IDs from Trivy by severity
+            # We create a simple text file for each severity containing the VulnIDs
+            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_low.txt || touch trivy_ids_low.txt
+            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_med.txt || touch trivy_ids_med.txt
+            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_high.txt || touch trivy_ids_high.txt
+            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_crit.txt || touch trivy_ids_crit.txt
+            # 2. Extract Unique IDs from OSV-Scanner by severity
+            # Mapping OSV's nested structure to match the "Package:ID" format
+            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="LOW") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_low.txt || touch osv_ids_low.txt
+            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="MEDIUM") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_med.txt || touch osv_ids_med.txt
+            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="HIGH") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_high.txt || touch osv_ids_high.txt
+            jq -r '.results[].packages[]? | .package.name as $pkg | .vulnerabilities[]? | select(.database_specific.severity=="CRITICAL") | $pkg + ":" + .id' results/osv-scan.json > osv_ids_crit.txt || touch osv_ids_crit.txt 
+            # 3. Merge, Sort, and De-duplicate
+            # 'sort -u' combines the lists and removes any ID found by both tools
+            COMBINED_L=$(cat trivy_ids_low.txt osv_ids_low.txt | sort -u | wc -l)
+            COMBINED_M=$(cat trivy_ids_med.txt osv_ids_med.txt | sort -u | wc -l)
+            COMBINED_H=$(cat trivy_ids_high.txt osv_ids_high.txt | sort -u | wc -l)
+            COMBINED_C=$(cat trivy_ids_crit.txt osv_ids_crit.txt | sort -u | wc -l) 
+            # 4. Save final de-duplicated counts
+            echo "$COMBINED_L,$COMBINED_M,$COMBINED_H,$COMBINED_C" > results/sbom_counts.txt
+            echo "generated" > results/sbom_status.txt
+            
       - name: Set artifact name
         id: set_artifact
         run: |
