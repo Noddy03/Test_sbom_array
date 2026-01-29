@@ -153,34 +153,40 @@ jobs:
         run: |
           mkdir -p results
           DEP_PATH="project"
+          IS_PYTHON=false
           if [ -f project/pom.xml ]; then
-            # Java: resolve dependencies and copy to target/deps
+            # Java: copy dependencies to target/deps
             cd project
             mvn -B dependency:copy-dependencies -DoutputDirectory=target/deps || true
             DEP_PATH="project/target/deps"
             cd ..
           elif [ -f project/.venv/bin/activate ]; then
-            # Python: activate venv, scan project root
-            source project/.venv/bin/activate
-            DEP_PATH="project"
+            # Python: generate SBOM from project metadata
+            IS_PYTHON=true
           fi
-          trivy fs "$DEP_PATH" --format cyclonedx --output results/sbom.cdx.json || true
-          trivy fs "$DEP_PATH" --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
+          if [ "$IS_PYTHON" = true ]; then
+            # Make sure CycloneDX Python tool is installed
+            pip install cyclonedx-bom
+            cd project
+            cyclonedx-py -o ../results/sbom.cdx.json
+            cd ..
+          else
+            # Java or other: Trivy FS scan
+            trivy fs "$DEP_PATH" --format cyclonedx --output results/sbom.cdx.json || true
+          fi
+          trivy sbom results/sbom.cdx.json --scanners vuln --format json --ignore-unfixed --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json
           jq '[.Results[].Vulnerabilities[]?] 
               | unique_by(.PkgName + .Severity + (.VulnID // "")) 
               | group_by(.Severity) 
               | map({(.[0].Severity): length}) 
               | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
-          trivy fs "$DEP_PATH" --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
+          trivy sbom results/sbom.cdx.json --scanners license --format json --output results/trivy_license.json || echo '{}' > results/trivy_license.json
           jq '[.Results[].Licenses[]?] 
               | group_by(.) 
               | map({(.[0].License): length}) 
               | add' results/trivy_license.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
           osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
-          if [ -f project/.venv/bin/activate ]; then
-            deactivate
-          fi
-
+      
 
             
       - name: Merge SBOM counts
