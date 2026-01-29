@@ -132,21 +132,20 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
-          cd project
-          # Create SBOM and capture vulnerabilities
-          trivy fs . --scanners vuln,license --format json --output ../results/sbom_vuln.json || true
-          
-          # Extract Trivy Counts
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' ../results/sbom_vuln.json > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json
-          
-          # Extract Licenses
-          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' ../results/sbom_vuln.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+          trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '
+            [.components[]? | select(.licenses != null) | .licenses[].license.id]
+            | group_by(.)
+            | map({(.[0]): length})
+            | add
+          ' results/sbom.cdx.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-      # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner
         run: |
-          # OSV-Scanner scans the project directory
-          osv-scanner -r project --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+          osv-scanner --sbom results/sbom.cdx.json --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+
 
       # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
