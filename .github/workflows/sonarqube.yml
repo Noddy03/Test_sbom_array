@@ -119,12 +119,28 @@ jobs:
           fi
           snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved > results/sca_raw.json || echo "Snyk scan completed with issues"
           jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
+                jq '
+          {
+            vulnerabilities:
+              .vulnerabilities
+              | map(
+                  select(
+                    ((.ignored // .isIgnored // false) | not)
+                  )
+                  | {
+                      id: (.id // .title),
+                      severity: (.severity // "unknown"),
+                      package: (.packageName // .name // "unknown"),
+                      version: (.version // "unknown"),
+                      isPatched: (.isPatched // .patched // false),
+                      title: .title,
+                      url: .url
+                    }
+                )
+              | unique_by(.package + ":" + .version + ":" + .id)
+          }
+          ' results/sca.json > results/sca_cleaned.json
 
-      - name: SCA - Cleaned (SBOM aligned)
-        run: |
-          jq '.vulnerabilities |= map(select(((.isIgnored // .ignored // false) | not) and ((.isPatched // .patched // false) | not) and ((.packageName // .name // .id) != null)))' results/sca.json > results/sca_tmp.json      
-          jq '.vulnerabilities |= unique_by(((.packageName // .name // .id) // "") + ":" + (.version // "unknown") + ":" + (.severity // "") + ":" + (.id // .title // ""))' results/sca_tmp.json > results/sca_cleaned.json      
-          rm -f results/sca_tmp.json
 
       - name: Semgrep
         run: |
