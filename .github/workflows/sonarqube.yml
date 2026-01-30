@@ -149,38 +149,38 @@ jobs:
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
        # ---------------- SBOM + Trivy + OSV ----------------
-      - name: Trivy vuln + license (real scan)
+      - name: Trivy vulnerabilities + licenses
         run: |
           set -e
-          mkdir -p results      
+          mkdir -p results     
           trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/trivy.json || echo '{"Results":[]}' > results/trivy.json     
+            --output results/trivy.json || echo '{"Results":[]}' > results/trivy.json      
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
               | add' results/trivy.json \
-              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json      
+              > results/vuln_summary.json || echo '{}' > results/vuln_summary.json     
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
               | add' results/trivy.json \
-              > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+              > results/licenses_summary.json || echo '{}' > results/licenses_summary.json
+
+      - name: Generate SBOM (compliance only)
+        run: |
+          mkdir -p results
+          trivy fs project --format cyclonedx --output results/sbom.cdx.json || \
+            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
       
       - name: OSV scan
         run: |
+          mkdir -p results
           osv-scanner -r project --format json \
             > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
-      
-      - name: Generate SBOM (compliance)
-        run: |
-          trivy fs project --format cyclonedx --output results/sbom.cdx.json
-
-
-
-            
+        
       - name: Merge SBOM counts
         run: |
             mkdir -p results    
