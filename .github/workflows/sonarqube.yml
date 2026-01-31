@@ -113,13 +113,16 @@ jobs:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
-          mkdir -p results      
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt    
           if [ -f project/pom.xml ]; then
             mvn -f project/pom.xml dependency:resolve || echo "Maven resolution failed"
-          fi
-          snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved > results/sca_raw.json || echo "Snyk scan completed with issues"
-          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json
-                jq '
+          fi     
+          snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved \
+            > results/sca_raw.json || echo "failed" > results/snyk_status.txt      
+          jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' \
+            results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json    
+          jq '
           {
             vulnerabilities:
               .vulnerabilities
@@ -140,6 +143,7 @@ jobs:
               | unique_by(.package + ":" + .version + ":" + .id)
           }
           ' results/sca.json > results/sca_cleaned.json
+      
 
 
       - name: Semgrep
@@ -151,13 +155,14 @@ jobs:
        # ---------------- SBOM + Trivy + OSV ----------------
       - name: Trivy vulnerabilities + licenses
         run: |
-          set -e
-          mkdir -p results     
+          mkdir -p results
+          echo "ok" > results/trivy_status.txt 
           # Main Trivy output (MATCHES downstream expectations)
           trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json || echo '{"Results":[]}' > results/sbom_vuln.json      
+            --output results/sbom_vuln.json \
+            || echo "failed" > results/trivy_status.txt      
           # Vulnerability summary
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
@@ -172,6 +177,7 @@ jobs:
               | add' results/sbom_vuln.json \
               > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
+
       - name: Generate SBOM (compliance only)
         run: |
           mkdir -p results
@@ -181,8 +187,10 @@ jobs:
       - name: OSV scan
         run: |
           mkdir -p results
+          echo "ok" > results/osv_status.txt    
           osv-scanner -r project --format json \
-            > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
+            > results/osv-scan.json \
+            || echo "failed" > results/osv_status.txt
 
 
         
