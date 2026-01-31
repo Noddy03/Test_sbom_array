@@ -241,22 +241,43 @@ jobs:
 
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv      
-          for d in all_results/*; do
-            R=$(basename "$d"); R=${R//_//}
-            SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
-            if [ -f "$d/sbom_counts.txt" ]; then IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"; else SB_L=0; SB_M=0; SB_H=0; SB_C=0; fi 
-            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))      
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SEM_L,$SEM_M,$SEM_H,$SEM_C,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
-          done
+          echo "repo,\
+          sca_low,sca_medium,sca_high,sca_critical,\
+          semgrep_low,semgrep_medium,semgrep_high,semgrep_critical,\
+          sbom_low,sbom_medium,sbom_high,sbom_critical,\
+          sca_status,trivy_status,osv_status,\
+          sbom_status,total" > summary.csv             
+              for d in all_results/*; do
+                R=$(basename "$d")
+                R=${R//_//}         
+                # -------- SCA (Snyk) --------
+                SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+                SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+                SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
+                SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)         
+                # -------- Semgrep (kept but not validated) --------
+                SEM_L=$(jq '[.results[]? | select(.extra.severity=="INFO")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+                SEM_M=$(jq '[.results[]? | select(.extra.severity=="WARNING")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+                SEM_H=$(jq '[.results[]? | select(.extra.severity=="ERROR")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)
+                SEM_C=$(jq '[.results[]? | select(.extra.severity=="ERROR" and (.extra.metadata.confidence // "")=="HIGH")] | length' "$d/semgrep.json" 2>/dev/null || echo 0)       
+                # -------- SBOM (Trivy + OSV) --------
+                if [ -f "$d/sbom_counts.txt" ]; then
+                  IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
+                else
+                  SB_L=0; SB_M=0; SB_H=0; SB_C=0
+                fi       
+                # -------- Status flags (only what matters) --------
+                SCA_STATUS=$(cat "$d/sca_status.txt" 2>/dev/null || echo "unknown")
+                TRIVY_STATUS=$(cat "$d/trivy_status.txt" 2>/dev/null || echo "unknown")
+                OSV_STATUS=$(cat "$d/osv_status.txt" 2>/dev/null || echo "unknown")
+                SBOM_STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "unknown")         
+                TOTAL=$((SCAL+SCAM+SCAH+SCAC+SEM_L+SEM_M+SEM_H+SEM_C+SB_L+SB_M+SB_H+SB_C))             
+                echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,\
+          $SEM_L,$SEM_M,$SEM_H,$SEM_C,\
+          $SB_L,$SB_M,$SB_H,$SB_C,\
+          $SCA_STATUS,$TRIVY_STATUS,$OSV_STATUS,\
+          $SBOM_STATUS,$TOTAL" >> summary.csv
+              done
 
       - name: Build summary_licenses.csv
         run: |
