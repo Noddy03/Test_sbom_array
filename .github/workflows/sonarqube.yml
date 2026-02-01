@@ -120,20 +120,26 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      - name: SCA - Snyk (optimised)
+      - name: SCA - Snyk (optimised, correct)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
-          echo "ok" > results/snyk_status.txt    
+          echo "ok" > results/snyk_status.txt     
           if [ -f project/pom.xml ]; then
             mvn -f project/pom.xml dependency:resolve || echo "Maven resolution failed"
-          fi     
+          fi        
+          set +e
           snyk test --all-projects --scan-unmanaged --detection-depth=50 --json --skip-unresolved \
-            > results/sca_raw.json || echo "failed" > results/snyk_status.txt      
+            > results/sca_raw.json
+          CODE=$?
+          set -e   
+          if [ "$CODE" -gt 1 ]; then
+            echo "failed" > results/snyk_status.txt
+          fi     
           jq 'if type=="array" then map(.vulnerabilities // []) | add else .vulnerabilities // [] end | { vulnerabilities: . }' \
-            results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json    
+            results/sca_raw.json > results/sca.json || echo '{"vulnerabilities":[]}' > results/sca.json        
           jq '
           {
             vulnerabilities:
@@ -155,7 +161,6 @@ jobs:
               | unique_by(.package + ":" + .version + ":" + .id)
           }
           ' results/sca.json > results/sca_cleaned.json
-      
 
 
       - name: Semgrep
@@ -213,33 +218,39 @@ jobs:
 
 
         
+     # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
       - name: Merge SBOM counts
         run: |
-            mkdir -p results    
-            # 1. Extract Unique IDs from Trivy by severity
-            # We create a simple text file for each severity containing the VulnIDs
-            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_low.txt || touch trivy_ids_low.txt
-            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_med.txt || touch trivy_ids_med.txt
-            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_high.txt || touch trivy_ids_high.txt
-            jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_ids_crit.txt || touch trivy_ids_crit.txt
-            # 2. Extract Unique IDs from OSV-Scanner by severity
-            # Mapping OSV's nested structure to match the "Package:ID" format
-                 jq -r '
-             .results[].packages[]?
-             | .package.name as $pkg
-              | .vulnerabilities[]?
-              | $pkg + ":" + .id
-              ' results/osv-scan.json > osv_ids_all.txt || touch osv_ids_all.txt
-            # 3. Merge, Sort, and De-duplicate
-            # 'sort -u' combines the lists and removes any ID found by both tools
-            COMBINED_L=$(cat trivy_ids_low.txt osv_ids_all.txt | sort -u | wc -l)
-            COMBINED_M=$(cat trivy_ids_med.txt osv_ids_all.txt | sort -u | wc -l)
-            COMBINED_H=$(cat trivy_ids_high.txt osv_ids_all.txt | sort -u | wc -l)
-            COMBINED_C=$(cat trivy_ids_crit.txt osv_ids_all.txt | sort -u | wc -l)
+          mkdir -p results    
+          # -------- Trivy IDs by severity --------
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
+          # -------- OSV mapped to severity via CVSS --------
+          jq -r '
+            .results[].packages[]?
+            | .package.name as $pkg
+            | .vulnerabilities[]?
+            | (.severity[]?.score // 0 | tonumber) as $s
+            | if $s < 4 then "LOW"
+              elif $s < 7 then "MEDIUM"
+              elif $s < 9 then "HIGH"
+              else "CRITICAL" end
+            | . + "|" + $pkg + ":" + .id
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt    
+          grep '^LOW|' osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
+          grep '^MEDIUM|' osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
+          grep '^HIGH|' osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
+          grep '^CRITICAL|' osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt    
+          # -------- Merge correctly (same severity only) --------
+          SB_L=$(cat trivy_low.txt osv_low.txt | sort -u | wc -l)
+          SB_M=$(cat trivy_med.txt osv_med.txt | sort -u | wc -l)
+          SB_H=$(cat trivy_high.txt osv_high.txt | sort -u | wc -l)
+          SB_C=$(cat trivy_crit.txt osv_crit.txt | sort -u | wc -l)  
+          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
 
-            # 4. Save final de-duplicated counts
-            echo "$COMBINED_L,$COMBINED_M,$COMBINED_H,$COMBINED_C" > results/sbom_counts.txt
-            echo "generated" > results/sbom_status.txt
             
       - name: Set artifact name
         id: set_artifact
