@@ -170,12 +170,20 @@ jobs:
     # ---------------- Build Trivy severity summary ----------------
       - name: Build Trivy severity summary
         run: |
-          jq '[.Results[].Vulnerabilities[]?]
-              | unique_by(.PkgName + .Severity + (.VulnID // ""))
-              | group_by(.Severity)
-              | map({(.[0].Severity): length})
-              | add // {}' results/sbom_vuln.json \
-            > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+          jq '
+            [.Results[].Vulnerabilities[]?]
+            | if length == 0 then {} else
+                unique_by(.PkgName + .Severity + (.VulnID // ""))
+                | group_by(.Severity)
+                | map({(.[0].Severity): length})
+                | add
+              end
+          ' results/sbom_vuln.json > results/trivy_tmp.json
+          # force valid JSON even if Trivy broke
+          if ! jq empty results/trivy_tmp.json 2>/dev/null; then
+            echo '{}' > results/trivy_tmp.json
+          fi
+
       
 
 
@@ -193,20 +201,15 @@ jobs:
             osv-scanner -r project --format json > results/osv-scan.json || true
           fi
 
-
-
-
-
-      # ---------------- Merge SBOM counts ----------------
       # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
         run: |
-          # Trivy Counts (FIXED: use -r)
-          TL=$(jq -r '.LOW // 0' results/trivy_tmp.json)
-          TM=$(jq -r '.MEDIUM // 0' results/trivy_tmp.json)
-          TH=$(jq -r '.HIGH // 0' results/trivy_tmp.json)
-          TC=$(jq -r '.CRITICAL // 0' results/trivy_tmp.json)    
-          # OSV Counts (real severity from CVSS)
+          # Trivy Counts (crash-proof)
+          TL=$(jq -r '(.LOW // 0) | tonumber' results/trivy_tmp.json)
+          TM=$(jq -r '(.MEDIUM // 0) | tonumber' results/trivy_tmp.json)
+          TH=$(jq -r '(.HIGH // 0) | tonumber' results/trivy_tmp.json)
+          TC=$(jq -r '(.CRITICAL // 0) | tonumber' results/trivy_tmp.json)   
+          # OSV Counts (unchanged)
           OL=$(jq '[.results[].packages[].vulnerabilities[]? 
                     | (.severity[]?.score // "0") | tonumber 
                     | select(. < 4.0)] | length' results/osv-scan.json)      
@@ -218,9 +221,10 @@ jobs:
                     | select(. >= 7.0 and . < 9.0)] | length' results/osv-scan.json)      
           OC=$(jq '[.results[].packages[].vulnerabilities[]? 
                     | (.severity[]?.score // "0") | tonumber 
-                    | select(. >= 9.0)] | length' results/osv-scan.json)
+                    | select(. >= 9.0)] | length' results/osv-scan.json)     
           echo "$((TL+OL)),$((TM+OM)),$((TH+OH)),$((TC+OC))" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
+
 
 
       - name: Set artifact name
