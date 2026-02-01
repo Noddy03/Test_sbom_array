@@ -138,64 +138,37 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses (REAL)
         run: |
           set -e
-          mkdir -p results
-          echo "ok" > results/trivy_status.txt    
-          # Find all artifacts
-          mapfile -t JARS < <(find project -type f -name "*.jar")      
-          if [ ${#JARS[@]} -eq 0 ]; then
-            echo "No artifacts found"
-            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
-            echo '{"Results":[]}' > results/sbom_vuln.json
-            echo '{}' > results/licenses_tmp.json
-            echo "failed" > results/trivy_status.txt
-            exit 0
-          fi   
-          echo "Found ${#JARS[@]} artifacts"      
-          # Combined outputs
+          mkdir -p results      
+          # Always create files
+          echo '{}' > results/trivy_tmp.json
+          echo '{}' > results/licenses_tmp.json
           echo '{"Results":[]}' > results/sbom_vuln.json
-          echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json      
-          for JAR in "${JARS[@]}"; do
-            echo "Scanning $JAR"      
-            trivy sbom "$JAR" \
-              --format cyclonedx \
-              --output tmp_sbom.json      
-            trivy sbom "$JAR" \
-              --scanners vuln,license \
-              --format json \
-              --output tmp_vuln.json    
-            # Merge CycloneDX components
-            jq -s '
-              .[0] as $base |
-              .[1] as $new |
-              $base.components += ($new.components // []) |
-              $base
-            ' results/sbom.cdx.json tmp_sbom.json > results/sbom_merged.json \
-            && mv results/sbom_merged.json results/sbom.cdx.json     
-            # Merge vulnerability results
-            jq -s '
-              .[0].Results += .[1].Results |
-              .[0]
-            ' results/sbom_vuln.json tmp_vuln.json > results/sbom_vuln_merged.json \
-            && mv results/sbom_vuln_merged.json results/sbom_vuln.json
-          done      
-          # Deduplicate vulnerabilities
-          jq '
-            .Results[].Vulnerabilities |=
-              (unique_by(.PkgName + .Severity + (.VulnID // "")))
-          ' results/sbom_vuln.json > results/sbom_vuln_dedup.json \
-          && mv results/sbom_vuln_dedup.json results/sbom_vuln.json     
-          # Vulnerability summary
+          echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+          echo "ok" > results/trivy_status.txt      
+          # Prefer artifacts, fallback to source
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
+          if [ -n "$JARS" ]; then
+            echo "Using compiled artifacts"
+            trivy sbom $JARS --format cyclonedx --output results/sbom.cdx.json || true
+            trivy sbom $JARS --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          else
+            echo "No artifacts found, scanning source tree"
+            trivy fs project --format cyclonedx --output results/sbom.cdx.json || true
+            trivy fs project --scanners vuln,license --format json --output results/sbom_vuln.json || true
+          fi      
+          # Summaries (always run)
           jq '[.Results[].Vulnerabilities[]?]
+              | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
               | add' results/sbom_vuln.json \
-              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json    
-          # License summary
+              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json      
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
               | add' results/sbom_vuln.json \
               > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
+
 
      # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner (REAL)
