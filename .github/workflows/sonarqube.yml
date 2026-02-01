@@ -153,44 +153,62 @@ jobs:
           semgrep --config p/security-audit --config p/owasp-top-ten --config p/$LANG_LOWER --json > results/semgrep.json || echo '{"results":[]}' > results/semgrep.json
 
        # ---------------- SBOM + Trivy + OSV ----------------
-      - name: Trivy vulnerabilities + licenses
+    # ---------------- BUILD ARTIFACT ----------------
+      - name: Build artifact
         run: |
-          mkdir -p results
-          echo "ok" > results/trivy_status.txt 
-          # Main Trivy output (MATCHES downstream expectations)
-          trivy fs project \
-            --scanners vuln,license \
-            --format json \
-            --output results/sbom_vuln.json \
-            || echo "failed" > results/trivy_status.txt      
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests package
+          fi
+      
+      # ---------------- REAL SBOM + VULNS + LICENSES ----------------
+      - name: Trivy SBOM + vulnerabilities + licenses (REAL)
+        run: |
+          set -e
+          mkdir -p results      
+          JAR=$(ls project/target/*.jar | head -n 1)    
+          if [ -z "$JAR" ]; then
+            echo "No artifact found"
+            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+            echo '{"Results":[]}' > results/sbom_vuln.json
+            echo '{}' > results/licenses_tmp.json
+            echo "failed" > results/trivy_status.txt
+            exit 0
+          fi     
+          echo "Scanning artifact: $JAR"
+          echo "ok" > results/trivy_status.txt      
+          # Real SBOM
+          trivy sbom "$JAR" --format cyclonedx --output results/sbom.cdx.json     
+          # Real vulnerabilities + licenses
+          trivy sbom "$JAR" --scanners vuln,license --format json --output results/sbom_vuln.json    
           # Vulnerability summary
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
               | add' results/sbom_vuln.json \
-              > results/vuln_summary.json || echo '{}' > results/vuln_summary.json     
-          # License summary (MATCHES summary job)
+              > results/vuln_summary.json || echo '{}' > results/vuln_summary.json   
+          # License summary
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
               | add' results/sbom_vuln.json \
               > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
-
-
-      - name: Generate SBOM (compliance only)
-        run: |
-          mkdir -p results
-          trivy fs project --format cyclonedx --output results/sbom.cdx.json || \
-            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
       
-      - name: OSV scan
+      # ---------------- REAL OSV ----------------
+      - name: OSV scan (REAL)
         run: |
-          mkdir -p results
-          echo "ok" > results/osv_status.txt    
-          osv-scanner -r project --format json \
-            > results/osv-scan.json \
-            || echo "failed" > results/osv_status.txt
+          set -e
+          mkdir -p results  
+          JAR=$(ls project/target/*.jar | head -n 1)   
+          if [ -z "$JAR" ]; then
+            echo '{"results":[]}' > results/osv-scan.json
+            echo "failed" > results/osv_status.txt
+            exit 0
+          fi      
+          echo "ok" > results/osv_status.txt
+          osv-scanner --scan-file "$JAR" --format json > results/osv-scan.json
+
 
 
         
