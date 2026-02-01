@@ -135,39 +135,46 @@ jobs:
           fi
 
      # ---------------- SBOM - Trivy ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses
+      - name: Trivy SBOM + vulnerabilities + licenses (REAL)
         run: |
-          mkdir -p results
-          echo "ok" > results/trivy_status.txt
-          cd project   
-          trivy fs . \
-            --scanners vuln,license \
-            --format json \
-            --output ../results/sbom_vuln.json \
-            || echo "failed" > ../results/trivy_status.txt     
+          set -e
+          mkdir -p results    
+          JAR=$(ls project/target/*.jar | head -n 1)      
+          if [ -z "$JAR" ]; then
+            echo '{"Results":[]}' > results/sbom_vuln.json
+            echo '{}' > results/licenses_tmp.json
+            echo '{"bomFormat":"CycloneDX","components":[]}' > results/sbom.cdx.json
+            echo "failed" > results/trivy_status.txt
+            exit 0
+          fi      
+          echo "ok" > results/trivy_status.txt      
+          trivy sbom "$JAR" --format cyclonedx --output results/sbom.cdx.json
+          trivy sbom "$JAR" --scanners vuln,license --format json --output results/sbom_vuln.json    
           jq '[.Results[].Vulnerabilities[]?]
               | unique_by(.PkgName + .Severity + (.VulnID // ""))
               | group_by(.Severity)
               | map({(.[0].Severity): length})
-              | add' ../results/sbom_vuln.json \
-              > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json      
+              | add' results/sbom_vuln.json \
+              > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json    
           jq '[.Results[].Licenses[]?]
               | group_by(.License)
               | map({(.[0].License): length})
-              | add' ../results/sbom_vuln.json \
-              > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json      
-          trivy fs . --format cyclonedx \
-            --output ../results/sbom.cdx.json \
-            || echo "failed" > ../results/trivy_status.txt
+              | add' results/sbom_vuln.json \
+              > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
      # ---------------- OSV-Scanner ----------------
-      - name: OSV-Scanner
+      - name: OSV-Scanner (REAL)
         run: |
           mkdir -p results
-          echo "ok" > results/osv_status.txt    
-          osv-scanner -r project --format json \
-            > results/osv-scan.json \
-            || echo "failed" > results/osv_status.txt
+          JAR=$(ls project/target/*.jar | head -n 1)      
+          if [ -z "$JAR" ]; then
+            echo '{"results":[]}' > results/osv-scan.json
+            echo "failed" > results/osv_status.txt
+            exit 0
+          fi      
+          echo "ok" > results/osv_status.txt
+          osv-scanner --scan-file "$JAR" --format json > results/osv-scan.json
+
 
 
 
