@@ -187,6 +187,16 @@ jobs:
               --output results/sbom_vuln.json || true
           fi
 
+    # ---------------- Build Trivy severity summary ----------------
+      - name: Build Trivy severity summary
+        run: |
+          jq '[.Results[].Vulnerabilities[]?]
+              | unique_by(.PkgName + .Severity + (.VulnID // ""))
+              | group_by(.Severity)
+              | map({(.[0].Severity): length})
+              | add // {}' results/sbom_vuln.json \
+            > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
+      
 
 
      # ---------------- OSV-Scanner ----------------
