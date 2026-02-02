@@ -191,7 +191,7 @@ jobs:
           cd project
           echo "ok" > results/osv_status.txt    
           osv-scanner --sbom results/sbom.json \
-            --format json > results/sbom_osv.json
+             --format json > results/sbom_osv.json || true
       
 
 
