@@ -184,17 +184,20 @@ jobs:
         run: |
           jq '
             [.Results[].Vulnerabilities[]?]
-            | if length == 0 then {} else
+            | if length == 0 then
+                {}
+              else
                 unique_by(.PkgName + .Severity + (.VulnID // ""))
                 | group_by(.Severity)
                 | map({(.[0].Severity): length})
                 | add
               end
-          ' results/sbom_vuln.json > results/trivy_tmp.json || true 
-          # HARD GUARD: if not valid JSON, overwrite
-          if ! jq empty results/trivy_tmp.json 2>/dev/null; then
+          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json    
+          # FORCE object, even if jq returned []
+          if jq 'type!="object"' results/trivy_tmp.json >/dev/null 2>&1; then
             echo '{}' > results/trivy_tmp.json
           fi
+
 
 
       
