@@ -117,17 +117,16 @@ jobs:
             cp pom.xml results/pom.xml
           fi
      
-      - name: Resolve Python dependencies (safe)
+      - name: Resolve Python dependencies (real & safe)
         run: |
           cd project
           python -m venv venv
           source venv/bin/activate
           if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+            pip install -r requirements.txt || true
           elif [ -f pyproject.toml ]; then
-            pip install -r <(grep -E "^[a-zA-Z0-9]" pyproject.toml || true)
+            pip install . || true
           fi
-
 
       - name: Resolve Maven dependencies (best effort)
         run: |
