@@ -154,16 +154,31 @@ jobs:
                 package || true
           fi
 
+      - name: Export Maven dependency graph (REAL)
+        run: |
+          cd project
+          mvn -B dependency:tree \
+            -DoutputType=json \
+            -DoutputFile=results/maven-deps.json || true
 
-      - name: SCA (direct vulnerability scanning)
+
+      - name: SCA (REAL Java + Python)
         run: |
           cd project
           echo "ok" > results/sca_status.txt
-          echo "ok" > results/trivy_status.txt   
-          trivy fs . \
-            --scanners vuln \
-            --format json \
-            --output results/sca.json
+          echo "ok" > results/trivy_status.txt  
+          if [ "${{ inputs.language }}" = "Python" ]; then
+            trivy fs . \
+              --scanners vuln \
+              --format json \
+              --output results/sca.json
+          else
+            trivy fs ~/.m2 \
+              --scanners vuln \
+              --format json \
+              --output results/sca.json
+          fi
+
 
 
 
@@ -182,18 +197,19 @@ jobs:
 
     
       # ---------------- SBOM ----------------
-      - name: SBOM generation (real, compatible) (FIXED)
+      - name: SBOM generation (REAL)
         run: |
-          cd project   
+          cd project
           if [ "${{ inputs.language }}" = "Python" ]; then
             source venv/bin/activate
-            pip install cyclonedx-bom      
+            pip install cyclonedx-bom
             cyclonedx-py environment -o results/sbom.json
           else
-            trivy fs . \
+            trivy fs ~/.m2 \
               --format cyclonedx \
               --output results/sbom.json
           fi
+
 
 
 
@@ -222,22 +238,20 @@ jobs:
           fi
 
       # ---------------- REAL OSV ----------------
-      - name: OSV scan (REAL for Java)
+      - name: OSV scan (REAL)
         run: |
           cd project
-          echo "ok" > results/osv_status.txt       
+          echo "ok" > results/osv_status.txt    
           if [ "${{ inputs.language }}" = "Python" ]; then
             osv-scanner \
               --lockfile results/python_lock.txt \
               --format json > results/sbom_osv.json || true
           else
-            JARS=$(find . -type f -name "*.jar" | head -n 10)
-            if [ -n "$JARS" ]; then
-              osv-scanner --scan-file $JARS --format json > results/sbom_osv.json || true
-            else
-              osv-scanner -r . --format json > results/sbom_osv.json || true
-            fi
+            osv-scanner \
+              --maven results/maven-deps.json \
+              --format json > results/sbom_osv.json || true
           fi
+
 
 
       
