@@ -163,14 +163,13 @@ jobs:
 
     
       # ---------------- SBOM ----------------
-      # ---------------- REAL SBOM (LANGUAGE-AWARE) ----------------
       - name: SBOM generation (real)
         run: |
-          cd project      
+          cd project    
           if [ "${{ inputs.language }}" = "Python" ]; then
             source venv/bin/activate
             pip install cyclonedx-bom
-            cyclonedx-py \
+            cyclonedx-py venv \
               --format json \
               --output results/sbom.json      
           else
@@ -179,6 +178,7 @@ jobs:
               --format cyclonedx \
               --output results/sbom.json
           fi
+
 
 
 
