@@ -193,21 +193,31 @@ jobs:
              --format json > results/sbom_osv.json || true
       
       # ---------------- REAL MERGE (FIXED) ----------------
-      - name: Merge SBOM counts (null-safe final)
+      - name: Merge SBOM counts (100% empty-safe)
         run: |
           cd project
+          # Extract CVEs (may be empty)
           jq -r '.Results[]?.Vulnerabilities[]?.VulnID' \
             results/sca.json > results/trivy_cves.txt || true
           jq -r '.results[].packages[].vulnerabilities[]?.id' \
             results/sbom_osv.json > results/osv_cves.txt || true
+          # Merge
           cat results/trivy_cves.txt results/osv_cves.txt \
             | sort -u > results/merged_cves.txt
-          jq -Rn '[inputs]' results/merged_cves.txt \
-            > results/merged_cves.json
+          # If no CVEs at all → short-circuit
+          if [ ! -s results/merged_cves.txt ]; then
+            echo '{"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0}' > results/sbom_counts.json
+            echo "0,0,0,0" > results/sbom_counts.txt
+            exit 0
+          fi
+          # Build severity map (may also be empty)
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | map({id:.VulnID, sev:(.Severity // "LOW")})
           ' results/sca.json > results/severity_map.json
+          # Now safe merge
+          jq -Rn '[inputs]' results/merged_cves.txt \
+            > results/merged_cves.json
           jq -s '
             reduce .[0][] as $cve (
               {"LOW":0,"MEDIUM":0,"HIGH":0,"CRITICAL":0};
@@ -220,10 +230,6 @@ jobs:
             > results/sbom_counts.json
           jq -r '[.LOW,.MEDIUM,.HIGH,.CRITICAL] | @csv' \
             results/sbom_counts.json > results/sbom_counts.txt
-
-
-
-
 
 
       - name: Set artifact name
