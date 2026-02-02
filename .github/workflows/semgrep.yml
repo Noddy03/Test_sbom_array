@@ -105,43 +105,73 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
+     
       # ---------------- JAVA ----------------
+     
       - name: Resolve Java dependencies
         if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
           if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
-
+      
       # ---------------- PYTHON ----------------
-      - name: Resolve Python dependencies
+      
+      - name: Resolve Python dependencies (fixed)
         if: ${{ inputs.language == 'Python' }}
         run: |
           cd project
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          if [ -f pyproject.toml ]; then pip install . || true; fi
-          deactivate
-
-      # ---------------- SCA - Trivy ----------------
-      - name: Trivy Dependency SCA (REAL)
+          pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt --target deps || true
+          fi
+          if [ -f pyproject.toml ]; then
+            pip install . --target deps || true
+          fi
+      
+      # ---------------- BUILD ----------------
+      - name: Build artifact
+        if: ${{ inputs.language == 'Java' }}
+        run: |
+          cd project
+          mvn -B -DskipTests package || true
+      
+      # ---------------- SCA - Trivy (REAL) ----------------
+      
+      # Java SCA (scan real JARs)
+      - name: Trivy Dependency SCA (Java)
+        if: ${{ inputs.language == 'Java' }}
         run: |
           mkdir -p results
-          echo "ok" > results/sca_status.txt
-          cd project      
-          trivy fs . \
+          echo "ok" > results/sca_status.txt 
+          trivy fs project/target \
             --scanners vuln \
-            --include-dev-deps \
             --format json \
             --ignore-unfixed \
-            --output ../results/trivy_sca.json \
-            || echo "failed" > ../results/sca_status.txt
+            --output results/trivy_sca.json \
+            || echo "failed" > results/sca_status.txt
+      
+      # Python SCA (scan installed deps)
+      - name: Trivy Dependency SCA (Python)
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          mkdir -p results
+          echo "ok" > results/sca_status.txt      
+          trivy fs project/deps \
+            --scanners vuln \
+            --format json \
+            --ignore-unfixed \
+            --output results/trivy_sca.json \
+            || echo "failed" > results/sca_status.txt
+
 
 
       # ---------------- SCA - Unique CVEs ----------------
       - name: Build SCA unique CVE summary
         run: |
+          if ! jq empty results/trivy_sca.json 2>/dev/null; then
+            echo '{}' > results/sca_unique.json
+            exit 0
+          fi
           jq '
             [.Results[]?.Vulnerabilities[]?]
             | unique_by(.VulnID)
@@ -150,15 +180,7 @@ jobs:
             | add
           ' results/trivy_sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
 
-
-      - name: Build artifact
-        if: ${{ inputs.language == 'Java' }}
-        run: |
-          cd project
-          mvn -B -DskipTests package || true
-
-
-     # ---------------- SBOM - Trivy ----------------
+      # ---------------- SBOM - Trivy ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (FINAL, CORRECT)
         run: |
           set -e
@@ -172,12 +194,31 @@ jobs:
             --format cyclonedx \
             --output results/sbom.cdx.json || true
 
+      - name: Build license summary
+        run: |
+          if ! jq empty results/sbom_vuln.json 2>/dev/null; then
+            echo '{}' > results/licenses_tmp.json
+            exit 0
+          fi
+          jq '
+            [.Results[]?.Licenses[]?]
+            | map(.Name)
+            | group_by(.)
+            | map({(.[0]): length})
+            | add
+          ' results/sbom_vuln.json > results/licenses_tmp.json || echo '{}' > results/licenses_tmp.json
 
-    # ---------------- Build Trivy severity summary ----------------
+
+
+      # ---------------- Build Trivy severity summary ----------------
       - name: Build Trivy severity summary
         run: |
+          if ! jq empty results/sbom_vuln.json 2>/dev/null; then
+            echo '{}' > results/trivy_tmp.json
+            exit 0
+          fi
           jq '
-            [.Results[].Vulnerabilities[]?]
+            [.Results[]?.Vulnerabilities[]?]
             | if length == 0 then
                 {}
               else
@@ -186,15 +227,9 @@ jobs:
                 | map({(.[0].Severity): length})
                 | add
               end
-          ' results/sbom_vuln.json 2>/dev/null \
-          | jq 'select(type=="object")' \
-          > results/trivy_tmp.json  
-          # Absolute hard guard
-          if [ ! -s results/trivy_tmp.json ]; then
-            echo '{}' > results/trivy_tmp.json
-          fi
+          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json
 
-     # ---------------- OSV-Scanner ----------------
+      # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner (bulletproof)
         run: |
           mkdir -p results
