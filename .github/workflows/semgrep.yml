@@ -44,7 +44,7 @@ jobs:
                   if os.environ["LANG"].lower() == "java":
                       files = ["pom.xml"]
                   elif os.environ["LANG"].lower() == "python":
-                      files = ["requirements.txt", "pyproject.toml", "setup.py"]
+                      files = ["requirements.txt", "pyproject.toml", "setup.py", "poetry.lock", "pdm.lock"]
                   found = False
                   for f in files:
                       if requests.get(
@@ -127,13 +127,20 @@ jobs:
           elif [ -f pyproject.toml ]; then
             pip install . || true
           fi
-      - name: Freeze Python dependency graph (FIX)
+      - name: Freeze Python dependency graph (REAL FIX)
         run: |
           cd project
-          if [ -d venv ]; then
+          if [ -f poetry.lock ]; then
+            cp poetry.lock results/python_lock.txt
+          elif [ -f pdm.lock ]; then
+            cp pdm.lock results/python_lock.txt
+          elif [ -f requirements.txt ]; then
+            cp requirements.txt results/python_lock.txt
+          else
             source venv/bin/activate
             pip freeze > results/python_lock.txt
           fi
+
 
       - name: Resolve Maven dependencies (best effort)
         run: |
