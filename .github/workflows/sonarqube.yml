@@ -247,11 +247,12 @@ jobs:
               elif $s < 9 then "HIGH"
               else "CRITICAL" end
             | . + "|" + $pkg + ":" + .id
-          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt    
-          grep '^LOW|' osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
-          grep '^MEDIUM|' osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
-          grep '^HIGH|' osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
-          grep '^CRITICAL|' osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt    
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt  
+          mv osv_mapped.txt results/
+          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
+          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
+          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
+          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
           # -------- Merge correctly (same severity only) --------
           SB_L=$(cat trivy_low.txt osv_low.txt | sort -u | wc -l)
           SB_M=$(cat trivy_med.txt osv_med.txt | sort -u | wc -l)
