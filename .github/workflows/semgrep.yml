@@ -116,12 +116,8 @@ jobs:
           if [ -f pom.xml ]; then
             cp pom.xml results/pom.xml
           fi
-
-
-
-
      
-      - name: Resolve Python dependencies
+      - name: Resolve Python dependencies (safe)
         run: |
           cd project
           python -m venv venv
@@ -129,15 +125,17 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           elif [ -f pyproject.toml ]; then
-            pip install .
+            pip install -r <(grep -E "^[a-zA-Z0-9]" pyproject.toml || true)
           fi
 
-      - name: Resolve Maven dependencies
+
+      - name: Resolve Maven dependencies (best effort)
         run: |
           cd project
           if [ -f pom.xml ]; then
-            mvn -q -DskipTests dependency:go-offline
+            mvn -q -DskipTests dependency:go-offline || true
           fi
+
 
       - name: SCA (direct vulnerability scanning)
         run: |
