@@ -192,11 +192,14 @@ jobs:
                 | map({(.[0].Severity): length})
                 | add
               end
-          ' results/sbom_vuln.json > results/trivy_tmp.json || echo '{}' > results/trivy_tmp.json    
-          # FORCE object, even if jq returned []
-          if jq 'type!="object"' results/trivy_tmp.json >/dev/null 2>&1; then
+          ' results/sbom_vuln.json 2>/dev/null \
+          | jq 'select(type=="object")' \
+          > results/trivy_tmp.json  
+          # Absolute hard guard
+          if [ ! -s results/trivy_tmp.json ]; then
             echo '{}' > results/trivy_tmp.json
           fi
+
 
 
 
