@@ -163,12 +163,23 @@ jobs:
 
     
       # ---------------- SBOM ----------------
-      - name: SBOM generation (ground truth)
+      # ---------------- REAL SBOM (LANGUAGE-AWARE) ----------------
+      - name: SBOM generation (real)
         run: |
-          cd project
-          trivy fs . \
-            --format cyclonedx \
-            --output results/sbom.json
+          cd project      
+          if [ "${{ inputs.language }}" = "Python" ]; then
+            source venv/bin/activate
+            pip install cyclonedx-bom
+            cyclonedx-py \
+              --format json \
+              --output results/sbom.json      
+          else
+            # Java / others
+            trivy fs . \
+              --format cyclonedx \
+              --output results/sbom.json
+          fi
+
 
 
       - name: License scanning (real)
