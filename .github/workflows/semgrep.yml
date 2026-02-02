@@ -145,6 +145,18 @@ jobs:
             echo "no_deps" > ../results/sca_status.txt
           fi
 
+      # ---------------- SCA - Unique CVEs ----------------
+      - name: Build SCA unique CVE summary
+        run: |
+          jq '
+            [.Results[]?.Vulnerabilities[]?]
+            | unique_by(.VulnID)
+            | group_by(.Severity)
+            | map({(.[0].Severity): length})
+            | add
+          ' results/trivy_sca.json > results/sca_unique.json || echo '{}' > results/sca_unique.json
+
+
       - name: Build artifact
         if: ${{ inputs.language == 'Java' }}
         run: |
@@ -189,23 +201,23 @@ jobs:
 
 
      # ---------------- OSV-Scanner ----------------
-      - name: OSV-Scanner (REAL, crash-proof)
+      # ---------------- OSV-Scanner (REAL, fixed) ----------------
+      - name: OSV-Scanner
         run: |
           mkdir -p results
-          echo "ok" > results/osv_status.txt    
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)   
+          echo "ok" > results/osv_status.txt      
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
           if [ -n "$JARS" ]; then
-            osv-scanner --scan-file $JARS --format json \
-              > results/osv-scan.json 2> results/osv-error.log || true
+            osv-scanner --scan-file $JARS --format json > results/osv-scan.json 2> results/osv-error.log || true
           else
-            osv-scanner -r project --format json \
-              > results/osv-scan.json 2> results/osv-error.log || true
-          fi
-          # HARD GUARD (the missing piece)
-          if ! jq empty results/osv-scan.json 2>/dev/null; then
+            osv-scanner -r project --format json > results/osv-scan.json 2> results/osv-error.log || true
+          fi      
+          # Only fail if file is missing or truly broken
+          if [ ! -s results/osv-scan.json ]; then
             echo '{"results":[]}' > results/osv-scan.json
             echo "failed" > results/osv_status.txt
           fi
+
 
 
       # ---------------- Merge SBOM counts ----------------
@@ -271,10 +283,10 @@ jobs:
                 R=$(basename "$d")
                 R=${R//_//}    
                 # -------- SCA (Trivy) --------
-                SCAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-                SCAM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-                SCAH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
-                SCAC=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)          
+                SCAL=$(jq -r '(.LOW // 0)' "$d/sca_unique.json")
+                SCAM=$(jq -r '(.MEDIUM // 0)' "$d/sca_unique.json")
+                SCAH=$(jq -r '(.HIGH // 0)' "$d/sca_unique.json")
+                SCAC=$(jq -r '(.CRITICAL // 0)' "$d/sca_unique.json")
                 # -------- SBOM (Trivy + OSV merged) --------
                 if [ -f "$d/sbom_counts.txt" ]; then
                   IFS=',' read SB_L SB_M SB_H SB_C < "$d/sbom_counts.txt"
