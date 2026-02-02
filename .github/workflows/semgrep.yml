@@ -200,31 +200,25 @@ jobs:
             echo '{}' > results/trivy_tmp.json
           fi
 
-
-
-
-      
-
-
      # ---------------- OSV-Scanner ----------------
-      # ---------------- OSV-Scanner (REAL, fixed) ----------------
-      - name: OSV-Scanner
+      - name: OSV-Scanner (bulletproof)
         run: |
           mkdir -p results
-          echo "ok" > results/osv_status.txt      
+          echo "ok" > results/osv_status.txt     
+          TMP=$(mktemp)      
           JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
           if [ -n "$JARS" ]; then
-            osv-scanner --scan-file $JARS --format json > results/osv-scan.json 2> results/osv-error.log || true
+            osv-scanner --scan-file $JARS --format json > "$TMP" 2>/dev/null || true
           else
-            osv-scanner -r project --format json > results/osv-scan.json 2> results/osv-error.log || true
+            osv-scanner -r project --format json > "$TMP" 2>/dev/null || true
           fi      
-          # Only fail if file is missing or truly broken
-          if [ ! -s results/osv-scan.json ]; then
+          # Accept only real JSON
+          if jq 'type=="object"' "$TMP" >/dev/null 2>&1; then
+            mv "$TMP" results/osv-scan.json
+          else
             echo '{"results":[]}' > results/osv-scan.json
             echo "failed" > results/osv_status.txt
           fi
-
-
 
       # ---------------- Merge SBOM counts ----------------
       - name: Merge SBOM counts
