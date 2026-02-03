@@ -127,29 +127,37 @@ jobs:
       - name: Trivy SBOM + vulnerabilities + licenses
         run: |
           mkdir -p results
-          cd project
+          cd project      
           # Create SBOM and capture vulnerabilities
-          trivy fs . --scanners vuln,license --format json --output ../results/sbom_vuln.json || true
-          
+          trivy fs . --scanners vuln,license --format json --output ../results/sbom_vuln.json || true          
           # Extract Trivy Counts
-          jq '[.Results[].Vulnerabilities[]?] | unique_by(.PkgName + .Severity + (.VulnID // "")) | group_by(.Severity) | map({(.[0].Severity): length}) | add' ../results/sbom_vuln.json > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json
-          
-          # Extract Licenses
-          jq '[.Results[].Licenses[]?] | group_by(.LicenseName) | map({(.[0].LicenseName): length}) | add' ../results/sbom_vuln.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
+          jq '[.Results[].Vulnerabilities[]?] 
+              | unique_by(.PkgName + .Severity + (.VulnID // "")) 
+              | group_by(.Severity) 
+              | map({(.[0].Severity): length}) 
+              | add // {}' \
+              ../results/sbom_vuln.json > ../results/trivy_tmp.json || echo '{}' > ../results/trivy_tmp.json          
+          # Extract Licenses (FIXED)
+          jq '[.Results[].Licenses[]? | select(.LicenseName != null)] 
+              | group_by(.LicenseName) 
+              | map({(.[0].LicenseName): length}) 
+              | add // {}' \
+              ../results/sbom_vuln.json > ../results/licenses_tmp.json || echo '{}' > ../results/licenses_tmp.json
+
       # ---------------- OSV-Scanner ----------------
       - name: OSV-Scanner (real dependency scan)
         run: |
           mkdir -p results
-          echo "ok" > results/osv_status.txt      
-          # Prefer built artifacts if present (better accuracy for Java)
+          echo "ok" > results/osv_status.txt          
           JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
           if [ -n "$JARS" ]; then
             echo "Scanning built artifacts"
-            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+            osv-scanner scan $JARS --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
           else
             echo "Scanning source tree"
-            osv-scanner -r project --format json > results/osv-scan.json || true
+            osv-scanner scan -r project --format json > results/osv-scan.json || echo '{"results":[]}' > results/osv-scan.json
           fi
+
 
       # ---------------- GLOBAL CVE DEDUPLICATION ----------------
       - name: Deduplicate CVEs across Trivy + OSV
