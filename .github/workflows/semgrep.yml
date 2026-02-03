@@ -78,9 +78,22 @@ jobs:
           cd project
           mkdir -p results
 
+      # Resolve once
+      - name: Resolve dependencies (industry realistic)
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests dependency:go-offline || true
+          fi
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt || true
+          fi
+
+
       # =======================
       # PIPELINE A — PURE SCA
       # =======================
+  
       - name: SCA (Direct Trivy)
         run: |
           cd project
@@ -103,15 +116,16 @@ jobs:
       # =======================
       # PIPELINE B — PURE SBOM
       # =======================
-      - name: Generate SBOM
+
+
+      - name: Generate SBOM (correct)
         run: |
           cd project
-          trivy sbom \
+          trivy fs . \
             --format cyclonedx \
-            --output results/sbom.json \
-            .
+            --output results/sbom.json
 
-      - name: SBOM-based vulnerability scan
+      - name: SBOM-based vulnerability scan (correct)
         run: |
           cd project
           trivy sbom results/sbom.json \
