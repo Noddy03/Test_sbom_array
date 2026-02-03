@@ -101,13 +101,15 @@ jobs:
       # =======================
       # PIPELINE A — REAL SCA
       # =======================
-      - name: SCA (Trivy on artifacts + source)
+      - name: SCA (Direct Trivy)
         run: |
           cd project
-          trivy fs project/target project \
+          trivy fs . \
             --scanners vuln \
             --format json \
             --output results/sca_direct.json
+
+
 
       - name: SCA summary
         run: |
@@ -123,12 +125,14 @@ jobs:
       # =======================
       # PIPELINE B — REAL SBOM
       # =======================
-      - name: Generate SBOM (from artifacts + source)
+      - name: Generate SBOM
         run: |
           cd project
-          trivy fs project/target project \
+          trivy fs . \
             --format cyclonedx \
             --output results/sbom.json
+
+
 
       - name: SBOM-based vulnerability scan
         run: |
@@ -137,6 +141,7 @@ jobs:
             --scanners vuln \
             --format json \
             --output results/sca_from_sbom.json
+
 
       - name: SBOM summary
         run: |
