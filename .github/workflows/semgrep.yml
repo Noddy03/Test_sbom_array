@@ -159,28 +159,35 @@ jobs:
             pip freeze > results/python_lock.txt
           fi
 
-
-     
-
+      # ---------------- SCA (REAL Java + Python) ----------------
       - name: SCA (REAL Java + Python)
         run: |
           cd project
           echo "ok" > results/sca_status.txt
-          echo "ok" > results/trivy_status.txt  
+          echo "ok" > results/trivy_status.txt     
           if [ "${{ inputs.language }}" = "Python" ]; then
             trivy fs . \
               --scanners vuln \
               --format json \
               --output results/sca.json
           else
-            trivy fs . ~/.m2 \
+            # Java project scan
+            trivy fs . \
               --scanners vuln \
               --format json \
-              --output results/sca.json
+              --output results/sca_proj.json      
+            # Maven cache scan
+            trivy fs ~/.m2 \
+              --scanners vuln \
+              --format json \
+              --output results/sca_m2.json     
+            # Merge both
+            jq -s '
+              {
+                Results: (.[0].Results + .[1].Results)
+              }
+            ' results/sca_proj.json results/sca_m2.json > results/sca.json
           fi
-
-
-
 
       # ---------------- SCA - Unique CVEs ----------------
       - name: Build SCA unique CVE summary
