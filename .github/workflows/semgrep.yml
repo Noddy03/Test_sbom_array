@@ -133,12 +133,28 @@ jobs:
 
     - name: Build summary.csv
       run: |
-        echo "repo,unique_cves" > summary.csv
-        for d in all_results/*; do
-          R=$(basename "$d")
-          COUNT=$(cat "$d/unique_cve_count.txt" | awk '{print $1}')
-          echo "$R,$COUNT" >> summary.csv
+        echo "repo,\
+        sca_low,sca_medium,sca_high,sca_critical,\
+        sbom_low,sbom_medium,sbom_high,sbom_critical,\
+        unique_cves" > summary.csv
+        
+            for d in all_results/*; do
+              R=$(basename "$d")
+        # -------- SCA (Trivy) --------
+        SCAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="LOW")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+        SCAM=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+        SCAH=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+        SCAC=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$d/trivy_sca.json" 2>/dev/null || echo 0)
+        # -------- SBOM (OSV normalized) --------
+        SB_L=$(grep LOW "$d/osv_severity_counts.txt" | awk '{print $1}' || echo 0)
+        SB_M=$(grep MEDIUM "$d/osv_severity_counts.txt" | awk '{print $1}' || echo 0)
+        SB_H=$(grep HIGH "$d/osv_severity_counts.txt" | awk '{print $1}' || echo 0)
+        SB_C=$(grep CRITICAL "$d/osv_severity_counts.txt" | awk '{print $1}' || echo 0)
+        # -------- Unique CVEs --------
+        UNIQUE=$(cat "$d/unique_cve_count.txt" | awk '{print $1}')  
+        echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$UNIQUE" >> summary.csv
         done
+
 
     - uses: actions/upload-artifact@v4
       with:
