@@ -118,42 +118,49 @@ jobs:
 
 
 
-      # ---------------- SCA - Trivy ----------------
-      - name: Trivy Dependency SCA
+           
+      # ---------------- DETERMINE REAL ARTIFACTS ----------------
+      - name: Resolve scan path
+        id: resolve
+        run: |
+          if [ "${{ inputs.language }}" = "Java" ]; then
+            JARS=$(find project -type f -path "*/target/*.jar")
+            if [ -z "$JARS" ]; then
+              echo "No jars built, falling back to full project"
+              SCAN_PATH="project"
+            else
+              SCAN_PATH=$(echo "$JARS" | xargs -n1 dirname | sort -u | tr '\n' ' ')
+            fi
+          else
+            SCAN_PATH="project/.venv"
+          fi
+          echo "scan_path=$SCAN_PATH" >> $GITHUB_OUTPUT
+
+      
+      # ---------------- SCA (TRIVY) ----------------
+      - name: Trivy SCA (real)
         run: |
           mkdir -p results
-          JARS=$(find project -type f -path "*/target/*.jar" 2>/dev/null)
-          if [ -n "$JARS" ]; then
-            trivy fs project --scanners vuln --format json \
-              --ignore-unfixed --output results/trivy_sca.json || \
-              echo '{"Results":[]}' > results/trivy_sca.json
-          elif [ -d project/.venv ]; then
-            trivy fs project/.venv --scanners vuln --format json \
-              --ignore-unfixed --output results/trivy_sca.json || \
-              echo '{"Results":[]}' > results/trivy_sca.json
-          else
+          trivy fs ${{ steps.resolve.outputs.scan_path }} \
+            --scanners vuln \
+            --ignore-unfixed \
+            --no-ignore \
+            --format json \
+            --output results/trivy_sca.json || \
             echo '{"Results":[]}' > results/trivy_sca.json
-          fi
-
-
-      # ---------------- SBOM - Trivy ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses
+      
+      # ---------------- SBOM (TRIVY) ----------------
+      - name: Trivy SBOM (vuln + license)
         run: |
-          mkdir -p results
-          JARS=$(find project -type f -path "*/target/*.jar" 2>/dev/null)    
-          if [ -n "$JARS" ]; then
-            trivy fs project --scanners vuln,license \
-              --format json --output results/sbom_vuln.json || true
-          elif [ -d project/.venv ]; then
-            trivy fs project/.venv --scanners vuln,license \
-              --format json --output results/sbom_vuln.json || true
-          else
+          trivy fs ${{ steps.resolve.outputs.scan_path }} \
+            --scanners vuln,license \
+            --no-ignore \
+            --format json \
+            --output results/sbom_vuln.json || \
             echo '{"Results":[]}' > results/sbom_vuln.json
-          fi
 
       - name: Extract licenses from Trivy SBOM
         run: |
-          mkdir -p results
           jq '
             .Results[]?.Licenses[]?.Name
           ' results/sbom_vuln.json 2>/dev/null | \
@@ -162,25 +169,15 @@ jobs:
           jq -s 'add' > results/licenses_tmp.json || \
           echo '{}' > results/licenses_tmp.json
 
-
-      # ---------------- OSV-Scanner ----------------
-      - name: OSV-Scanner (real dependency scan)
+      
+      # ---------------- OSV ----------------
+      - name: OSV-Scanner
         run: |
-          mkdir -p results
-          JARS=$(find project -type f -path "*/target/*.jar" 2>/dev/null | head -n 20)     
-          if [ -n "$JARS" ]; then
-            echo "Scanning Java artifacts:"
-            echo "$JARS"
-            osv-scanner scan $JARS --format json > results/osv-scan.json || \
-              echo '{"results":[]}' > results/osv-scan.json
-          elif [ -d project/.venv ]; then
-            echo "Scanning Python environment"
-            osv-scanner scan project/.venv --format json > results/osv-scan.json || \
-              echo '{"results":[]}' > results/osv-scan.json
-          else
+          osv-scanner scan ${{ steps.resolve.outputs.scan_path }} \
+            --no-ignore \
+            --format json \
+            > results/osv-scan.json || \
             echo '{"results":[]}' > results/osv-scan.json
-          fi
-
 
 
 
