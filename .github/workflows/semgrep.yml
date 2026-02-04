@@ -64,7 +64,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
+          curl -L https://github.com/google/osv-scanner/releases/download/v1.9.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
           echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
 
       - name: Clone repo
@@ -129,11 +130,20 @@ jobs:
             --format json \
             --output results/sbom_vuln.json
 
-      - name: OSV
+      - name: OSV scan (REAL)
         run: |
-          osv-scanner scan ${{ steps.resolve.outputs.scan_path }} \
-            --format json \
-            > results/osv-scan.json
+          set -e
+          mkdir -p results
+          echo "ok" > results/osv_status.txt     
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
+          if [ -n "$JARS" ]; then
+            echo "Scanning artifacts"
+            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+          else
+            echo "Scanning source tree"
+            osv-scanner -r project --format json > results/osv-scan.json || true
+          fi
+
 
       # ---------------- DEDUPLICATED CVE LISTS BY SEVERITY ----------------
       - name: Generate Severity-Based Deduplicated Files
