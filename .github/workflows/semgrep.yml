@@ -64,53 +64,32 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
-          curl -L https://github.com/google/osv-scanner/releases/download/v1.9.0/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
-          chmod +x /usr/local/bin/osv-scanner
-          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
+          sudo mv ~/go/bin/osv-scanner /usr/local/bin/osv-scanner
+
+          
 
       - name: Clone repo
-        run: git clone https://github.com/${{ matrix.repo }} project
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Build Java
-        if: inputs.language == 'Java'
+      - name: Install Java dependencies
+        if: ${{ inputs.language == 'Java' }}
         run: |
           cd project
-          mvn -B -DskipTests package || true
-      
-     
-
-      - name: Build Python (best effort)
-        if: inputs.language == 'Python'
+          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
+          if [ -f build.gradle ]; then ./gradlew build || true; fi
+      - name: Python deps (best effort)
+        if: ${{ inputs.language == 'Python' }}
         run: |
-          mkdir -p results
           cd project
           python3 -m venv .venv
-          source .venv/bin/activate  
-          pip install -U pip setuptools wheel || true    
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          fi      
-          if [ -f pyproject.toml ]; then
-            pip install . || true
-          fi      
-          pip freeze > ../results/requirements.lock.txt || true
-          deactivate || true
+          source .venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
 
-
-      - name: Resolve scan path
-        id: resolve
-        run: |
-          if [ "${{ inputs.language }}" = "Java" ]; then
-            JARS=$(find project -name "*.jar")
-            if [ -z "$JARS" ]; then
-              SCAN_PATH="project"
-            else
-              SCAN_PATH=$(echo "$JARS" | xargs -n1 dirname | sort -u | tr '\n' ' ')
-            fi
-          else
-            SCAN_PATH="project"
-          fi
-          echo "scan_path=$SCAN_PATH" >> $GITHUB_OUTPUT
 
 
 
@@ -118,18 +97,56 @@ jobs:
       - name: Trivy SCA
         run: |
           mkdir -p results
-          trivy fs ${{ steps.resolve.outputs.scan_path }} \
+          trivy fs project \
             --scanners vuln \
             --format json \
             --output results/trivy_sca.json
 
-      - name: Trivy SBOM
+      - name: Deduplicate SCA
         run: |
-          trivy fs ${{ steps.resolve.outputs.scan_path }} \
+          for sev in LOW MEDIUM HIGH CRITICAL; do
+            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
+              results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
+          done
+
+      
+      - name: Build artifact (best effort, safe)
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
+          fi
+      
+      # ---------------- REAL SBOM + VULNS + LICENSES ----------------
+      - name: Trivy SBOM + vulnerabilities + licenses (correct)
+        run: |
+          set -e
+          mkdir -p results
+          echo "ok" > results/trivy_status.txt        
+          trivy fs project \
             --scanners vuln,license \
             --format json \
-            --output results/sbom_vuln.json
+            --output results/sbom_vuln.json || true     
+          trivy fs project \
+            --format cyclonedx \
+            --output results/sbom.cdx.json || true
 
+      - name: Extract license counts
+        run: |
+          jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
+          sort | uniq -c |
+          awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
+          sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
+
+
+      
+      # ---------------- REAL OSV ----------------
       - name: OSV scan (REAL)
         run: |
           set -e
@@ -137,44 +154,51 @@ jobs:
           echo "ok" > results/osv_status.txt     
           JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
           if [ -n "$JARS" ]; then
-            echo "Scanning artifacts"
-            osv-scanner --scan-file $JARS --format json > results/osv-scan.json || true
+            osv-scanner scan $JARS --format json > results/osv-scan.json || true 
           else
-            echo "Scanning source tree"
-            osv-scanner -r project --format json > results/osv-scan.json || true
+            osv-scanner scan project/pom.xml project/requirements.txt --format json > results/osv-scan.json || true 
           fi
 
-
-      # ---------------- DEDUPLICATED CVE LISTS BY SEVERITY ----------------
-      - name: Generate Severity-Based Deduplicated Files
+        
+     # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
+      - name: Merge SBOM counts
         run: |
-          mkdir -p results
-          # --- 1. SCA DEDUPLICATION (By Severity) ---
-          for sev in LOW MEDIUM HIGH CRITICAL; do
-            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac         
-            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
-              results/trivy_sca.json | sort -u | grep -v '^$' > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
-          done
-          # --- 2. SBOM DEDUPLICATION (By Severity: Trivy SBOM + OSV) ---
-          for sev in LOW MEDIUM HIGH CRITICAL; do
-            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac                       
-            # A. Get Trivy SBOM IDs
-            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
-              results/sbom_vuln.json > temp_ids.txt || touch temp_ids.txt        
-            # B. Get Robust OSV IDs
-            jq -r --arg sev "$sev" '
-              .results[].packages[].vulnerabilities[]? 
-              | select(
-                  .database_specific.severity == $sev or 
-                  ((.severity[]? | select(.type=="CVSS_V3" or .type=="CVSS_V2") | .score | tonumber) as $s | 
-                   if $s < 4 then "LOW" elif $s < 7 then "MEDIUM" elif $s < 9 then "HIGH" else "CRITICAL" end == $sev)
-                ) | .id' results/osv-scan.json >> temp_ids.txt || touch temp_ids.txt           
-            # C. Save unique IDs to the file the summary expects
-            sort -u temp_ids.txt | grep -v '^$' > results/vulnerability_sbom_$s.txt || touch results/vulnerability_sbom_$s.txt
-          done
+          mkdir -p results    
+          # -------- Trivy IDs by severity --------
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") | .PkgName + ":" + .VulnID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
+          # -------- OSV mapped to severity via CVSS --------
+          jq -r '
+            .results[].packages[]?
+            | .package.name as $pkg
+            | .vulnerabilities[]?
+            | ( [.severity[]? | select(.type=="CVSS_V3") | .score | tonumber] | max // 0 ) as $s
+            | if $s < 4 then "LOW"
+              elif $s < 7 then "MEDIUM"
+              elif $s < 9 then "HIGH"
+              else "CRITICAL" end
+            | . + "|" + $pkg + ":" + .id
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt
+          mv osv_mapped.txt results/
+          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
+          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
+          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
+          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
+          # -------- Merge correctly and SAVE to files in results folder --------
+          cat trivy_low.txt osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
+          cat trivy_med.txt osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
+          cat trivy_high.txt osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
+          cat trivy_crit.txt osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
+          # -------- Count the lines from the saved files --------
+          SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
+          SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
+          SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
           echo "generated" > results/sbom_status.txt
-          rm -f temp_ids.txt
-          
+            
       - name: Set artifact name
         id: set_artifact
         run: |
