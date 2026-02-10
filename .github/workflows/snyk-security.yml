@@ -3,60 +3,25 @@ name: Security Scan – Trivy SCA + SBOM + TEST
 on:
   workflow_dispatch:
     inputs:
+      src_repository:
+        description: 'Source Repository (e.g., user/repo)'
+        required: true
       language:
         description: 'Choose language to scan'
         required: true
         default: 'Java'
-      top_n:
-        description: 'Number of repositories to scan'
-        required: false
-        default: '5'
 
 permissions:
   contents: read
   security-events: write
 
 jobs:
-  fetch_repos:
-    runs-on: ubuntu-latest
-    outputs:
-      repos: ${{ steps.fetch.outputs.repos }}
-    steps:
-      - id: fetch
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LANG: ${{ inputs.language }}
-          TOP_N: ${{ inputs.top_n }}
-        run: |
-          python3 <<'EOF'
-          import os, requests, json, urllib.parse, time
-          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
-          repos = []
-          page = 1
-          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
-              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
-              r = requests.get(url, headers=headers)
-              for repo in r.json().get("items", []):
-                  files = ["pom.xml"] if os.environ["LANG"].lower()=="java" else ["requirements.txt","pyproject.toml","setup.py"]
-                  for f in files:
-                      if requests.get(f"https://api.github.com/repos/{repo['full_name']}/contents/{f}", headers=headers).status_code==200:
-                          repos.append(repo["full_name"])
-                          break
-                  if len(repos) >= int(os.environ["TOP_N"]):
-                      break
-              page += 1
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"repos={json.dumps(repos)}\n")
-          EOF
   scan_repo:
-    needs: fetch_repos
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
-
-
+        repo: ${{ inputs.src_repository }}
     steps:
       - name: Install tools
         run: |
@@ -69,7 +34,7 @@ jobs:
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ inputs.src_repository }} project
 
       - name: Install Java dependencies
         if: ${{ inputs.language == 'Java' }}
@@ -86,25 +51,6 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
-      # -------- Trivy SCA ----------
-      - name: Trivy SCA
-        run: |
-          mkdir -p results
-          trivy fs project \
-            --scanners vuln \
-            --format json \
-            --output results/trivy_sca.json || true
-          trivy fs project \
-            --format cyclonedx \
-            --output results/sbom.cdx_SCA.json || true
-      - name: Deduplicate SCA
-        run: |
-          for sev in LOW MEDIUM HIGH CRITICAL; do
-            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
-            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
-              results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
-          done
-      
       - name: Build artifact (best effort, safe)
         run: |
           cd project
@@ -116,6 +62,24 @@ jobs:
                 -Dfabric8.skip=true \
                 package || true
           fi
+      # -------- Trivy SCA ----------
+      - name: Trivy SCA
+        run: |
+          mkdir -p results
+          trivy fs project \
+            --scanners vuln \
+            --format json \
+            --output results/trivy_sca.json || true
+
+      - name: Deduplicate SCA
+        run: |
+          for sev in LOW MEDIUM HIGH CRITICAL; do
+            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID + PkgID + InstalledVersion' \
+              results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
+          done
+      
+      
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
@@ -136,127 +100,198 @@ jobs:
             echo "failed" > results/trivy_status.txt
           fi     
           # 2. Scan the SBOM itself 
-         # trivy sbom results/sbom.cdx.json \
-          #  --scanners vuln \
-          #  --format json \
-          #  --output results/sbom_vuln.json || true
+          trivy sbom results/sbom.cdx.json \
+            --scanners vuln \
+            --format json \
+            --output results/sbom_vuln_Trivy.json || true
       - name: Extract license counts
         run: |
           jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
           sort | uniq -c |
           awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
           sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
-      
-      # ---------------- REAL OSV ----------------
-      - name: OSV scan (REAL)
-        run: |
-          set -e
-          mkdir -p results
-          echo "ok" > results/osv_status.txt     
-          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
-          if [ -n "$JARS" ]; then
-            osv-scanner scan $JARS --format json > results/osv-scan.json || true 
-          else
-            osv-scanner scan project/pom.xml project/requirements.txt --format json > results/osv-scan.json || true 
-          fi
-        
+            
      # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
       - name: Merge SBOM counts
         run: |
           mkdir -p results    
-          # -------- OSV mapped to severity via CVSS --------
-          jq -r '
-            .results[].packages[]?
-            | .package.name as $pkg
-            | .vulnerabilities[]?
-            | ( [.severity[]? | select(.type=="CVSS_V3") | .score | tonumber] | max // 0 ) as $s
-            | if $s < 4 then "LOW"
-              elif $s < 7 then "MEDIUM"
-              elif $s < 9 then "HIGH"
-              else "CRITICAL" end
-            | . + "|" + $pkg + ":" + .id
-          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt
-          mv osv_mapped.txt results/
-          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
-          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
-          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
-          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
+          # -------- Trivy IDs by severity --------
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID + PkgID + InstalledVersion' results/sbom_vuln_Trivy.json > trivy_low.txt || touch trivy_low.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID + PkgID + InstalledVersion' results/sbom_vuln_Trivy.json > trivy_med.txt || touch trivy_med.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID + PkgID + InstalledVersion' results/sbom_vuln_Trivy.json > trivy_high.txt || touch trivy_high.txt
+          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID + PkgID + InstalledVersion' results/sbom_vuln_Trivy.json > trivy_crit.txt || touch trivy_crit.txt  
+          
           # -------- Merge correctly and SAVE to files in results folder --------
-          cat osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
-          cat osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
-          cat osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
-          cat osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
+          cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low_Trivy.txt
+          cat trivy_med.txt  | sort -u > results/vulnerability_sbom_med_Trivy.txt
+          cat trivy_high.txt  | sort -u > results/vulnerability_sbom_high_Trivy.txt
+          cat trivy_crit.txt  | sort -u > results/vulnerability_sbom_crit_Trivy.txt
           # -------- Count the lines from the saved files --------
-          SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
-          SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
-          SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
-          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
-          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
-          echo "generated" > results/sbom_status.txt
-            
+          SB_L=$(wc -l < results/vulnerability_sbom_low_Trivy.txt)
+          SB_M=$(wc -l < results/vulnerability_sbom_med_Trivy.txt)
+          SB_H=$(wc -l < results/vulnerability_sbom_high_Trivy.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit_Trivy.txt)
+          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts_Trivy.txt
+          echo "generated" > results/sbom_status_Trivy.txt
+
+      # SNYK SCA
+      - name: SCA - Snyk (deduplicated, real)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
+          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
+        run: |
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt
+          # Pre-resolve deps if Java
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || true
+          fi    
+          set +e
+          snyk test \
+            --all-projects \
+            --scan-unmanaged \
+            --detection-depth=50 \
+            --json \
+            --skip-unresolved \
+            > results/sca_raw.json
+          CODE=$?
+          set -e     
+          if [ "$CODE" -gt 1 ]; then
+            echo "failed" > results/snyk_status.txt
+          fi      
+          # Normalize output (array vs object)
+          jq '
+            if type=="array"
+            then map(.vulnerabilities // []) | add
+            else .vulnerabilities // []
+            end
+          ' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json      
+          # TRUE deduplication (by vulnerability ID)
+          jq '
+          {
+            vulnerabilities:
+              .
+              | map(select(((.ignored // .isIgnored // false) | not)))
+              | unique_by(.id)
+              | map({
+                  id,
+                  severity: (.severity // "unknown"),
+                  title,
+                  package: (.packageName // .name // "unknown"),
+                  version: (.version // "unknown"),
+                  url
+                })
+          }
+          ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
+
+      # ---------------- Snyk SBOM + vulnerabilities + licenses ----------------
+      - name: Snyk SBOM + vulnerabilities + licenses
+        run: |
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt      
+          # -------- 1. Generate SBOM --------
+          set +e
+          snyk sbom --format=cyclonedx1.6-json --output=results/sbom_Snyk.cdx.json
+          EXIT=$?
+          set -e     
+          if [ $EXIT -ne 0 ]; then
+            echo '{}' > results/sbom_Snyk.cdx.json
+            echo "failed" > results/snyk_status.txt
+          fi     
+   
+      # ---------------- Extract license counts ----------------
+      - name: Extract license counts
+        run: |
+          jq -r '.dependencies[].licenses[]?' results/sbom_vuln_Snyk.json |
+          sort | uniq -c |
+          awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
+          sed '1s/^/{/;$s/$/}/' > results/licenses_tmp_Snyk.json || touch results/licenses_tmp_Snyk.json
+                 
       - name: Set artifact name
         id: set_artifact
         run: |
-          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
-          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+              ARTIFACT_NAME=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')_$(date +%s)
+              echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+                
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.set_artifact.outputs.artifact_name }}
-          path: results
+         name: ${{ steps.set_artifact.outputs.artifact_name }}
+         path: results
 
-  # =========================================================
-  # GLOBAL SUMMARY
-  # =========================================================
-  build_summary:
+# =========================================================
+# GLOBAL SUMMARY
+# =========================================================
+ build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: all_results
+  
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv       
+          echo "repo,\
+          trivy_sca_low,trivy_sca_medium,trivy_sca_high,trivy_sca_critical,\
+          trivy_sbom_low,trivy_sbom_medium,trivy_sbom_high,trivy_sbom_critical,\
+          snyk_sca_low,snyk_sca_medium,snyk_sca_high,snyk_sca_critical,\
+          snyk_sbom_components,snyk_sbom_licenses" > summary.csv
           for d in all_results/*; do
             R=$(basename "$d")
             R=${R//_//}
-            # -------- 1. DEDUPLICATED SCA COUNTS --------
-            # Assuming you created these in the previous job inside the results folder
-            SCAL=$(wc -l < "$d/deduped_sca_low.txt" 2>/dev/null || echo 0)
-            SCAM=$(wc -l < "$d/deduped_sca_med.txt" 2>/dev/null || echo 0)
-            SCAH=$(wc -l < "$d/deduped_sca_high.txt" 2>/dev/null || echo 0)
-            SCAC=$(wc -l < "$d/deduped_sca_crit.txt" 2>/dev/null || echo 0)
-            # -------- 2. DEDUPLICATED SBOM COUNTS --------
-            # These files contain (Trivy SBOM + OSV) sorted and unique
-            SB_L=$(wc -l < "$d/vulnerability_sbom_low.txt" 2>/dev/null || echo 0)
-            SB_M=$(wc -l < "$d/vulnerability_sbom_med.txt" 2>/dev/null || echo 0)
-            SB_H=$(wc -l < "$d/vulnerability_sbom_high.txt" 2>/dev/null || echo 0)
-            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)
-            # -------- 3. STATUS & TOTAL --------
-            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
-            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
-          done
+            # -------- TRIVY SCA --------
+            TSCAL=$(wc -l < "$d/deduped_sca_low.txt" 2>/dev/null || echo 0)
+            TSCAM=$(wc -l < "$d/deduped_sca_med.txt" 2>/dev/null || echo 0)
+            TSCAH=$(wc -l < "$d/deduped_sca_high.txt" 2>/dev/null || echo 0)
+            TSCAC=$(wc -l < "$d/deduped_sca_crit.txt" 2>/dev/null || echo 0)
+            # -------- TRIVY SBOM --------
+            TSBL=$(wc -l < "$d/vulnerability_sbom_low_Trivy.txt" 2>/dev/null || echo 0)
+            TSBM=$(wc -l < "$d/vulnerability_sbom_med_Trivy.txt" 2>/dev/null || echo 0)
+            TSBH=$(wc -l < "$d/vulnerability_sbom_high_Trivy.txt" 2>/dev/null || echo 0)
+            TSBC=$(wc -l < "$d/vulnerability_sbom_crit_Trivy.txt" 2>/dev/null || echo 0)
+            # -------- SNYK SCA --------
+            SSCAL=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' \
+                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
+            SSCAM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' \
+                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
+            SSCAH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' \
+                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
+            SSCAC=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' \
+                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
+            # -------- SNYK SBOM INVENTORY --------
+            SCOMP=$(jq '.components | length' "$d/sbom_Snyk.cdx.json" 2>/dev/null || echo 0)
+  
+            SLIC=$(jq -r '.components[].licenses[]?.license.id' \
+                      "$d/sbom_Snyk.cdx.json" 2>/dev/null | sort -u | wc -l || echo 0)
+  
+            echo "$R,\
+          $TSCAL,$TSCAM,$TSCAH,$TSCAC,\
+          $TSBL,$TSBM,$TSBH,$TSBC,\
+          $SSCAL,$SSCAM,$SSCAH,$SSCAC,\
+          $SCOMP,$SLIC" >> summary.csv
+            done
+  
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
           path: summary.csv
+  
       - name: Build summary_licenses.csv
         run: |
-          echo "repo,license_name,count" > summary_licenses.csv
-          for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}
-            if [ -f "$d/licenses_tmp.json" ]; then
-              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
-              while IFS=',' read -r license count; do
-                license=$(echo $license | tr -d '"')
-                echo "$R,$license,$count" >> summary_licenses.csv
-              done
-            fi
-          done
+            echo "repo,license_name,count" > summary_licenses.csv
+            for d in all_results/*; do
+              R=$(basename "$d")
+              R=${R//_//}
+              if [ -f "$d/licenses_tmp.json" ]; then
+                jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+                while IFS=',' read -r license count; do
+                  license=$(echo $license | tr -d '"')
+                  echo "$R,$license,$count" >> summary_licenses.csv
+                done
+              fi
+            done
       - uses: actions/upload-artifact@v4
         with:
-          name: licenses-summary
-          path: summary_licenses.csv
+            name: licenses-summary
+            path: summary_licenses.csv
