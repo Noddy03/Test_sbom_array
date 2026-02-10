@@ -1,4 +1,4 @@
-name: Security Scan – Trivy SCA + SBOM + TEST
+name: Security Scan – Trivy & SNYK SCA + SBOM + TEST
 
 on:
   workflow_dispatch:
@@ -219,10 +219,11 @@ jobs:
          name: ${{ steps.set_artifact.outputs.artifact_name }}
          path: results
 
-# =========================================================
-# GLOBAL SUMMARY
-# =========================================================
- build_summary:
+ # =========================================================
+ # GLOBAL SUMMARY
+ # =========================================================
+
+  build_summary:
     needs: scan_repo
     runs-on: ubuntu-latest
     steps:
