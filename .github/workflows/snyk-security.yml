@@ -67,7 +67,7 @@ jobs:
         run: |
           for sev in LOW MEDIUM HIGH CRITICAL; do
             case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
-            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID + PkgID + InstalledVersion' \
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID + .PkgID + .InstalledVersion' \
               results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
           done
         # SNYK SCA
@@ -228,47 +228,36 @@ jobs:
         with:
           path: all_results
   
-      - name: Build summary.csv
+      - name: Build detailed summary.csv
         run: |
-          echo "repo,\
-          trivy_sca_low,trivy_sca_medium,trivy_sca_high,trivy_sca_critical,\
-          trivy_sbom_low,trivy_sbom_medium,trivy_sbom_high,trivy_sbom_critical,\
-          snyk_sca_low,snyk_sca_medium,snyk_sca_high,snyk_sca_critical,\
-          snyk_sbom_components,snyk_sbom_licenses" > summary.csv
+          echo "repo,tool,mode,severity,cve,package,version" > summary.csv      
           for d in all_results/*; do
             R=$(basename "$d")
-            R=${R//_//}
+            R=${R//_//}      
             # -------- TRIVY SCA --------
-            TSCAL=$(wc -l < "$d/deduped_sca_low.txt" 2>/dev/null || echo 0)
-            TSCAM=$(wc -l < "$d/deduped_sca_med.txt" 2>/dev/null || echo 0)
-            TSCAH=$(wc -l < "$d/deduped_sca_high.txt" 2>/dev/null || echo 0)
-            TSCAC=$(wc -l < "$d/deduped_sca_crit.txt" 2>/dev/null || echo 0)
+            jq -r --arg repo "$R" '
+              .Results[]?.Vulnerabilities[]? |
+              [$repo,"Trivy","SCA",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
+              @csv
+            ' "$d/trivy_sca.json" 2>/dev/null >> summary.csv      
             # -------- TRIVY SBOM --------
-            TSBL=$(wc -l < "$d/vulnerability_sbom_low_Trivy.txt" 2>/dev/null || echo 0)
-            TSBM=$(wc -l < "$d/vulnerability_sbom_med_Trivy.txt" 2>/dev/null || echo 0)
-            TSBH=$(wc -l < "$d/vulnerability_sbom_high_Trivy.txt" 2>/dev/null || echo 0)
-            TSBC=$(wc -l < "$d/vulnerability_sbom_crit_Trivy.txt" 2>/dev/null || echo 0)
+            jq -r --arg repo "$R" '
+              .Results[]?.Vulnerabilities[]? |
+              [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
+              @csv
+            ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv   
             # -------- SNYK SCA --------
-            SSCAL=$(jq '[.vulnerabilities[] | select(.severity=="low")] | length' \
-                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
-            SSCAM=$(jq '[.vulnerabilities[] | select(.severity=="medium")] | length' \
-                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
-            SSCAH=$(jq '[.vulnerabilities[] | select(.severity=="high")] | length' \
-                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
-            SSCAC=$(jq '[.vulnerabilities[] | select(.severity=="critical")] | length' \
-                      "$d/sca_cleaned_Snyk.json" 2>/dev/null || echo 0)
-            # -------- SNYK SBOM INVENTORY --------
-            SCOMP=$(jq '.components | length' "$d/sbom_Snyk.cdx.json" 2>/dev/null || echo 0)
-  
-            SLIC=$(jq -r '.components[].licenses[]?.license.id' \
-                      "$d/sbom_Snyk.cdx.json" 2>/dev/null | sort -u | wc -l || echo 0)
-  
-            echo "$R,\
-          $TSCAL,$TSCAM,$TSCAH,$TSCAC,\
-          $TSBL,$TSBM,$TSBH,$TSBC,\
-          $SSCAL,$SSCAM,$SSCAH,$SSCAC,\
-          $SCOMP,$SLIC" >> summary.csv
-            done
+            jq -r --arg repo "$R" '
+              .vulnerabilities[]? |
+              [$repo,"Snyk","SCA",
+               (.severity // "unknown" | ascii_upcase),
+               .id,
+               (.package // "unknown"),
+               (.version // "unknown")] |
+              @csv
+            ' "$d/sca_cleaned_Snyk.json" 2>/dev/null >> summary.csv
+          done
+
   
       - uses: actions/upload-artifact@v4
         with:
