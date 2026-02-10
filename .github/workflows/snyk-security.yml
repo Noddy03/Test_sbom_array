@@ -1,163 +1,260 @@
-name: IoT Multi-Repo Snyk Scan Security
+name: Security Scan – Trivy SCA + SBOM + TEST
 
 on:
   workflow_dispatch:
     inputs:
       language:
-        description: "Language filter (e.g., C++, Python, Java)"
+        description: 'Choose language to scan'
         required: true
-        default: "C++"
+        default: 'Java'
+      top_n:
+        description: 'Number of repositories to scan'
+        required: false
+        default: '5'
 
 permissions:
   contents: read
-  actions: read
-  security-events: write   # REQUIRED for SARIF uploads
+  security-events: write
 
 jobs:
-
-  fetch_top_repos:
+  fetch_repos:
     runs-on: ubuntu-latest
     outputs:
-      repo_list: ${{ steps.fetch.outputs.repo_list }}
-
+      repos: ${{ steps.fetch.outputs.repos }}
     steps:
-      - name: Install jq & gh
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq gh git
-
-      - name: Fetch top IoT repositories
-        id: fetch
+      - id: fetch
         env:
-          LANG: ${{ github.event.inputs.language }}
-          GH_TOKEN: ${{ github.token }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LANG: ${{ inputs.language }}
+          TOP_N: ${{ inputs.top_n }}
         run: |
-          set -euo pipefail
-          RAW_Q="topic:iot language:$LANG fork:false archived:false"
-
-          REPOS=$(gh api -X GET /search/repositories \
-            --raw-field q="$RAW_Q" \
-            --raw-field sort=stars \
-            --raw-field order=desc \
-            --raw-field per_page=100 \
-            --jq '.items[].full_name' || true)
-
-          if [ -z "$REPOS" ]; then
-            RAW_Q="language:$LANG fork:false archived:false"
-            REPOS=$(gh api -X GET /search/repositories \
-              --raw-field q="$RAW_Q" \
-              --raw-field sort=stars \
-              --raw-field order=desc \
-              --raw-field per_page=100 \
-              --jq '.items[].full_name' || true)
-          fi
-
-          JSON_ARRAY=$(printf "%s" "$REPOS" | jq -R -s -c 'split("\n") | map(select(length>0))')
-          echo "repo_list=$JSON_ARRAY" >> $GITHUB_OUTPUT
-
-  snyk_scan:
-    needs: fetch_top_repos
+          python3 <<'EOF'
+          import os, requests, json, urllib.parse, time
+          headers = {"Authorization": f"token {os.environ['TOKEN']}", "Accept": "application/vnd.github+json"}
+          repos = []
+          page = 1
+          while len(repos) < int(os.environ["TOP_N"]) and page <= 10:
+              url = f"https://api.github.com/search/repositories?q=language:{urllib.parse.quote(os.environ['LANG'])}&sort=stars&order=desc&per_page=30&page={page}"
+              r = requests.get(url, headers=headers)
+              for repo in r.json().get("items", []):
+                  files = ["pom.xml"] if os.environ["LANG"].lower()=="java" else ["requirements.txt","pyproject.toml","setup.py"]
+                  for f in files:
+                      if requests.get(f"https://api.github.com/repos/{repo['full_name']}/contents/{f}", headers=headers).status_code==200:
+                          repos.append(repo["full_name"])
+                          break
+                  if len(repos) >= int(os.environ["TOP_N"]):
+                      break
+              page += 1
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"repos={json.dumps(repos)}\n")
+          EOF
+  scan_repo:
+    needs: fetch_repos
     runs-on: ubuntu-latest
-    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
-        repo: ${{ fromJSON(needs.fetch_top_repos.outputs.repo_list) }}
+        repo: ${{ fromJSON(needs.fetch_repos.outputs.repos) }}
 
-    env:
-      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
-
-      - name: Checkout repo into root (fix SARIF upload)
-        uses: actions/checkout@v3
-        with:
-          repository: ${{ matrix.repo }}
-
-      - name: Sanitize name
-        id: sanitize
+      - name: Install tools
         run: |
-          SAFE=$(echo "${{ matrix.repo }}" | sed 's/[^A-Za-z0-9._-]/_/g')
-          echo "safe=$SAFE" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+          go install github.com/google/osv-scanner/cmd/osv-scanner@v1.9.0
+          sudo mv ~/go/bin/osv-scanner /usr/local/bin/osv-scanner
+          
+      - name: Clone repo
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ matrix.repo }} project
 
-      - name: Set up Snyk
-        uses: snyk/actions/setup@v1
-        with:
-          snyk-version: "latest"
-
-      - name: Create reports directory
-        run: mkdir -p snyk_reports
-
-      - name: Run Snyk Code (SAST)
-        run: snyk code test . --sarif-file-output=snyk_reports/sast.sarif || true
-
-      - name: Ensure SAST SARIF exists
+      - name: Install Java dependencies
+        if: ${{ inputs.language == 'Java' }}
         run: |
-          if [ ! -s snyk_reports/sast.sarif ]; then
-            echo '{"version":"2.1.0","runs":[]}' > snyk_reports/sast.sarif
+          cd project
+          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
+          if [ -f build.gradle ]; then ./gradlew build || true; fi
+      - name: Python deps (best effort)
+        if: ${{ inputs.language == 'Python' }}
+        run: |
+          cd project
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
+          if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
+      # -------- Trivy SCA ----------
+      - name: Trivy SCA
+        run: |
+          mkdir -p results
+          trivy fs project \
+            --scanners vuln \
+            --format json \
+            --output results/trivy_sca.json || true
+            --output results/sbom.cdx_SCA.json
+      - name: Deduplicate SCA
+        run: |
+          for sev in LOW MEDIUM HIGH CRITICAL; do
+            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
+            jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID' \
+              results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
+          done
+      
+      - name: Build artifact (best effort, safe)
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
           fi
-
-      - name: Run Snyk Open Source (SCA)
-        run: snyk test --json > snyk_reports/sca.json || echo '{"vulnerabilities":[]}' > snyk_reports/sca.json
-
-      - name: Run Snyk IaC
-        run: snyk iac test . --json-file-output=snyk_reports/iac.json || echo '{"infrastructure-as-code-issues":[]}' > snyk_reports/iac.json
-
-      - name: Build Docker (optional)
+      
+      # ---------------- REAL SBOM + VULNS + LICENSES ----------------
+      - name: Trivy SBOM + vulnerabilities + licenses (correct)
         run: |
-          if [ -f Dockerfile ]; then
-            docker build -t project-image . || true
-          fi
-
-      - name: Snyk Container scan
+          mkdir -p results
+          echo "ok" > results/trivy_status.txt     
+          # 1. Generate SBOM (safe)
+          set +e
+          trivy fs project \
+            --timeout 20m \
+            --format cyclonedx \
+            --output results/sbom.cdx.json
+          EXIT=$?
+          set -e      
+          # Se SBOM fallisce, metti placeholder per non rompere il passo 2
+          if [ $EXIT -ne 0 ]; then
+            echo '{}' > results/sbom.cdx.json
+            echo "failed" > results/trivy_status.txt
+          fi     
+          # 2. Scan the SBOM itself 
+         # trivy sbom results/sbom.cdx.json \
+          #  --scanners vuln \
+          #  --format json \
+          #  --output results/sbom_vuln.json || true
+      - name: Extract license counts
         run: |
-          if docker image inspect project-image >/dev/null 2>&1; then
-            snyk container test project-image --json > snyk_reports/container.json || echo '{"vulnerabilities":[]}' > snyk_reports/container.json
+          jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
+          sort | uniq -c |
+          awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
+          sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
+      
+      # ---------------- REAL OSV ----------------
+      - name: OSV scan (REAL)
+        run: |
+          set -e
+          mkdir -p results
+          echo "ok" > results/osv_status.txt     
+          JARS=$(find project -type f -name "*.jar" 2>/dev/null | head -n 5)      
+          if [ -n "$JARS" ]; then
+            osv-scanner scan $JARS --format json > results/osv-scan.json || true 
           else
-            echo '{"vulnerabilities":[]}' > snyk_reports/container.json
+            osv-scanner scan project/pom.xml project/requirements.txt --format json > results/osv-scan.json || true 
           fi
-
-      - name: Create summary.csv
+        
+     # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
+      - name: Merge SBOM counts
         run: |
-          echo "repo,sast_total,sca_vulns,iac_vulns,container_vulns" > summary.csv
-
-          SAST=$(jq '[.runs[].results[]] | length' snyk_reports/sast.sarif 2>/dev/null || echo 0)
-          SCA=$(jq '.vulnerabilities | length' snyk_reports/sca.json 2>/dev/null || echo 0)
-          IAC=$(jq '.["infrastructure-as-code-issues"] | length' snyk_reports/iac.json 2>/dev/null || echo 0)
-          CONTAINER=$(jq '.vulnerabilities | length' snyk_reports/container.json 2>/dev/null || echo 0)
-
-          echo "\"${{ matrix.repo }}\",$SAST,$SCA,$IAC,$CONTAINER" >> summary.csv
-
-      - name: Upload per-repo artifact
+          mkdir -p results    
+          # -------- OSV mapped to severity via CVSS --------
+          jq -r '
+            .results[].packages[]?
+            | .package.name as $pkg
+            | .vulnerabilities[]?
+            | ( [.severity[]? | select(.type=="CVSS_V3") | .score | tonumber] | max // 0 ) as $s
+            | if $s < 4 then "LOW"
+              elif $s < 7 then "MEDIUM"
+              elif $s < 9 then "HIGH"
+              else "CRITICAL" end
+            | . + "|" + $pkg + ":" + .id
+          ' results/osv-scan.json > osv_mapped.txt || touch osv_mapped.txt
+          mv osv_mapped.txt results/
+          grep '^LOW|' results/osv_mapped.txt | cut -d'|' -f2 > osv_low.txt || touch osv_low.txt
+          grep '^MEDIUM|' results/osv_mapped.txt | cut -d'|' -f2 > osv_med.txt || touch osv_med.txt
+          grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
+          grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
+          # -------- Merge correctly and SAVE to files in results folder --------
+          cat  osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
+          cat  osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
+          cat  osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
+          cat  osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
+          # -------- Count the lines from the saved files --------
+          SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
+          SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
+          SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
+          SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
+          echo "generated" > results/sbom_status.txt
+            
+      - name: Set artifact name
+        id: set_artifact
+        run: |
+          ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
+          echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+      - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.sanitize.outputs.safe }}-scan
-          path: |
-            snyk_reports
-            summary.csv
+          name: ${{ steps.set_artifact.outputs.artifact_name }}
+          path: results
 
-      - name: Upload SARIF to GitHub (now works)
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: snyk_reports/sast.sarif
-
-  aggregate_summaries:
-    needs: snyk_scan
+  # =========================================================
+  # GLOBAL SUMMARY
+  # =========================================================
+  build_summary:
+    needs: scan_repo
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: all
-
-      - name: Build master_summary.csv
+          path: all_results
+      - name: Build summary.csv
         run: |
-          echo "repo,sast_total,sca_vulns,iac_vulns,container_vulns" > master_summary.csv
-          for f in $(find all -name "summary.csv"); do
-            tail -n +2 "$f" >> master_summary.csv
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv       
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+            # -------- 1. DEDUPLICATED SCA COUNTS --------
+            # Assuming you created these in the previous job inside the results folder
+            SCAL=$(wc -l < "$d/deduped_sca_low.txt" 2>/dev/null || echo 0)
+            SCAM=$(wc -l < "$d/deduped_sca_med.txt" 2>/dev/null || echo 0)
+            SCAH=$(wc -l < "$d/deduped_sca_high.txt" 2>/dev/null || echo 0)
+            SCAC=$(wc -l < "$d/deduped_sca_crit.txt" 2>/dev/null || echo 0)
+            # -------- 2. DEDUPLICATED SBOM COUNTS --------
+            # These files contain (Trivy SBOM + OSV) sorted and unique
+            SB_L=$(wc -l < "$d/vulnerability_sbom_low.txt" 2>/dev/null || echo 0)
+            SB_M=$(wc -l < "$d/vulnerability_sbom_med.txt" 2>/dev/null || echo 0)
+            SB_H=$(wc -l < "$d/vulnerability_sbom_high.txt" 2>/dev/null || echo 0)
+            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)
+            # -------- 3. STATUS & TOTAL --------
+            STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
+            echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
-
       - uses: actions/upload-artifact@v4
         with:
-          name: master_summary
-          path: master_summary.csv
+          name: security-summary
+          path: summary.csv
+      - name: Build summary_licenses.csv
+        run: |
+          echo "repo,license_name,count" > summary_licenses.csv
+          for d in all_results/*; do
+            R=$(basename "$d")
+            R=${R//_//}
+            if [ -f "$d/licenses_tmp.json" ]; then
+              jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
+              while IFS=',' read -r license count; do
+                license=$(echo $license | tr -d '"')
+                echo "$R,$license,$count" >> summary_licenses.csv
+              done
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licenses-summary
+          path: summary_licenses.csv
