@@ -49,17 +49,7 @@ jobs:
           pip install --upgrade pip setuptools wheel
           if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
-      - name: Build artifact (best effort, safe)
-        run: |
-          cd project
-          if [ -f pom.xml ]; then
-            mvn -B -DskipTests \
-                -Ddocker.skip=true \
-                -DskipDocker=true \
-                -Djib.skip=true \
-                -Dfabric8.skip=true \
-                package || true
-          fi
+    
       # -------- Trivy SCA ----------
       - name: Trivy SCA
         run: |
@@ -76,8 +66,66 @@ jobs:
             jq -r --arg sev "$sev" '.Results[]?.Vulnerabilities[]? | select(.Severity==$sev) | .VulnerabilityID + PkgID + InstalledVersion' \
               results/trivy_sca.json | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
           done
-      
-      
+        # SNYK SCA
+      - name: SCA - Snyk (deduplicated, real)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
+          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
+        run: |
+          mkdir -p results
+          echo "ok" > results/snyk_status.txt
+          # Pre-resolve deps if Java
+          if [ -f project/pom.xml ]; then
+            mvn -f project/pom.xml dependency:resolve || true
+          fi    
+          set +e
+          snyk test \
+            --all-projects \
+            --scan-unmanaged \
+            --detection-depth=50 \
+            --json \
+            --skip-unresolved \
+            > results/sca_raw_Snyk.json
+          CODE=$?
+          set -e     
+          if [ "$CODE" -gt 1 ]; then
+            echo "failed" > results/snyk_status.txt
+          fi      
+          # Normalize output (array vs object)
+          jq '
+            if type=="array"
+            then map(.vulnerabilities // []) | add
+            else .vulnerabilities // []
+            end
+          ' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json      
+          # TRUE deduplication (by vulnerability ID)
+          jq '
+          {
+            vulnerabilities:
+              .
+              | map(select(((.ignored // .isIgnored // false) | not)))
+              | unique_by(.id)
+              | map({
+                  id,
+                  severity: (.severity // "unknown"),
+                  title,
+                  package: (.packageName // .name // "unknown"),
+                  version: (.version // "unknown"),
+                  url
+                })
+          }
+          ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
+      - name: Build artifact (best effort, safe)
+        run: |
+          cd project
+          if [ -f pom.xml ]; then
+            mvn -B -DskipTests \
+                -Ddocker.skip=true \
+                -DskipDocker=true \
+                -Djib.skip=true \
+                -Dfabric8.skip=true \
+                package || true
+          fi
       
       # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
@@ -132,55 +180,7 @@ jobs:
           echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts_Trivy.txt
           echo "generated" > results/sbom_status_Trivy.txt
 
-      # SNYK SCA
-      - name: SCA - Snyk (deduplicated, real)
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
-          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
-        run: |
-          mkdir -p results
-          echo "ok" > results/snyk_status.txt
-          # Pre-resolve deps if Java
-          if [ -f project/pom.xml ]; then
-            mvn -f project/pom.xml dependency:resolve || true
-          fi    
-          set +e
-          snyk test \
-            --all-projects \
-            --scan-unmanaged \
-            --detection-depth=50 \
-            --json \
-            --skip-unresolved \
-            > results/sca_raw_Snyk.json
-          CODE=$?
-          set -e     
-          if [ "$CODE" -gt 1 ]; then
-            echo "failed" > results/snyk_status.txt
-          fi      
-          # Normalize output (array vs object)
-          jq '
-            if type=="array"
-            then map(.vulnerabilities // []) | add
-            else .vulnerabilities // []
-            end
-          ' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json      
-          # TRUE deduplication (by vulnerability ID)
-          jq '
-          {
-            vulnerabilities:
-              .
-              | map(select(((.ignored // .isIgnored // false) | not)))
-              | unique_by(.id)
-              | map({
-                  id,
-                  severity: (.severity // "unknown"),
-                  title,
-                  package: (.packageName // .name // "unknown"),
-                  version: (.version // "unknown"),
-                  url
-                })
-          }
-          ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
+    
 
       # ---------------- Snyk SBOM + vulnerabilities + licenses ----------------
       - name: Snyk SBOM  + licenses
