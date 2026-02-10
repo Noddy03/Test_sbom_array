@@ -182,10 +182,10 @@ jobs:
           grep '^HIGH|' results/osv_mapped.txt | cut -d'|' -f2 > osv_high.txt || touch osv_high.txt
           grep '^CRITICAL|' results/osv_mapped.txt | cut -d'|' -f2 > osv_crit.txt || touch osv_crit.txt
           # -------- Merge correctly and SAVE to files in results folder --------
-          cat  osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
-          cat  osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
-          cat  osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
-          cat  osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
+          cat osv_low.txt | sort -u > results/vulnerability_sbom_low.txt
+          cat osv_med.txt | sort -u > results/vulnerability_sbom_med.txt
+          cat osv_high.txt | sort -u > results/vulnerability_sbom_high.txt
+          cat osv_crit.txt | sort -u > results/vulnerability_sbom_crit.txt
           # -------- Count the lines from the saved files --------
           SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
           SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
