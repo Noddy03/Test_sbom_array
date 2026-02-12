@@ -1,4 +1,4 @@
-name: Security Scan – Trivy & SNYK SCA + COMPILE CODE + TEST
+name: Security Scan – Trivy & SNYK (COMPILE + REAL JAVA SCA vs SBOM)
 
 on:
   workflow_dispatch:
@@ -6,312 +6,106 @@ on:
       src_repository:
         description: 'Source Repository (e.g., user/repo)'
         required: true
-      language:
-        description: 'Choose language to scan'
-        required: true
-        default: 'Java'
 
 permissions:
   contents: read
-  security-events: write
 
 jobs:
   scan_repo:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
+
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven python3-pip golang
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
           curl -sSL https://static.snyk.io/cli/latest/snyk-linux -o snyk
           chmod +x snyk
           sudo mv snyk /usr/local/bin/snyk
-          
+
       - name: Clone repo
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: git clone --depth 1 https://x-access-token:${TOKEN}@github.com/${{ inputs.src_repository }} project
 
-      - name: Install Java dependencies
-        if: ${{ inputs.language == 'Java' }}
-        run: |
-          cd project
-          if [ -f pom.xml ]; then mvn -B dependency:resolve || true; fi
-          if [ -f build.gradle ]; then ./gradlew build || true; fi
-      - name: Python deps (best effort)
-        if: ${{ inputs.language == 'Python' }}
-        run: |
-          cd project
-          python3 -m venv .venv
-          source .venv/bin/activate
-          pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then pip install --no-deps -r requirements.txt || true; fi
-          if [ -f pyproject.toml ]; then pip install --no-deps . || true; fi
-
-      - name: Build artifact (best effort, safe)
+      # ---------------- COMPILE (REALISM) ----------------
+      - name: Compile Java (best effort)
         run: |
           cd project
           if [ -f pom.xml ]; then
-           mvn -DskipTests \
-            -Dmaven.javadoc.skip=true \
-            -DskipAssembly=false \
-            -DskipMinify=true \
-            package
+            mvn -DskipTests package || true
           fi
 
-      - name: Collect compiled binaries
-        run: |
-          mkdir -p binaries
-          find project -path "*target/*.jar" -type f -exec cp {} binaries/ \;
-          ls -lh binaries
-          if [ -z "$(ls -A binaries)" ]; then
-            echo "No binaries found" > results/no_binaries.txt
-            echo '{"Results":[]}' > results/trivy_sca.json
-            echo '{}' > results/sbom_Trivy.cdx.json
-          fi
-
-      - name: Keep only real runtime jars
-        run: |
-          mkdir -p real_binaries
-          find binaries -name "*.jar" \
-            ! -name "*-sources.jar" \
-            ! -name "*-tests.jar" \
-            ! -name "*-javadoc.jar" \
-            -exec cp {} real_binaries/ \;
-
-          echo "Scanning these artifacts:"
-          ls -lh real_binaries
-
-
-      # -------- Trivy SCA ----------
-      - name: Trivy SCA
+      # ---------------- TRIVY SCA (SOURCE GRAPH) ----------------
+      - name: Trivy SCA (real Java)
         run: |
           mkdir -p results
-          trivy fs real_binaries \
+          trivy fs project \
             --scanners vuln \
-            --skip-files '**/*sources.jar' \
-            --skip-dirs node_modules \
             --format json \
             --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
 
-
-
-             
-      - name: Deduplicate SCA
+      # ---------------- TRIVY SBOM ----------------
+      - name: Trivy SBOM
         run: |
-          for sev in LOW MEDIUM HIGH CRITICAL; do
-            case $sev in "MEDIUM") s="med";; "CRITICAL") s="crit";; *) s=$(echo $sev | tr '[:upper:]' '[:lower:]');; esac
-            jq -r --arg sev "$sev" '
-              (.Results // [])[]?.Vulnerabilities[]? 
-              | select(.Severity==$sev) 
-              | .VulnerabilityID + .PkgID + .InstalledVersion
-            ' results/trivy_sca.json \
-            | sort -u > results/deduped_sca_$s.txt || touch results/deduped_sca_$s.txt
-          done
+          trivy fs project \
+            --format cyclonedx \
+            --scanners vuln,license \
+            --output results/sbom_Trivy.cdx.json || echo '{}' > results/sbom_Trivy.cdx.json
 
-        # SNYK SCA
-      - name: SCA - Snyk (deduplicated, real)
+      - name: Trivy SBOM vulnerabilities
+        run: |
+          trivy sbom results/sbom_Trivy.cdx.json \
+            --scanners vuln \
+            --format json \
+            --output results/sbom_vuln_Trivy.json || echo '{"Results":[]}' > results/sbom_vuln_Trivy.json
+
+      # ---------------- SNYK SCA ----------------
+      - name: Snyk SCA (real Java)
         env:
-          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
-          SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          mkdir -p results
-          set +e
-          snyk test \
-            --unmanaged \
-            --scan-all-unmanaged \
-            real_binaries \
-            --json > results/sca_raw_Snyk.json
-          set -e
-          # Normalize output (array vs object)
+          cd project
+          snyk test --json > ../results/sca_raw_Snyk.json || true
+
+      - name: Normalize Snyk
+        run: |
           jq '
             if type=="array"
             then map(.vulnerabilities // []) | add
             else .vulnerabilities // []
             end
-          ' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json      
-          # TRUE deduplication (by vulnerability ID)
+          ' results/sca_raw_Snyk.json > results/sca_flat_Snyk.json || echo "[]" > results/sca_flat_Snyk.json
+
           jq '
           {
             vulnerabilities:
               .
-              | map(select(((.ignored // .isIgnored // false) | not)))
               | unique_by(.id)
               | map({
                   id,
-                  severity: (.severity // "unknown"),
+                  severity,
                   title,
-                  package: (.packageName // .name // "unknown"),
-                  version: (.version // "unknown"),
+                  package: .packageName,
+                  version: .version,
                   url
                 })
           }
           ' results/sca_flat_Snyk.json > results/sca_cleaned_Snyk.json
-     
-      
-      # ---------------- REAL SBOM + VULNS + LICENSES ----------------
-      - name: Trivy SBOM + vulnerabilities + licenses (correct)
-        run: |
-          mkdir -p results
-          echo "Generating SBOM..."
 
-          # 1. Generate SBOM from real runtime binaries
-          set +e
-          trivy fs real_binaries \
-            --format cyclonedx \
-            --scanners vuln,license \
-            --ignore-unfixed \
-            --output results/sbom_Trivy.cdx.json
-          EXIT=$?
-          set -e      
-
-          # If SBOM generation failed, create safe placeholder
-          if [ $EXIT -ne 0 ]; then
-            echo '{}' > results/sbom_Trivy.cdx.json
-            echo "failed" > results/trivy_status.txt
-          fi     
-
-          # 2. Scan the SBOM itself (only if it exists)
-          if [ -s results/sbom_Trivy.cdx.json ]; then
-            trivy sbom results/sbom_Trivy.cdx.json \
-              --scanners vuln \
-              --format json \
-              --output results/sbom_vuln_Trivy.json || true
-          else
-            echo '{"Results":[]}' > results/sbom_vuln_Trivy.json
-          fi
-
-            
-      - name: Extract license counts
+      # ---------------- SNYK SBOM ----------------
+      - name: Snyk SBOM
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}
         run: |
-          jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln_Trivy.json |
-          sort | uniq -c |
-          awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
-          sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
-            
-     # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
-      - name: Merge SBOM counts
-        run: |
-          mkdir -p results    
-          # -------- Trivy IDs by severity --------
-          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_low.txt || touch trivy_low.txt
-          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_med.txt || touch trivy_med.txt
-          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_high.txt || touch trivy_high.txt
-          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_crit.txt || touch trivy_crit.txt  
-          
-          # -------- Merge correctly and SAVE to files in results folder --------
-          cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low_Trivy.txt
-          cat trivy_med.txt  | sort -u > results/vulnerability_sbom_med_Trivy.txt
-          cat trivy_high.txt  | sort -u > results/vulnerability_sbom_high_Trivy.txt
-          cat trivy_crit.txt  | sort -u > results/vulnerability_sbom_crit_Trivy.txt
-          # -------- Count the lines from the saved files --------
-          SB_L=$(wc -l < results/vulnerability_sbom_low_Trivy.txt)
-          SB_M=$(wc -l < results/vulnerability_sbom_med_Trivy.txt)
-          SB_H=$(wc -l < results/vulnerability_sbom_high_Trivy.txt)
-          SB_C=$(wc -l < results/vulnerability_sbom_crit_Trivy.txt)
-          echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts_Trivy.txt
-          echo "generated" > results/sbom_status_Trivy.txt
-    
+          cd project
+          snyk sbom --format=cyclonedx1.6-json \
+            --output=../results/sbom_Snyk.cdx.json || echo '{}' > ../results/sbom_Snyk.cdx.json
 
-      # ---------------- Snyk SBOM + vulnerabilities + licenses ----------------
-      - name: Snyk SBOM  + licenses
-        run: |
-          mkdir -p results
-          echo "ok"     
-          # -------- 1. Generate SBOM --------
-          set +e
-          snyk sbom --format=cyclonedx1.6-json --output=results/sbom_Snyk.cdx.json
-          EXIT=$?
-          set -e     
-          if [ $EXIT -ne 0 ]; then
-            echo '{}' > results/sbom_Snyk.cdx.json
-            echo "failed" > results/snyk_status.txt
-          fi     
-                 
-      - name: Set artifact name
-        id: set_artifact
-        run: |
-              ARTIFACT_NAME=$(echo "${{ inputs.src_repository }}" | sed 's#[/:]#_#g')_$(date +%s)
-              echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-                
+      # ---------------- UPLOAD ----------------
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-         name: ${{ steps.set_artifact.outputs.artifact_name }}
-         path: results
-
- # =========================================================
- # GLOBAL SUMMARY
- # =========================================================
-
-  build_summary:
-    needs: scan_repo
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: all_results
-  
-      - name: Build detailed summary.csv
-        run: |
-          echo "repo,tool,mode,severity,cve,package,version" > summary.csv      
-          for d in all_results/*; do
-            R=$(basename "$d")
-            R=${R//_//}      
-            # -------- TRIVY SCA --------
-            jq -r --arg repo "$R" '
-              (.Results // [])[]?.Vulnerabilities[]? |
-              [$repo,"Trivy","SCA",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
-              @csv
-            ' "$d/trivy_sca.json" 2>/dev/null >> summary.csv || true      
-            # -------- TRIVY SBOM --------
-            jq -r --arg repo "$R" '
-              (.Results // [])[]?.Vulnerabilities[]? |
-              [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
-              @csv
-            ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv || true   
-            # -------- SNYK SCA --------
-            jq -r --arg repo "$R" '
-              .vulnerabilities[]? |
-              [$repo,"Snyk","SCA",
-               (.severity | ascii_upcase),
-               .id,
-               .package,
-               .version] |
-              @csv
-            ' "$d/sca_cleaned_Snyk.json"
-
-            # -------- SNYK SBOM INVENTORY --------
-            jq -r --arg repo "$R" '
-              (.components // .bom.components // [])[]? |
-              [$repo,"Snyk","SBOM","NONE","",.name,(.version // "unknown")] |
-              @csv
-            ' "$d/sbom_Snyk.cdx.json" 2>/dev/null >> summary.csv || true
-           done
-  
-      - uses: actions/upload-artifact@v4
-        with:
-          name: security-summary
-          path: summary.csv
-  
-      - name: Build summary_licenses.csv
-        run: |
-            echo "repo,license_name,count" > summary_licenses.csv
-            for d in all_results/*; do
-              R=$(basename "$d")
-              R=${R//_//}
-              if [ -f "$d/licenses_tmp.json" ]; then
-                jq -r 'to_entries[] | [.key, .value] | @csv' "$d/licenses_tmp.json" 2>/dev/null | \
-                while IFS=',' read -r license count; do
-                  license=$(echo $license | tr -d '"')
-                  echo "$R,$license,$count" >> summary_licenses.csv
-                done
-              fi
-            done
-      - uses: actions/upload-artifact@v4
-        with:
-            name: licenses-summary
-            path: summary_licenses.csv
+          name: results_${{ github.run_id }}
+          path: results
