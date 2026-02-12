@@ -62,12 +62,18 @@ jobs:
                 -Dfabric8.skip=true \
                 package || true
           fi
-    
+
+      - name: Collect compiled binaries
+        run: |
+          mkdir -p binaries
+          find project -path "*target/*.jar" -type f -exec cp {} binaries/ \;
+          ls -lh binaries
+
       # -------- Trivy SCA ----------
       - name: Trivy SCA
         run: |
           mkdir -p results
-          trivy fs project/target \
+          trivy fs binaries \
             --scanners vuln \
             --format json \
             --output results/trivy_sca.json || true
@@ -85,13 +91,7 @@ jobs:
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
         run: |
           mkdir -p results
-          echo "ok" > results/snyk_status.txt
-          # Pre-resolve deps if Java
-          if [ -f project/pom.xml ]; then
-            mvn -f project/pom.xml dependency:resolve || true
-          fi    
-          set +e
-          snyk test project/target \
+          snyk test binaries \
             --detection-depth=50 \
             --json \
             --skip-unresolved \
@@ -134,7 +134,7 @@ jobs:
           echo "ok"     
           # 1. Generate SBOM (safe)
           set +e
-          trivy fs project/target \
+          trivy fs binaries \
             --timeout 20m \
             --format cyclonedx \
             --output results/sbom_Trivy.cdx.json
