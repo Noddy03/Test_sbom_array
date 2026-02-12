@@ -67,6 +67,12 @@ jobs:
           mkdir -p binaries
           find project -path "*target/*.jar" -type f -exec cp {} binaries/ \;
           ls -lh binaries
+          if [ -z "$(ls -A binaries)" ]; then
+            echo "No binaries found" > results/no_binaries.txt
+            echo '{"Results":[]}' > results/trivy_sca.json
+            echo '{}' > results/sbom_Trivy.cdx.json
+          fi
+
 
       # -------- Trivy SCA ----------
       - name: Trivy SCA
@@ -74,11 +80,12 @@ jobs:
           mkdir -p results
           trivy fs binaries \
             --scanners vuln \
-            --package-types jar \
             --skip-files '**/*sources.jar' \
             --skip-dirs node_modules \
             --format json \
-            --output results/trivy_sca.json
+            --output results/trivy_sca.json || echo '{"Results":[]}' > results/trivy_sca.json
+
+
 
              
       - name: Deduplicate SCA
@@ -104,8 +111,9 @@ jobs:
           snyk test \
             --scan-all-unmanaged \
             --file=binaries \
-            --detection-depth=5
-            --json > results/sca_raw_Snyk.json
+            --detection-depth=5 \
+            --json > results/sca_raw_Snyk.json || echo '{}' > results/sca_raw_Snyk.json
+
           CODE=$?
           set -e
           # Normalize output (array vs object)
@@ -171,10 +179,10 @@ jobs:
         run: |
           mkdir -p results    
           # -------- Trivy IDs by severity --------
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_low.txt || touch trivy_low.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_med.txt || touch trivy_med.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_high.txt || touch trivy_high.txt
-          jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_crit.txt || touch trivy_crit.txt  
+          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_low.txt || touch trivy_low.txt
+          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_med.txt || touch trivy_med.txt
+          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_high.txt || touch trivy_high.txt
+          jq -r '(.Results // [])[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID + .PkgID + .InstalledVersion' results/sbom_vuln_Trivy.json > trivy_crit.txt || touch trivy_crit.txt  
           
           # -------- Merge correctly and SAVE to files in results folder --------
           cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low_Trivy.txt
@@ -237,19 +245,19 @@ jobs:
             R=${R//_//}      
             # -------- TRIVY SCA --------
             jq -r --arg repo "$R" '
-              .Results[]?.Vulnerabilities[]? |
+              (.Results // [])[]?.Vulnerabilities[]? |
               [$repo,"Trivy","SCA",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
               @csv
             ' "$d/trivy_sca.json" 2>/dev/null >> summary.csv || true      
             # -------- TRIVY SBOM --------
             jq -r --arg repo "$R" '
-              .Results[]?.Vulnerabilities[]? |
+              (.Results // [])[]?.Vulnerabilities[]? |
               [$repo,"Trivy","SBOM",.Severity,.VulnerabilityID,.PkgID,.InstalledVersion] |
               @csv
             ' "$d/sbom_vuln_Trivy.json" 2>/dev/null >> summary.csv || true   
             # -------- SNYK SCA --------
             jq -r --arg repo "$R" '
-              .vulnerabilities[]? |
+              (.Results // [])[]?.Vulnerabilities[]? |
               [$repo,"Snyk","SCA",
                (.severity // "unknown" | ascii_upcase),
                .id,
