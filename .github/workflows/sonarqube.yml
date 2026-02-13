@@ -78,7 +78,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm      
+          sudo apt-get install -y jq git curl unzip openjdk-17-jdk maven gradle nodejs npm     
           # Python tools
           pip3 install --upgrade pip
           pip3 install semgrep      
@@ -89,12 +89,11 @@ jobs:
             | sudo sh -s -- -b /usr/local/bin      
           # ---- Install OSV-Scanner (prebuilt binary, no Go needed) ----
           OSV_VERSION="1.9.0"
-          curl -sSL \
-            https://github.com/google/osv-scanner/releases/download/v1.9.0/osv-scanner_1.9.0_linux_amd64.tar.gz
-            -o osv-scanner.tar.gz      
+          curl -L -sS https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_${OSV_VERSION}_linux_amd64.tar.gz -o osv-scanner.tar.gz
           tar -xzf osv-scanner.tar.gz
           sudo mv osv-scanner /usr/local/bin/
           osv-scanner --version
+
 
 
       - name: Cache build tools
