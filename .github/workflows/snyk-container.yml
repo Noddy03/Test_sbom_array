@@ -107,5 +107,5 @@ jobs:
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
-          name: results_${{ github.run_id }}
-          path: results
+         name: ${{ inputs.src_repository}}
+         path: results
