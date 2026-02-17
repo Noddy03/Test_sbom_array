@@ -126,7 +126,7 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
           if [ -f pyproject.toml ]; then pip install . || true; fi
 
-      - name: SCA - Snyk (deduplicated, real)
+      - name: SCA Snyk (deduplicated, real)
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_SECRET }}   # optional, but strongly recommended
           SNYK_CFG_ENABLE_EXPERIMENTAL_ECOSYSTEMS: "1"
@@ -175,17 +175,17 @@ jobs:
             }
              ' results/sca_flat.json > results/sca_cleaned.json
   
-            - name: Build artifact (best effort, safe)
-              run: |
-                cd project
-                if [ -f pom.xml ]; then
-                  mvn -B -DskipTests \
-                      -Ddocker.skip=true \
-                      -DskipDocker=true \
-                      -Djib.skip=true \
-                      -Dfabric8.skip=true \
-                      package || true
-                fi
+      - name: Build artifact (best effort, safe)
+        run: |
+             cd project
+             if [ -f pom.xml ]; then
+                mvn -B -DskipTests \
+                    -Ddocker.skip=true \
+                    -DskipDocker=true \
+                    -Djib.skip=true \
+                    -Dfabric8.skip=true \
+                    package || true
+               fi
             
             # ---------------- REAL SBOM + VULNS + LICENSES ----------------
       - name: Trivy SBOM + vulnerabilities + licenses (correct)
