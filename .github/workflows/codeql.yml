@@ -267,34 +267,29 @@ jobs:
           path: all_results
       - name: Build summary.csv
         run: |
-          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv       
+          # Write header once
+          echo "repo,sca_low,sca_medium,sca_high,sca_critical,sbom_low,sbom_medium,sbom_high,sbom_critical,sbom_status,total" > summary.csv      
+          # Loop over each artifact folder
           for d in all_results/*; do
             R=$(basename "$d")
-            R=${R//_//}
-           echo "repo,\
-          sca_low,sca_medium,sca_high,sca_critical,\
-          sbom_low,sbom_medium,sbom_high,sbom_critical,\
-          sca_status,trivy_status,osv_status,\
-          sbom_status,total" > summary.csv             
-              for d in all_results/*; do
-                R=$(basename "$d")
-                R=${R//_//}         
+            R=${R//_//}      
             # -------- SCA (Snyk) --------
             SCAL=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "low")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAM=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "medium")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
             SCAH=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "high")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)
-            # -------- 2. DEDUPLICATED SBOM COUNTS --------
-            # These files contain (Trivy SBOM + OSV) sorted and unique
+            SCAC=$(jq '[.vulnerabilities[]? | select((.severity // "") | ascii_downcase == "critical")] | length' "$d/sca_cleaned.json" 2>/dev/null || echo 0)      
+            # -------- SBOM counts --------
             SB_L=$(wc -l < "$d/vulnerability_sbom_low.txt" 2>/dev/null || echo 0)
             SB_M=$(wc -l < "$d/vulnerability_sbom_med.txt" 2>/dev/null || echo 0)
             SB_H=$(wc -l < "$d/vulnerability_sbom_high.txt" 2>/dev/null || echo 0)
-            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)
-            # -------- 3. STATUS & TOTAL --------
+            SB_C=$(wc -l < "$d/vulnerability_sbom_crit.txt" 2>/dev/null || echo 0)    
+            # -------- STATUS & TOTAL --------
             STATUS=$(cat "$d/sbom_status.txt" 2>/dev/null || echo "generated")
-            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))
+            TOTAL=$((SCAL+SCAM+SCAH+SCAC+SB_L+SB_M+SB_H+SB_C))      
+            # Append to summary.csv
             echo "$R,$SCAL,$SCAM,$SCAH,$SCAC,$SB_L,$SB_M,$SB_H,$SB_C,$STATUS,$TOTAL" >> summary.csv
           done
+
       - uses: actions/upload-artifact@v4
         with:
           name: security-summary
