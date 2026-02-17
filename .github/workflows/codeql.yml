@@ -172,8 +172,8 @@ jobs:
                   version: (.version // "unknown"),
                   url
                 })
-          }
-          ' results/sca_flat.json > results/sca_cleaned.json
+            }
+             ' results/sca_flat.json > results/sca_cleaned.json
   
             - name: Build artifact (best effort, safe)
               run: |
@@ -188,13 +188,13 @@ jobs:
                 fi
             
             # ---------------- REAL SBOM + VULNS + LICENSES ----------------
-            - name: Trivy SBOM + vulnerabilities + licenses (correct)
-              run: |
-                mkdir -p results
-                echo "ok" > results/trivy_status.txt     
-                # 1. Generate SBOM (safe)
-                set +e
-                trivy fs project \
+      - name: Trivy SBOM + vulnerabilities + licenses (correct)
+        run: |
+             mkdir -p results
+             echo "ok" > results/trivy_status.txt     
+             # 1. Generate SBOM (safe)
+             set +e
+             trivy fs project \
                   --timeout 20m \
                   --format cyclonedx \
                   --output results/sbom.cdx.json
@@ -213,47 +213,46 @@ jobs:
       
       
       
-            - name: Extract license counts
-              run: |
-                jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
-                sort | uniq -c |
-                awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
-                sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
+      - name: Extract license counts
+        run: |
+            jq -r '.Results[].Licenses[]?.Name' results/sbom_vuln.json |
+            sort | uniq -c |
+            awk '{count=$1; $1=""; sub(/^ /,""); print "\"" $0 "\":" count}' |
+            sed '1s/^/{/;$s/$/}/' > results/licenses_tmp.json || touch results/licenses_tmp.json
                   
            # ---------------- Merge SBOM counts (FIXED, REAL SEVERITY) ----------------
-            - name: Merge SBOM counts
-              run: |
-                mkdir -p results    
-                # -------- Trivy IDs by severity --------
-                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
-                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
-                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
-                jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt  
-                
-                # -------- Merge correctly and SAVE to files in results folder --------
-                cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low.txt
-                cat trivy_med.txt  | sort -u > results/vulnerability_sbom_med.txt
-                cat trivy_high.txt  | sort -u > results/vulnerability_sbom_high.txt
-                cat trivy_crit.txt  | sort -u > results/vulnerability_sbom_crit.txt
-                # -------- Count the lines from the saved files --------
-                SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
-                SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
-                SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
-                SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
-                echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
-                echo "generated" > results/sbom_status.txt
+      - name: Merge SBOM counts
+        run: |
+              mkdir -p results    
+              # -------- Trivy IDs by severity --------
+              jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="LOW") |  .VulnerabilityID' results/sbom_vuln.json > trivy_low.txt || touch trivy_low.txt
+              jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="MEDIUM") |  .VulnerabilityID' results/sbom_vuln.json > trivy_med.txt || touch trivy_med.txt
+              jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="HIGH") |  .VulnerabilityID' results/sbom_vuln.json > trivy_high.txt || touch trivy_high.txt
+              jq -r '.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL") |  .VulnerabilityID' results/sbom_vuln.json > trivy_crit.txt || touch trivy_crit.txt              
+              # -------- Merge correctly and SAVE to files in results folder --------
+              cat trivy_low.txt  | sort -u > results/vulnerability_sbom_low.txt
+              cat trivy_med.txt  | sort -u > results/vulnerability_sbom_med.txt
+              cat trivy_high.txt  | sort -u > results/vulnerability_sbom_high.txt
+              cat trivy_crit.txt  | sort -u > results/vulnerability_sbom_crit.txt
+              # -------- Count the lines from the saved files --------
+              SB_L=$(wc -l < results/vulnerability_sbom_low.txt)
+              SB_M=$(wc -l < results/vulnerability_sbom_med.txt)
+              SB_H=$(wc -l < results/vulnerability_sbom_high.txt)
+              SB_C=$(wc -l < results/vulnerability_sbom_crit.txt)
+              echo "$SB_L,$SB_M,$SB_H,$SB_C" > results/sbom_counts.txt
+              echo "generated" > results/sbom_status.txt
                   
                   
-            - name: Set artifact name
-              id: set_artifact
-              run: |
+      - name: Set artifact name
+        id: set_artifact
+        run: |
                 ARTIFACT_NAME=$(echo "${{ matrix.repo }}" | sed 's#[/:]#_#g')_$(date +%s)
                 echo "artifact_name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
-            - name: Upload results
-              uses: actions/upload-artifact@v4
-              with:
-                name: ${{ steps.set_artifact.outputs.artifact_name }}
-                path: results
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+            name: ${{ steps.set_artifact.outputs.artifact_name }}
+            path: results
       
       
   # =========================================================
